@@ -638,6 +638,19 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
         let runtime_overrides = runtime_overrides.unwrap_or_default();
         let mut command = std::process::Command::new(&target);
         command.args(rewritten_args);
+        // 桌面 app-server 的 stdio 与桌面窗口一一绑定，浏览器无法接入。这里只在桌面
+        // 受管启动时，在同一包装进程内另起一个同源实例供局域网网页使用；桌面自身的
+        // 协议流、握手与降级语义都不受影响。
+        #[cfg(windows)]
+        {
+            if app_server && managed_launch {
+                let gateway_args = command
+                    .get_args()
+                    .map(|argument| argument.to_os_string())
+                    .collect::<Vec<_>>();
+                crate::remote_gateway::start_if_enabled(&target, &gateway_args, &runtime_overrides);
+            }
+        }
         for name in [
             "CODEX_CLI_PATH",
             CLI_WRAPPER_TARGET_ENV,
