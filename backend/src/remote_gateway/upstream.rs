@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -26,7 +26,6 @@ const EVENT_BUFFER: usize = 1024;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type SocketSink = SplitSink<Socket, Message>;
-type SocketStream = SplitStream<Socket>;
 
 /// 上游 app-server 推给网关的事件。
 #[derive(Clone, Debug)]
