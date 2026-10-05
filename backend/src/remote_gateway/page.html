@@ -117,9 +117,14 @@
     .search input:focus { border-color: var(--accent); }
     .count { flex: none; color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
     .thread-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 2px 8px 12px; -webkit-overflow-scrolling: touch; }
+    /* 会话按项目（工作目录）分组，组标题滚动时吸附在列表顶部。 */
     .group-label {
-      padding: 12px 8px 6px; color: var(--faint); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+      position: sticky; top: -2px; z-index: 1; background: var(--surface);
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 12px 8px 6px; color: var(--muted); font-size: 12px; font-weight: 600;
     }
+    .group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .group-count { margin-left: auto; flex: none; color: var(--faint); font-size: 11.5px; font-weight: 400; font-variant-numeric: tabular-nums; }
     .thread {
       padding: 9px 10px; border-radius: var(--radius-sm); cursor: pointer;
       border: 1px solid transparent; display: flex; flex-direction: column; gap: 2px;
@@ -131,7 +136,6 @@
     .t-prev { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .t-meta { color: var(--faint); font-size: 11.5px; display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; }
     .t-meta .sep { opacity: .5; }
-    .t-meta .mono { overflow: hidden; text-overflow: ellipsis; }
     .run-badge {
       display: inline-flex; align-items: center; gap: 4px; flex: none;
       padding: 1px 7px; border-radius: 999px; font-size: 11px;
@@ -699,14 +703,12 @@ function relTime(seconds) {
   return (date.getMonth() + 1) + "月" + date.getDate() + "日";
 }
 
-function groupOf(seconds) {
-  if (!seconds) return "更早";
-  const date = new Date(seconds * 1000);
-  const now = new Date();
-  if (sameDay(date, now)) return "今天";
-  if (sameDay(date, new Date(now.getTime() - 86400000))) return "昨天";
-  if ((Date.now() - date.getTime()) / 1000 < 604800) return "本周";
-  return "更早";
+// 会话按工作目录归属到项目，网页和桌面端一样以项目分组；没有目录的归到「其他」。
+function projectOf(thread) {
+  const cwd = thread && thread.cwd ? String(thread.cwd).replace(/[\\/]+$/, "") : "";
+  if (!cwd) return { key: "", name: "其他", path: "" };
+  const name = cwd.split(/[\\/]/).pop() || cwd;
+  return { key: cwd.toLowerCase(), name, path: cwd };
 }
 
 /* token 与耗时都来自 app-server 的回合数据与落盘用量，这里只做紧凑展示。 */
@@ -1430,37 +1432,44 @@ function renderThreads() {
     root.appendChild(el("div", "empty", "没有匹配的对话"));
     return;
   }
-  let group = null;
+  // 上游按最近使用返回，因此项目组的先后就是各项目最近一次会话的先后，组内也已经是最近在前。
+  const groups = new Map();
   for (const thread of state.threads) {
-    const next = groupOf(thread.updatedAt);
-    if (next !== group) {
-      group = next;
-      root.appendChild(el("div", "group-label", group));
+    const project = projectOf(thread);
+    const entry = groups.get(project.key) || { name: project.name, path: project.path, threads: [] };
+    entry.threads.push(thread);
+    groups.set(project.key, entry);
+  }
+  for (const entry of groups.values()) {
+    const label = el("div", "group-label");
+    label.appendChild(el("span", "group-name", entry.name));
+    label.appendChild(el("span", "group-count", entry.threads.length + " 个会话"));
+    if (entry.path) label.title = entry.path;
+    root.appendChild(label);
+    for (const thread of entry.threads) {
+      const running = !!(thread.status && thread.status.type === "active");
+      const node = el("div", "thread" + (thread.id === state.threadId ? " active" : ""));
+      const top = el("div", "t-top");
+      top.appendChild(el("span", "t-name", thread.name || preview(thread.preview) || "(未命名)"));
+      if (running) {
+        const badge = el("span", "run-badge");
+        badge.appendChild(el("i"));
+        badge.appendChild(el("span", null, "运行中"));
+        top.appendChild(badge);
+      }
+      node.appendChild(top);
+      const line = preview(thread.preview);
+      if (line && line !== thread.name) node.appendChild(el("div", "t-prev", line));
+      const meta = el("div", "t-meta");
+      if (thread.model) {
+        meta.appendChild(el("span", null, thread.model));
+        meta.appendChild(el("span", "sep", "·"));
+      }
+      meta.appendChild(el("span", null, relTime(thread.updatedAt)));
+      node.appendChild(meta);
+      node.addEventListener("click", () => openThread(thread.id).catch(reportError));
+      root.appendChild(node);
     }
-    const running = !!(thread.status && thread.status.type === "active");
-    const node = el("div", "thread" + (thread.id === state.threadId ? " active" : ""));
-    const top = el("div", "t-top");
-    top.appendChild(el("span", "t-name", thread.name || preview(thread.preview) || "(未命名)"));
-    if (running) {
-      const badge = el("span", "run-badge");
-      badge.appendChild(el("i"));
-      badge.appendChild(el("span", null, "运行中"));
-      top.appendChild(badge);
-    }
-    node.appendChild(top);
-    const line = preview(thread.preview);
-    if (line && line !== thread.name) node.appendChild(el("div", "t-prev", line));
-    const meta = el("div", "t-meta");
-    if (thread.cwd) meta.appendChild(el("span", "mono", preview(String(thread.cwd).split(/[\\/]/).pop() || thread.cwd, 24)));
-    if (thread.model) {
-      meta.appendChild(el("span", "sep", "·"));
-      meta.appendChild(el("span", null, thread.model));
-    }
-    meta.appendChild(el("span", "sep", "·"));
-    meta.appendChild(el("span", null, relTime(thread.updatedAt)));
-    node.appendChild(meta);
-    node.addEventListener("click", () => openThread(thread.id).catch(reportError));
-    root.appendChild(node);
   }
 }
 
