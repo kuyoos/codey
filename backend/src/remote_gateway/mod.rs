@@ -1156,6 +1156,12 @@ async fn api_interrupt(state: &State, request: &Request, id: &str) -> ApiResult 
 }
 
 async fn api_close(state: &State, id: &str) -> ApiResult {
+    // 共享模式的上游就是桌面正在使用的同一条连接：`thread/unsubscribe` 会把桌面对该会话
+    // 的订阅一并退掉，桌面从此收不到 `turn/completed` 与状态变化，界面就一直停在“运行中”。
+    // 网页只放弃自己的本地视图，不得改动桌面连接上的订阅。
+    if state.shared {
+        return Ok(json!({ "closed": true }));
+    }
     let _ = state
         .upstream
         .request("thread/unsubscribe", json!({ "threadId": id }))
