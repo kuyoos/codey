@@ -361,11 +361,12 @@
     /* ---------- 弹层、提示 ---------- */
     .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 40; animation: fade .16s ease; }
     @keyframes fade { from { opacity: 0; } }
-    .sheet { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-end; justify-content: center; }
+    /* 整张 sheet 铺满全屏，但不吃指针事件：面板以外的点击落到遮罩上直接关闭。 */
+    .sheet { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-end; justify-content: center; pointer-events: none; }
     .sheet-panel {
       width: 100%; max-width: 520px; background: var(--surface); border: 1px solid var(--line);
       border-radius: 18px 18px 0 0; padding: 10px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
-      box-shadow: var(--shadow); animation: rise .2s ease;
+      box-shadow: var(--shadow); animation: rise .2s ease; pointer-events: auto;
     }
     @keyframes rise { from { transform: translateY(16px); opacity: .4; } }
     .grabber { width: 38px; height: 4px; border-radius: 99px; background: var(--line-2); margin: 2px auto 12px; }
@@ -1697,7 +1698,13 @@ function slashVisible() {
 }
 
 function closeSlash() {
-  if (slashVisible()) $("slashPanel").hidden = true;
+  if (!slashVisible()) return;
+  $("slashPanel").hidden = true;
+  // 「/」按钮补出来的空命令在收起面板时一起清掉，免得误发一条只有斜杠的消息。
+  if ($("input").value.trim() === "/") {
+    $("input").value = "";
+    autoGrow();
+  }
 }
 
 function renderSlash(matches) {
@@ -1724,7 +1731,9 @@ function renderSlash(matches) {
   panel.hidden = false;
 }
 
+// 命令面板只由「/」按钮打开：输入框里敲出 / 不再自动弹出，面板已打开时才按输入过滤。
 function updateSlash() {
+  if (!slashVisible()) return;
   if (!state.threadId) {
     closeSlash();
     return;
@@ -1734,17 +1743,17 @@ function updateSlash() {
     closeSlash();
     return;
   }
-  if (!slashVisible()) state.slashIndex = 0;
   renderSlash(matches);
 }
 
-// 输入框右侧的「/」按钮：没内容时补一个斜杠并聚焦，方便在手机上调出命令面板。
+// 输入框右侧的「/」按钮是命令面板的唯一入口：没内容时补一个斜杠并聚焦。
 function toggleSlash() {
   const input = $("input");
   if (slashVisible()) {
     closeSlash();
     return;
   }
+  if (!state.threadId) return;
   const text = input.value.trim();
   // 已有草稿时不覆盖输入框，只提示命令入口，避免误触丢掉正在写的内容。
   if (text && !slashMatches(text).length) {
@@ -1756,7 +1765,8 @@ function toggleSlash() {
     autoGrow();
   }
   input.focus();
-  updateSlash();
+  state.slashIndex = 0;
+  renderSlash(slashMatches(input.value.trim()));
 }
 
 function parseSlashCommand(text) {
@@ -2182,8 +2192,24 @@ function bind() {
   $("composer").addEventListener("submit", (event) => { event.preventDefault(); submitInput(); });
   $("stopBtn").addEventListener("click", stop);
   $("cmdBtn").addEventListener("click", toggleSlash);
+  // 命令面板：点空白处或输入框失焦都收起；面板内的按下会先让输入框失焦，那一次不算。
+  let slashHold = false;
+  document.addEventListener("pointerdown", (event) => {
+    if (!slashVisible()) return;
+    slashHold = $("slashPanel").contains(event.target);
+    if (slashHold || $("cmdBtn").contains(event.target) || event.target === $("input")) return;
+    closeSlash();
+  });
+  window.addEventListener("pointerup", () => { slashHold = false; });
+  window.addEventListener("pointercancel", () => { slashHold = false; });
   $("statusClose").addEventListener("click", closeStatus);
   $("statusOverlay").addEventListener("click", closeStatus);
+  $("input").addEventListener("blur", (event) => {
+    if (slashHold) return;
+    const next = event.relatedTarget;
+    if (next && $("slashPanel").contains(next)) return;
+    closeSlash();
+  });
   $("input").addEventListener("input", () => { autoGrow(); updateSlash(); });
   $("input").addEventListener("keydown", (event) => {
     if (event.isComposing) return;
