@@ -160,6 +160,9 @@
     .turn + .turn { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
     .turn-head { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 11.5px; }
     .turn-head .line { flex: 1; height: 1px; background: var(--line); }
+    .turn-head .meta { color: var(--faint); white-space: nowrap; }
+    .turn.flash { animation: flash 1.2s ease; }
+    @keyframes flash { 0%, 100% { background: transparent; } 20% { background: var(--accent-dim); } }
     .chip {
       display: inline-flex; align-items: center; gap: 5px; padding: 1.5px 8px; border-radius: 999px;
       font-size: 11.5px; background: var(--surface-2); color: var(--muted); white-space: nowrap;
@@ -176,6 +179,15 @@
       border-radius: 16px 16px 4px 16px; padding: 9px 12px;
     }
     .msg.agent { max-width: 100%; }
+    /* 编辑与复制默认隐藏，悬停或聚焦时出现，触屏设备上常驻，避免正文被按钮挤占。 */
+    .msg-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; opacity: 0; transition: opacity .15s ease; }
+    .msg.user:hover .msg-actions, .msg.user:focus-within .msg-actions { opacity: 1; }
+    .msg-actions button {
+      padding: 2px 8px; border-radius: 7px; font-size: 11.5px; color: var(--muted);
+      background: rgba(255, 255, 255, .06); border: 1px solid var(--line-2);
+    }
+    .msg-actions button:hover { color: var(--text); }
+    @media (hover: none) { .msg-actions { opacity: .75; } }
     .caret::after { content: ""; display: inline-block; width: 7px; height: 15px; margin-left: 2px; vertical-align: -2px; background: var(--accent); animation: pulse 1s steps(2, start) infinite; }
     .more-btn {
       align-self: center; margin: 4px 0 10px; padding: 6px 14px; border-radius: 999px;
@@ -247,12 +259,13 @@
     .raw-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     summary .copy { flex: none; color: var(--muted); font-size: 11.5px; padding: 2px 7px; border-radius: 6px; }
     summary .copy:hover { background: var(--surface-3); color: var(--text); }
-    /* 思考过程只留一行计数，和聊天里的元信息一样轻。 */
-    .think {
+    /* 思考、工具与命令都只留一行计数，和聊天里的元信息一样轻。 */
+    .think, .tool-note {
       display: inline-flex; align-items: center; gap: 6px; align-self: flex-start;
       margin: 4px 0; padding: 3px 10px; border-radius: 999px;
       background: var(--surface-2); color: var(--faint); font-size: 12px;
     }
+    .tool-note .icon { color: var(--faint); }
     details.card {
       border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface);
       overflow: hidden; margin: 8px 0;
@@ -330,6 +343,23 @@
     .sheet-close {
       width: 100%; height: 44px; border-radius: 12px; background: var(--accent); color: #08101c; font-weight: 600;
     }
+    /* 会话导航：列出每个回合的用户输入，点击跳到对应位置。 */
+    .nav-list { max-height: min(56vh, 440px); overflow-y: auto; margin: 2px 0 10px; }
+    .nav-item {
+      display: flex; gap: 10px; width: 100%; text-align: left; padding: 9px 6px;
+      border-bottom: 1px solid var(--line); background: transparent; color: var(--text);
+    }
+    .nav-item:hover { background: var(--surface-2); }
+    .nav-item .n {
+      flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--surface-3);
+      color: var(--faint); font-size: 11.5px; display: grid; place-items: center;
+    }
+    .nav-body { min-width: 0; flex: 1; }
+    .nav-text {
+      font-size: 13.5px; line-height: 1.5; overflow: hidden; display: -webkit-box;
+      -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
+    .nav-meta { color: var(--faint); font-size: 11.5px; margin-top: 2px; }
     .toast-host { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(env(safe-area-inset-bottom, 0px) + 74px); z-index: 60; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
     .toast {
       pointer-events: auto; max-width: 88vw; padding: 9px 14px; border-radius: 12px; font-size: 13px;
@@ -420,6 +450,9 @@
           <div class="chat-title" id="chatTitle">选择一个对话</div>
           <div class="chat-meta" id="chatMeta"></div>
         </div>
+        <button class="icon-btn" id="navBtn" type="button" aria-label="会话导航">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
+        </button>
         <button class="chip-btn" id="modelChip" type="button" aria-label="模型与推理强度">
           <span class="k">模型</span><span class="t" id="modelChipText">跟随会话</span>
         </button>
@@ -453,6 +486,16 @@
     <div class="sheet-info" id="sheetInfo"></div>
     <div class="sheet-note">设置随下一条消息生效，并沿用到该会话的后续回合。</div>
     <button class="sheet-close" id="sheetClose" type="button">完成</button>
+  </div>
+</div>
+
+<div class="overlay" id="navOverlay" hidden></div>
+<div class="sheet" id="navSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="会话导航">
+    <div class="grabber"></div>
+    <div class="sheet-title">会话导航</div>
+    <div class="nav-list" id="navList"></div>
+    <button class="sheet-close" id="navClose" type="button">关闭</button>
   </div>
 </div>
 
@@ -495,6 +538,7 @@ const state = {
   nextCursor: null,
   activeTurnId: null,
   live: new Map(),
+  usage: { total: null, turns: {} },
   approvals: [],
   reloadTimer: null,
   searchTimer: null,
@@ -562,6 +606,35 @@ function groupOf(seconds) {
   if (sameDay(date, new Date(now.getTime() - 86400000))) return "昨天";
   if ((Date.now() - date.getTime()) / 1000 < 604800) return "本周";
   return "更早";
+}
+
+/* token 与耗时都来自 app-server 的回合数据与落盘用量，这里只做紧凑展示。 */
+function formatTokens(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return "";
+  if (count < 1000) return String(count);
+  if (count < 1000000) return (count / 1000).toFixed(count < 10000 ? 1 : 0) + "k";
+  return (count / 1000000).toFixed(2) + "M";
+}
+
+function formatDuration(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const total = Math.round(value / 1000);
+  if (total < 60) return total + " 秒";
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return minutes + " 分 " + (total % 60) + " 秒";
+  return Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分";
+}
+
+function turnMeta(turn) {
+  const parts = [];
+  const duration = formatDuration(turn && turn.durationMs);
+  if (duration) parts.push("耗时 " + duration);
+  const usage = state.usage.turns[(turn && turn.id) || ""];
+  const tokens = usage && formatTokens(usage.total_tokens);
+  if (tokens) parts.push(tokens + " tokens");
+  return parts.join(" · ");
 }
 
 async function copyText(text, label) {
@@ -872,13 +945,39 @@ function agentMessage(text) {
   return node;
 }
 
-function userMessage(item) {
+function messageText(item) {
   const parts = [];
   for (const part of (item && item.content) || []) {
     if (part && part.type === "text" && part.text) parts.push(part.text);
     else if (part && part.type) parts.push("[" + part.type + "]");
   }
-  return el("div", "msg user", parts.join("\n"));
+  return parts.join("\n");
+}
+
+function userMessage(item) {
+  const text = messageText(item);
+  const node = el("div", "msg user", text);
+  const actions = el("div", "msg-actions");
+  const copy = el("button", null, "复制");
+  copy.type = "button";
+  copy.addEventListener("click", () => copyText(text, "已复制消息"));
+  const edit = el("button", null, "编辑");
+  edit.type = "button";
+  edit.addEventListener("click", () => editMessage(text));
+  actions.appendChild(copy);
+  actions.appendChild(edit);
+  node.appendChild(actions);
+  return node;
+}
+
+// 编辑把消息回填到输入框：历史仍保留，改完直接发送即可重新提问。
+function editMessage(text) {
+  const input = $("input");
+  input.value = text;
+  autoGrow();
+  input.focus();
+  try { input.setSelectionRange(text.length, text.length); } catch { /* 忽略 */ }
+  toast("已填入输入框，修改后发送");
 }
 
 // app-server 的 kind 是 { type, move_path } 对象，先归一化成短标签再展示。
@@ -905,38 +1004,16 @@ function changeRows(changes) {
   return rows;
 }
 
-// 连续的工具与命令合并成一张卡片，只留一行概要，避免长回合堆出上百个卡片。
+// 工具与命令只留一行计数，和思考一样轻；正文在网关侧已裁掉，网页不再逐项渲染。
 const TOOL_TYPES = new Set([
   "commandExecution", "mcpToolCall", "dynamicToolCall",
   "functionCallOutput", "webSearch", "collabAgentToolCall",
 ]);
-const TOOL_ROW_LIMIT = 8;
-
-function toolRow(item) {
-  switch (item.type) {
-    case "commandExecution": return { icon: "$", text: preview(item.command || "", 120) || "命令" };
-    case "mcpToolCall":
-    case "dynamicToolCall":
-      return { icon: "⚙", text: ((item.server || "") + "." + (item.tool || "")).replace(/^\./, "") || "工具调用" };
-    case "functionCallOutput": return { icon: "↳", text: item.name || "工具输出" };
-    case "webSearch": return { icon: "⌕", text: preview(item.query || "", 120) || "联网搜索" };
-    case "collabAgentToolCall": return { icon: "⧉", text: "子代理 " + (item.tool || "") };
-    default: return { icon: "•", text: item.type || "" };
-  }
-}
 
 function toolGroup(items) {
-  const node = card("⛭", "工具与命令 · " + items.length + " 项", null);
-  for (const item of items.slice(0, TOOL_ROW_LIMIT)) {
-    const row = toolRow(item);
-    const line = el("div", "tool-row" + (String(item.status || "").toLowerCase() === "failed" ? " is-failed" : ""));
-    line.appendChild(el("span", "icon", row.icon));
-    line.appendChild(el("span", "mono", row.text));
-    node.appendChild(line);
-  }
-  if (items.length > TOOL_ROW_LIMIT) {
-    node.appendChild(el("div", "tool-row more", "还有 " + (items.length - TOOL_ROW_LIMIT) + " 项"));
-  }
+  const node = el("div", "tool-note");
+  node.appendChild(el("span", "icon", "⛭"));
+  node.appendChild(el("span", null, "工具与命令 " + items.length + " 项"));
   return node;
 }
 
@@ -1131,9 +1208,12 @@ function renderTranscript(forceScroll) {
   const ordered = state.turns.slice().reverse();
   for (const turn of ordered) {
     const node = el("div", "turn");
+    node.id = "turn-" + turn.id;
     const head = el("div", "turn-head");
     const stamp = turn.createdAt || turn.startedAt || turn.completedAt;
     head.appendChild(el("span", null, stamp ? relTime(stamp) : "回合"));
+    const meta = turnMeta(turn);
+    if (meta) head.appendChild(el("span", "meta", meta));
     head.appendChild(el("span", "line"));
     const chip = statusChip(turn.status, null);
     if (chip) head.appendChild(chip);
@@ -1147,14 +1227,7 @@ function renderTranscript(forceScroll) {
     let runKind = null;
     const flushRun = () => {
       if (!run.length) return;
-      if (runKind === "files") {
-        node.appendChild(fileBlock(run));
-      } else if (run.length > 1) {
-        node.appendChild(toolGroup(run));
-      } else {
-        const single = renderItem(run[0]);
-        if (single) node.appendChild(single);
-      }
+      node.appendChild(runKind === "files" ? fileBlock(run) : toolGroup(run));
       run = [];
       runKind = null;
     };
@@ -1244,6 +1317,8 @@ function renderChatHead() {
     if (thread.cwd) meta.push(thread.cwd);
     if (state.detail.model) meta.push(state.detail.model);
     if (state.activeTurnId) meta.push("运行中");
+    const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
+    if (total) meta.push("累计 " + total + " tokens");
   }
   $("chatMeta").textContent = meta.join(" · ");
 }
@@ -1315,6 +1390,71 @@ function closeSheet() {
   $("sheet").hidden = true;
 }
 
+/* ================= 会话导航 ================= */
+
+// 取回合里第一条有正文的用户消息，用于导航项的标题。
+function turnUserText(turn) {
+  for (const item of (turn && turn.items) || []) {
+    if (!item || item.type !== "userMessage") continue;
+    const parts = [];
+    for (const part of item.content || []) {
+      if (part && part.type === "text" && part.text) parts.push(part.text);
+    }
+    const text = parts.join(" ").replace(/\s+/g, " ").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function openNav() {
+  const list = $("navList");
+  list.textContent = "";
+  // 从最早到最新排列，序号即回合顺序；只列有用户输入的回合。
+  const entries = state.turns
+    .slice()
+    .reverse()
+    .map((turn) => ({ turn, text: turnUserText(turn) }))
+    .filter((entry) => entry.text);
+  if (!entries.length) {
+    list.appendChild(el("div", "empty", "还没有可跳转的回合。"));
+  }
+  entries.forEach((entry, index) => {
+    const turn = entry.turn;
+    const item = el("button", "nav-item");
+    item.type = "button";
+    item.appendChild(el("span", "n", String(index + 1)));
+    const body = el("div", "nav-body");
+    body.appendChild(el("div", "nav-text", preview(entry.text, 140)));
+    const meta = [];
+    const stamp = turn.completedAt || turn.startedAt || turn.createdAt;
+    if (stamp) meta.push(relTime(stamp));
+    const duration = formatDuration(turn.durationMs);
+    if (duration) meta.push(duration);
+    if (meta.length) body.appendChild(el("div", "nav-meta", meta.join(" · ")));
+    item.appendChild(body);
+    item.addEventListener("click", () => {
+      closeNav();
+      scrollToTurn(turn.id);
+    });
+    list.appendChild(item);
+  });
+  $("navOverlay").hidden = false;
+  $("navSheet").hidden = false;
+}
+
+function closeNav() {
+  $("navOverlay").hidden = true;
+  $("navSheet").hidden = true;
+}
+
+function scrollToTurn(id) {
+  const node = document.getElementById("turn-" + id);
+  if (!node) return;
+  node.scrollIntoView({ block: "start", behavior: "smooth" });
+  node.classList.add("flash");
+  setTimeout(() => node.classList.remove("flash"), 1200);
+}
+
 /* ================= 数据加载 ================= */
 
 function reportError(error) {
@@ -1351,6 +1491,16 @@ async function loadTurns(cursor) {
   renderTranscript(!cursor);
 }
 
+// 用量单独懒加载：网关要扫盘聚合，先渲染正文再补 token，不拖慢会话打开。
+async function loadUsage(id) {
+  const usage = await api("/api/threads/" + encodeURIComponent(id) + "/usage");
+  if (state.threadId !== id || !usage || typeof usage !== "object") return;
+  state.usage = { total: usage.total || null, turns: usage.turns || {} };
+  renderChatHead();
+  // 运行中的回合靠事件流增量渲染，重排会打断它，等回合结束再补上用量。
+  if (!state.live.size) renderTranscript(false);
+}
+
 function showListView() {
   $("app").dataset.view = "list";
 }
@@ -1367,6 +1517,7 @@ async function openThread(id) {
   state.nextCursor = null;
   state.activeTurnId = null;
   state.live.clear();
+  state.usage = { total: null, turns: {} };
   state.approvals = [];
   renderApprovals();
   try { localStorage.setItem(LAST_THREAD_KEY, id); } catch { /* 隐私模式下忽略 */ }
@@ -1386,6 +1537,7 @@ async function openThread(id) {
   updateModelChip();
   await loadTurns(null);
   scrollToBottom();
+  loadUsage(id).catch(() => {});
 }
 
 function closeThread(id) {
@@ -1637,6 +1789,9 @@ function bind() {
   $("modelChip").addEventListener("click", openSheet);
   $("sheetClose").addEventListener("click", closeSheet);
   $("overlay").addEventListener("click", closeSheet);
+  $("navBtn").addEventListener("click", openNav);
+  $("navClose").addEventListener("click", closeNav);
+  $("navOverlay").addEventListener("click", closeNav);
   $("model").addEventListener("change", () => { renderEfforts(); });
   $("search").addEventListener("input", () => {
     clearTimeout(state.searchTimer);
@@ -1661,7 +1816,10 @@ function bind() {
   window.addEventListener("popstate", () => showListView());
   window.addEventListener("beforeunload", () => { if (state.threadId) closeThread(state.threadId); });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeSheet();
+    if (event.key === "Escape") {
+      closeSheet();
+      closeNav();
+    }
   });
 }
 

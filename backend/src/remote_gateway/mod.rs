@@ -41,8 +41,7 @@ const LOCK_FILE_NAME: &str = ".codey-remote-gateway.lock";
 const WS_TOKEN_FILE_NAME: &str = ".codey-remote-gateway.ws-token";
 const DEFAULT_PORT: u16 = 8799;
 const DEFAULT_PAGE_TURNS: u32 = 8;
-/// 网页只展示概要，命令行与输出各保留一小段预览。
-const COMMAND_PREVIEW_CHARS: usize = 200;
+/// 网页只展示概要，工具输出保留一小段预览。
 const OUTPUT_PREVIEW_CHARS: usize = 400;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const PAGE: &str = include_str!("page.html");
@@ -952,6 +951,7 @@ async fn api(state: &Arc<State>, request: &Request) -> (u16, Value) {
         ("GET", ["api", "threads"]) => api_threads(state, request).await,
         ("GET", ["api", "threads", id]) => api_thread(state, id).await,
         ("GET", ["api", "threads", id, "turns"]) => api_turns(state, request, id).await,
+        ("GET", ["api", "threads", id, "usage"]) => api_usage(state, id).await,
         ("POST", ["api", "threads", id, "messages"]) => api_message(state, request, id).await,
         ("POST", ["api", "threads", id, "interrupt"]) => api_interrupt(state, request, id).await,
         ("POST", ["api", "threads", id, "close"]) => api_close(state, id).await,
@@ -1123,15 +1123,14 @@ fn slim_turns(turns: &mut Value) {
                 }
                 Some("commandExecution") => {
                     let _ = object.remove("commandActions");
-                    truncate_field(object, "command", COMMAND_PREVIEW_CHARS);
-                    truncate_field(object, "aggregatedOutput", OUTPUT_PREVIEW_CHARS);
+                    // 网页只显示「工具与命令 · N 项」的计数，命令与输出正文不再下发。
+                    let _ = object.remove("command");
+                    let _ = object.remove("aggregatedOutput");
                 }
                 Some("mcpToolCall" | "dynamicToolCall") => {
-                    let _ = object.remove("arguments");
-                    let _ = object.remove("result");
-                    let _ = object.remove("appContext");
-                    let _ = object.remove("mcpAppUi");
-                    truncate_field(object, "error", OUTPUT_PREVIEW_CHARS);
+                    for key in ["arguments", "result", "appContext", "mcpAppUi", "error"] {
+                        let _ = object.remove(key);
+                    }
                 }
                 Some("functionCallOutput") => {
                     truncate_field(object, "output", OUTPUT_PREVIEW_CHARS);
@@ -1171,6 +1170,119 @@ fn truncate_field(object: &mut serde_json::Map<String, Value>, key: &str, max_ch
     let mut preview: String = text.chars().take(max_chars).collect();
     preview.push_str("\n…（已截断）");
     object.insert(key.to_owned(), Value::String(preview));
+}
+
+/// app-server 的回合结构不含 token 字段，用量只落在 rollout jsonl 里：会话续写会把同一个
+/// sessionId 拆成多个分段文件，因此按 sessionId 找到全部分段，逐个取回合与线程的累计值。
+async fn api_usage(state: &State, id: &str) -> ApiResult {
+    let value = state
+        .upstream
+        .request("thread/read", json!({ "threadId": id }))
+        .await
+        .map_err(upstream_error)?;
+    let thread = value.get("thread").cloned().unwrap_or(Value::Null);
+    let session_id = thread
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            thread
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(session_id_from_rollout)
+        });
+    let Some(session_id) = session_id else {
+        return Ok(json!({ "total": Value::Null, "turns": {} }));
+    };
+    let usage = tokio::task::spawn_blocking(move || collect_token_usage(&session_id))
+        .await
+        .unwrap_or_else(|_| json!({ "total": Value::Null, "turns": {} }));
+    Ok(usage)
+}
+
+/// `rollout-2026-10-05T09-27-08-<sessionId>[_<分段>].jsonl`：时间戳固定形如
+/// `YYYY-MM-DDTHH-MM-SS`，其后的 `T` 再往后 9 个字符起，到 `_` 之间就是 sessionId。
+fn session_id_from_rollout(path: &str) -> Option<String> {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .strip_prefix("rollout-")?
+        .strip_suffix(".jsonl")?;
+    let after_date = name.get(name.find('T')? + 1..)?;
+    let id = after_date.get(9..)?.split('_').next()?;
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// 按 sessionId 在 sessions 树里递归匹配分段文件；文件名以 `rollout-<时间戳>` 开头，
+/// 字典序即时间序，后写的分段持有更大的累计值。只解析含 token 记录的行。
+fn collect_token_usage(session_id: &str) -> Value {
+    let mut files = Vec::new();
+    let root = crate::codex_config::codex_home().join("sessions");
+    collect_rollout_files(&root, session_id, &mut files);
+    files.sort();
+    let mut turns = serde_json::Map::new();
+    let mut total: Option<Value> = None;
+    let mut best_total = -1i64;
+    for file in files {
+        let Ok(handle) = std::fs::File::open(&file) else {
+            continue;
+        };
+        let mut reader = std::io::BufReader::new(handle);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            if !line.contains("\"token_usage_record\"") {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(payload) = record.get("payload") else {
+                continue;
+            };
+            if let (Some(turn_id), Some(turn_usage)) = (
+                payload.get("turn_id").and_then(Value::as_str),
+                payload.get("turn_token_usage"),
+            ) {
+                turns.insert(turn_id.to_owned(), turn_usage.clone());
+            }
+            if let Some(thread_usage) = payload.get("thread_token_usage") {
+                let tokens = thread_usage
+                    .get("total_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if tokens >= best_total {
+                    best_total = tokens;
+                    total = Some(thread_usage.clone());
+                }
+            }
+        }
+    }
+    json!({ "total": total.unwrap_or(Value::Null), "turns": turns })
+}
+
+fn collect_rollout_files(dir: &Path, session_id: &str, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_files(&path, session_id, found);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(session_id) && name.ends_with(".jsonl"))
+        {
+            found.push(path);
+        }
+    }
 }
 
 async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
@@ -1276,6 +1388,7 @@ mod tests {
                     { "type": "agentMessage", "id": "a1", "text": "回答" },
                     { "type": "commandExecution", "id": "c1", "command": "cargo build", "aggregatedOutput": long_output, "commandActions": [{ "command": "cargo build" }] },
                     { "type": "mcpToolCall", "id": "m1", "server": "srv", "tool": "tool", "arguments": { "big": "参数" }, "result": { "big": "结果" } },
+                    { "type": "functionCallOutput", "id": "o1", "name": "shell", "output": long_output },
                     { "type": "fileChange", "id": "f1", "changes": [{ "path": "src/a.rs", "kind": { "type": "update", "move_path": null }, "diff": "@@ -1,1 +1,2 @@" }] },
                     { "type": "webSearch", "id": "w1", "query": "问题", "results": [{ "huge": "结果" }] }
                 ]
@@ -1284,23 +1397,47 @@ mod tests {
         ]);
         slim_turns(&mut turns);
         let items = turns[0]["items"].as_array().expect("items");
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 7);
         assert_eq!(items[0]["type"], json!("reasoning"));
         assert!(items[0].get("summary").is_none());
         assert!(items[0].get("content").is_none());
         assert_eq!(items[1]["text"], json!("回答"));
-        assert_eq!(items[2]["command"], json!("cargo build"));
+        // 工具与命令只留计数，命令与输出正文不再下发。
+        assert!(items[2].get("command").is_none());
+        assert!(items[2].get("aggregatedOutput").is_none());
         assert!(items[2].get("commandActions").is_none());
-        let output = items[2]["aggregatedOutput"].as_str().expect("output");
-        assert!(output.ends_with("…（已截断）"));
-        assert!(output.chars().count() < long_output.chars().count());
         assert!(items[3].get("arguments").is_none());
         assert!(items[3].get("result").is_none());
         assert_eq!(items[3]["server"], json!("srv"));
-        assert!(items[4]["changes"][0].get("diff").is_none());
-        assert_eq!(items[4]["changes"][0]["path"], json!("src/a.rs"));
-        assert_eq!(items[4]["changes"][0]["kind"]["type"], json!("update"));
-        assert!(items[5].get("results").is_none());
-        assert_eq!(items[5]["query"], json!("问题"));
+        // 工具输出仍保留一小段预览并标记截断。
+        let output = items[4]["output"].as_str().expect("output");
+        assert!(output.ends_with("…（已截断）"));
+        assert!(output.chars().count() < long_output.chars().count());
+        assert!(items[5]["changes"][0].get("diff").is_none());
+        assert_eq!(items[5]["changes"][0]["path"], json!("src/a.rs"));
+        assert_eq!(items[5]["changes"][0]["kind"]["type"], json!("update"));
+        assert!(items[6].get("results").is_none());
+        assert_eq!(items[6]["query"], json!("问题"));
+    }
+
+    #[test]
+    fn session_id_is_parsed_from_segmented_rollout_names() {
+        let id = "01a10721-2cf5-7271-b22f-544b877b192e";
+        assert_eq!(
+            session_id_from_rollout(&format!("rollout-2026-10-04T21-36-17-{id}.jsonl")),
+            Some(id.to_owned())
+        );
+        // 会话续写的分段文件带 `_<分段>` 后缀；目录用 `/` 分隔，让断言在 Windows 与 Linux 上都成立。
+        assert_eq!(
+            session_id_from_rollout(&format!(
+                "sessions/2026/10/05/rollout-2026-10-05T09-27-08-{id}_01a109ab-fa6d-7ad1-ad34-0afa27f448e6.jsonl"
+            )),
+            Some(id.to_owned())
+        );
+        assert_eq!(session_id_from_rollout("thread.jsonl"), None);
+        assert_eq!(
+            session_id_from_rollout("rollout-2026-10-05T09-27-08.jsonl"),
+            None
+        );
     }
 }
