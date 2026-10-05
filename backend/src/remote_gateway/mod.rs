@@ -1,14 +1,19 @@
 //! Codey 局域网远程控制网关。
 //!
 //! 桌面自身的 app-server 走 stdio，与桌面窗口一一绑定，浏览器无法接入；浏览器也不能
-//! 直连 app-server，因为它暴露文件、命令与配置接口。这里在桌面 app-server 的包装进程里
-//! 另起一个同源 app-server（同一 `CODEX_HOME` 与同一份本地路由配置），只监听回环
-//! WebSocket 并核验能力令牌，再由网关转成带令牌的局域网 HTTP 与 SSE 供网页使用。
+//! 直连 app-server，因为它暴露文件、命令与配置接口。网关于是运行在桌面 app-server 的包装
+//! 进程里，把 app-server 转成带令牌的局域网 HTTP 与 SSE 供网页使用。
+//!
+//! 默认的共享模式（见 [`shared`]）直接复用桌面这条 stdio：桌面数据流逐行直通，网页请求
+//! 注入同一连接，因此桌面正在运行的会话也能收发，且不影响桌面行为。配置里的 `isolated`
+//! 模式会另起一个同源 app-server，只能读磁盘历史，仅在需要严格隔离时使用。
 //!
 //! 网关不是独立进程：只有拿到 `CODEX_HOME` 下独占文件锁的那一次包装器启动才会运行，
 //! 因此跟随桌面 app-server 的生命周期，也不会重复监听端口。
 
+pub(crate) mod console;
 mod http;
+mod shared;
 mod upstream;
 
 use std::collections::{HashMap, HashSet};
@@ -23,7 +28,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot};
 
 use http::{EventStream, Request, read_request, write_json, write_response};
 use upstream::{Event, Upstream};
@@ -63,6 +68,19 @@ struct GatewayConfig {
     enabled: bool,
     #[serde(default = "port_default")]
     port: u16,
+    #[serde(default)]
+    mode: GatewayMode,
+}
+
+/// 上游连接方式；控制台只暴露开关与端口，模式留作严格隔离时的兜底。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum GatewayMode {
+    /// 复用桌面 app-server 的 stdio，运行中的会话也能收发。
+    #[default]
+    Shared,
+    /// 另起一个同源 app-server，只读磁盘历史，不影响桌面会话。
+    Isolated,
 }
 
 fn enabled_default() -> bool {
@@ -78,16 +96,24 @@ impl Default for GatewayConfig {
         Self {
             enabled: enabled_default(),
             port: port_default(),
+            mode: GatewayMode::default(),
         }
     }
 }
 
 /// 在桌面 app-server 的包装进程里尝试启动网关；每个进程只尝试一次。
 ///
-/// `args` 是去掉受管配置后重新拼装的 app-server 参数，网关沿用同一份本地路由配置。
-pub(crate) fn start_if_enabled(target: &Path, args: &[OsString], overrides: &[String]) {
+/// 返回 `Some` 表示网关要接管这次 app-server 的 stdio（共享模式），包装器需要在 spawn
+/// 之后把管道交给 [`SharedUpstream::serve`]；返回 `None` 表示网关未启用，或已按独占模式
+/// 自行启动（独占模式不需要包装器改管道）。`args` 是去掉受管配置后重新拼装的 app-server
+/// 参数，网关沿用同一份本地路由配置。
+pub(crate) fn prepare_upstream(
+    target: &Path,
+    args: &[OsString],
+    overrides: &[String],
+) -> Option<SharedUpstream> {
     if ATTEMPTED.set(()).is_err() {
-        return;
+        return None;
     }
     let home = crate::codex_config::codex_home().to_path_buf();
     let config = load_or_create_config(&home);
@@ -96,29 +122,50 @@ pub(crate) fn start_if_enabled(target: &Path, args: &[OsString], overrides: &[St
             "codey.remote_gateway.disabled",
             json!({ "config": home.join(CONFIG_FILE_NAME).display().to_string() }),
         );
-        return;
+        return None;
     }
     let Some(guard) = acquire_lock(&home) else {
-        return;
+        return None;
     };
     let Some(token) = load_or_create_token(&home) else {
-        return;
+        return None;
     };
     let _ = LOCK_GUARD.set(guard);
-    if std::fs::write(home.join(WS_TOKEN_FILE_NAME), &token).is_err() {
+    let overrides = overrides.to_vec();
+    if config.mode == GatewayMode::Isolated {
+        start_isolated_upstream(&home, target, args, overrides, &token, config.port);
+        return None;
+    }
+    Some(SharedUpstream {
+        home,
+        http_port: config.port,
+        overrides,
+    })
+}
+
+/// 独占模式：另起一个同源 app-server，只监听回环 WebSocket 并核验能力令牌。
+fn start_isolated_upstream(
+    home: &Path,
+    target: &Path,
+    args: &[OsString],
+    overrides: Vec<String>,
+    token: &str,
+    http_port: u16,
+) {
+    if std::fs::write(home.join(WS_TOKEN_FILE_NAME), token).is_err() {
         log(
             "codey.remote_gateway.ws_token_failed",
             json!({ "message": "无法写入上游能力令牌" }),
         );
         return;
     }
-    let port = match free_loopback_port() {
+    let upstream_port = match free_loopback_port() {
         Ok(port) => port,
         Err(_) => return,
     };
-    let args = transport_args(args, port, &home.join(WS_TOKEN_FILE_NAME));
-    let overrides = overrides.to_vec();
+    let args = transport_args(args, upstream_port, &home.join(WS_TOKEN_FILE_NAME));
     let target = target.to_path_buf();
+    let home = home.to_path_buf();
     let spawned = std::thread::Builder::new()
         .name("codey-remote-gateway".to_owned())
         .spawn(move || {
@@ -140,8 +187,8 @@ pub(crate) fn start_if_enabled(target: &Path, args: &[OsString], overrides: &[St
                 target,
                 args,
                 overrides,
-                port,
-                config.port,
+                upstream_port,
+                http_port,
                 home,
             ));
         });
@@ -150,6 +197,66 @@ pub(crate) fn start_if_enabled(target: &Path, args: &[OsString], overrides: &[St
             "codey.remote_gateway.thread_failed",
             json!({ "message": format!("{error}") }),
         );
+    }
+}
+
+/// 共享模式的接管参数。
+pub(crate) struct SharedUpstream {
+    home: PathBuf,
+    http_port: u16,
+    overrides: Vec<String>,
+}
+
+impl SharedUpstream {
+    /// 在独立线程里启动网关；`server_stdin`/`server_stdout` 是桌面 app-server 的管道，
+    /// `source` 是桌面输入（本地路由模式下为转发器的输出），缺省时读取包装器自身的 stdin。
+    pub(crate) fn serve(
+        self,
+        server_stdin: Option<std::process::ChildStdin>,
+        server_stdout: Option<std::process::ChildStdout>,
+        source: Option<Box<dyn std::io::Read + Send>>,
+    ) {
+        let (Some(server_stdin), Some(server_stdout)) = (server_stdin, server_stdout) else {
+            log(
+                "codey.remote_gateway.stdio_failed",
+                json!({ "message": "桌面 app-server 管道不可用" }),
+            );
+            return;
+        };
+        let local_router =
+            crate::codex_startup_patch::local_router_runtime_enabled(&self.overrides);
+        let SharedUpstream {
+            home,
+            http_port,
+            overrides,
+        } = self;
+        let spawned = std::thread::Builder::new()
+            .name("codey-remote-gateway".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        log(
+                            "codey.remote_gateway.runtime_failed",
+                            json!({ "message": format!("{error}") }),
+                        );
+                        return;
+                    }
+                };
+                let source = source.unwrap_or_else(|| Box::new(std::io::stdin()));
+                let upstream = shared::start(server_stdin, server_stdout, source, local_router);
+                runtime.block_on(serve_shared(home, http_port, overrides, upstream));
+            });
+        if let Err(error) = spawned {
+            log(
+                "codey.remote_gateway.thread_failed",
+                json!({ "message": format!("{error}") }),
+            );
+        }
     }
 }
 
@@ -204,11 +311,12 @@ async fn serve_forever(
         .map(|address| address.port())
         .unwrap_or(http_port);
     let state = Arc::new(State {
-        upstream: Arc::clone(&upstream),
+        upstream: UpstreamLink::Isolated(Arc::clone(&upstream)),
         approvals: Approvals::default(),
         browsers: AtomicUsize::new(0),
         token,
         overrides,
+        shared: false,
     });
     spawn_request_responder(Arc::clone(&state));
     tokio::spawn(async move {
@@ -221,6 +329,59 @@ async fn serve_forever(
     log(
         "codey.remote_gateway.started",
         json!({
+            "port": port,
+            "lan": lan_ipv4().map(|address| address.to_string()),
+            "link": home.join(URL_FILE_NAME).display().to_string(),
+        }),
+    );
+    accept_loop(listener, state).await;
+}
+
+/// 共享模式：上游就是桌面 app-server 的 stdio，网关只负责转成局域网 HTTP 与 SSE。
+async fn serve_shared(
+    home: PathBuf,
+    http_port: u16,
+    overrides: Vec<String>,
+    upstream: Arc<shared::SharedLink>,
+) {
+    let token = match std::fs::read_to_string(home.join(TOKEN_FILE_NAME)) {
+        Ok(token) => token.trim().to_owned(),
+        Err(error) => {
+            log(
+                "codey.remote_gateway.token_failed",
+                json!({ "message": format!("{error}") }),
+            );
+            return;
+        }
+    };
+    let listener = match bind_listener(http_port).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            log(
+                "codey.remote_gateway.listen_failed",
+                json!({ "message": format!("{error:#}") }),
+            );
+            return;
+        }
+    };
+    let port = listener
+        .local_addr()
+        .map(|address| address.port())
+        .unwrap_or(http_port);
+    let state = Arc::new(State {
+        upstream: UpstreamLink::Shared(upstream),
+        approvals: Approvals::default(),
+        browsers: AtomicUsize::new(0),
+        token,
+        overrides,
+        shared: true,
+    });
+    spawn_request_responder(Arc::clone(&state));
+    publish_url(&home, port, &state.token);
+    log(
+        "codey.remote_gateway.started",
+        json!({
+            "mode": "shared",
             "port": port,
             "lan": lan_ipv4().map(|address| address.to_string()),
             "link": home.join(URL_FILE_NAME).display().to_string(),
@@ -280,13 +441,18 @@ fn load_or_create_token(home: &Path) -> Option<String> {
             return Some(token.to_owned());
         }
     }
-    let token = format!(
+    let token = new_token();
+    std::fs::write(&path, &token).ok()?;
+    Some(token)
+}
+
+/// 网页访问密钥：控制台重新生成时也走这里，保证格式一致。
+pub(crate) fn new_token() -> String {
+    format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
-    );
-    std::fs::write(&path, &token).ok()?;
-    Some(token)
+    )
 }
 
 fn acquire_lock(home: &Path) -> Option<std::fs::File> {
@@ -349,6 +515,37 @@ fn log(event: &str, detail: Value) {
     let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(event, detail);
 }
 
+/// 网页请求的上游通道。
+enum UpstreamLink {
+    /// 独占模式：另起的同源 app-server，通过回环 WebSocket 通信。
+    Isolated(Arc<Upstream>),
+    /// 共享模式：注入桌面 app-server 已有的 stdio 连接。
+    Shared(Arc<shared::SharedLink>),
+}
+
+impl UpstreamLink {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, Value> {
+        match self {
+            Self::Isolated(upstream) => upstream.request(method, params).await,
+            Self::Shared(upstream) => upstream.request(method, params).await,
+        }
+    }
+
+    async fn reply(&self, id: Value, result: Result<Value, Value>) {
+        match self {
+            Self::Isolated(upstream) => upstream.reply(id, result).await,
+            Self::Shared(upstream) => upstream.reply(id, result).await,
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Event> {
+        match self {
+            Self::Isolated(upstream) => upstream.subscribe(),
+            Self::Shared(upstream) => upstream.subscribe(),
+        }
+    }
+}
+
 struct AppServer {
     target: PathBuf,
     args: Vec<OsString>,
@@ -395,11 +592,13 @@ impl AppServer {
 }
 
 struct State {
-    upstream: Arc<Upstream>,
+    upstream: UpstreamLink,
     approvals: Approvals,
     browsers: AtomicUsize,
     token: String,
     overrides: Vec<String>,
+    /// 共享模式的上游就是桌面会话，反向请求由桌面应答，网页不能替它给默认值。
+    shared: bool,
 }
 
 #[derive(Default)]
@@ -426,7 +625,8 @@ impl Approvals {
     }
 }
 
-/// 只有网页能给出合法应答的审批请求才交给浏览器；其余一律安全默认应答，避免会话卡死。
+/// 只有网页能给出合法应答的审批请求才交给浏览器；其余请求由桌面应答或给出安全默认应答，
+/// 避免会话卡死。
 ///
 /// 旧版 `applyPatchApproval` 与 `execCommandApproval` 的决策枚举、以及 `item/permissions`
 /// 需要回传具体权限，网页无法完整构造，因此保持默认拒绝。
@@ -437,7 +637,7 @@ fn is_interactive_approval(method: &str) -> bool {
     )
 }
 
-/// 网页不处理的请求一律给出安全的默认应答，避免会话卡死。
+/// 独占模式下网页不处理的请求一律给出安全的默认应答，避免会话卡死；共享模式由桌面应答。
 fn default_reply(method: &str) -> Result<Value, Value> {
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
@@ -488,26 +688,30 @@ fn spawn_request_responder(state: Arc<State>) {
                 continue;
             };
             if !is_interactive_approval(&method) {
-                let _ = state.upstream.reply(id, default_reply(&method)).await;
+                // 共享模式的上游就是桌面会话，其余反向请求由桌面应答，网页不能抢先给默认值。
+                if !state.shared {
+                    let _ = state.upstream.reply(id, default_reply(&method)).await;
+                }
                 continue;
             }
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                // 没有网页在看时立即拒绝，避免无人应答的会话长时间挂起。
-                let reply = if state.browsers.load(Ordering::Relaxed) == 0 {
-                    None
-                } else {
-                    let wait = state.approvals.register(&id).await;
-                    match tokio::time::timeout(APPROVAL_TIMEOUT, wait).await {
-                        Ok(Ok(value)) => Some(Ok(value)),
-                        _ => {
-                            state.approvals.forget(&id).await;
-                            None
+                // 独占模式没有桌面兜底：没有网页在看时立即拒绝，避免无人应答的会话长时间挂起。
+                if !state.shared && state.browsers.load(Ordering::Relaxed) == 0 {
+                    state.upstream.reply(id, default_reply(&method)).await;
+                    return;
+                }
+                let wait = state.approvals.register(&id).await;
+                match tokio::time::timeout(APPROVAL_TIMEOUT, wait).await {
+                    Ok(Ok(value)) => state.upstream.reply(id, Ok(value)).await,
+                    _ => {
+                        state.approvals.forget(&id).await;
+                        // 共享模式：桌面仍在等用户确认，网页超时不要替它决定。
+                        if !state.shared {
+                            state.upstream.reply(id, default_reply(&method)).await;
                         }
                     }
-                };
-                let reply = reply.unwrap_or_else(|| default_reply(&method));
-                state.upstream.reply(id, reply).await;
+                }
             });
         }
     });
@@ -573,6 +777,11 @@ async fn stream_events(stream: TcpStream, state: Arc<State>) -> Result<()> {
     let mut sse = EventStream::start(stream).await?;
     state.browsers.fetch_add(1, Ordering::Relaxed);
     let _browser = BrowserGuard(Arc::clone(&state));
+    // 共享模式复用桌面连接，没有独立上游连接状态；直接给出已连接，避免网页停在“连接中”。
+    if state.shared {
+        sse.send(&json!({ "kind": "status", "connected": true, "detail": "" }))
+            .await?;
+    }
     let payload = |event: &Event| match event {
         Event::Notification { method, params } => {
             json!({ "kind": "notification", "method": method, "params": params })
@@ -659,6 +868,29 @@ fn bad(message: &str) -> (u16, Value) {
 
 fn upstream_error(error: Value) -> (u16, Value) {
     (502, json!({ "error": error }))
+}
+
+/// app-server 在会话被其他写入者占用时只回一句笼统的 `thread not found`；把发送前接入
+/// 会话的真实原因带上，网页才能给出可读提示。
+fn describe_send_failure(error: Value, resume_error: Option<&Value>) -> Value {
+    let Some(reason) = resume_error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    else {
+        return error;
+    };
+    let mut described = error;
+    if !described.is_object() {
+        return described;
+    }
+    let message = described
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    described["message"] = json!(format!("{message}（发送前接入会话失败：{reason}）"));
+    described
 }
 
 async fn api(state: &Arc<State>, request: &Request) -> (u16, Value) {
@@ -846,19 +1078,24 @@ async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
     if let Some(effort) = body.get("effort").and_then(Value::as_str) {
         params["effort"] = json!(effort);
     }
-    // 发送前把会话接入本进程；失败也继续尝试，由 turn/start 决定最终结果。
-    let _ = state
+    // 发送前把会话接入上游；失败也继续尝试，由 turn/start 决定最终结果，但保留原因用于解释失败。
+    let resume_error = state
         .upstream
         .request(
             "thread/resume",
             json!({ "threadId": id, "excludeTurns": true }),
         )
-        .await;
-    let value = state
-        .upstream
-        .request("turn/start", params)
         .await
-        .map_err(upstream_error)?;
+        .err();
+    let value = match state.upstream.request("turn/start", params).await {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(upstream_error(describe_send_failure(
+                error,
+                resume_error.as_ref(),
+            )));
+        }
+    };
     Ok(json!({ "turn": value.get("turn").cloned().unwrap_or(Value::Null) }))
 }
 

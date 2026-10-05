@@ -36,6 +36,7 @@ import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { customContextRestoredNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
+import { RemoteControlCard } from "./RemoteControlCard";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { SettingsLayout } from "./SettingsLayout";
@@ -1667,6 +1668,7 @@ export function App({
               onSubagentOptimizationChange={handleSubagentOptimizationChange}
             />
           ),
+          remote: <RemoteControlCard />,
           plugins: <CodeyPluginsSection container={popupContainer} />,
           mcp: (active) => (
             <CodexExtensionsPage kind="mcp" active={active} request={extensionRequest} container={popupContainer} />

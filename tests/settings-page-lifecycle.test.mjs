@@ -7,7 +7,7 @@ const source = await readFile(new URL("../src/SettingsLayout.tsx", import.meta.u
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
 }).outputText;
-const pages = ["overview", "models", "prompt", "subagents", "plugins", "mcp", "skills"];
+const pages = ["overview", "models", "prompt", "subagents", "remote", "plugins", "mcp", "skills"];
 
 // 与现有组件测试一样，用轻量 hook/组件身份模型验证生命周期，无需 DOM 或新增依赖。
 function layoutHarness() {

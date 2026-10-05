@@ -32,6 +32,13 @@ if (import.meta.env.DEV) {
     let previewInjectionMode = new URLSearchParams(window.location.search).get("injection") === "cli"
       ? "cli" : "node_options";
     let previewInjectionRepairUntil = 0;
+    const previewRemoteGateway = {
+      enabled: true,
+      port: 8799,
+      token: "preview-remote-gateway-token-0123456789abcdef",
+      url: "http://192.168.1.20:8799/?token=preview-remote-gateway-token-0123456789abcdef",
+      active: true,
+    };
     const configRepairPreview = new URLSearchParams(window.location.search).get("configRepair");
     let previewConfigLoadFailed = configRepairPreview === "load-failure";
     const previewEndpoints = {
@@ -1576,6 +1583,21 @@ if (import.meta.env.DEV) {
           status: "ok",
           result: { httpStatus: 200, responsePreview: "preview" },
         };
+      }
+      if (
+        command === "remote_gateway_status"
+        || command === "save_remote_gateway_config"
+        || command === "regenerate_remote_gateway_token"
+      ) {
+        if (command === "save_remote_gateway_config") {
+          previewRemoteGateway.enabled = args?.enabled === true;
+          const port = Number(args?.port);
+          if (Number.isInteger(port) && port >= 1024 && port <= 65535) previewRemoteGateway.port = port;
+        }
+        if (command === "regenerate_remote_gateway_token") {
+          previewRemoteGateway.token = `preview-remote-gateway-token-${Date.now().toString(36)}`;
+        }
+        return { ...previewRemoteGateway, active: previewRemoteGateway.enabled };
       }
       return { status: "ok" };
     };

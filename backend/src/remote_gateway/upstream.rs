@@ -103,7 +103,7 @@ impl Upstream {
     }
 }
 
-fn upstream_stopped() -> Value {
+pub(super) fn upstream_stopped() -> Value {
     json!({ "code": -32000, "message": "远程网关上游 app-server 未连接" })
 }
 
