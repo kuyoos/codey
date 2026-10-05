@@ -1372,7 +1372,10 @@ async fn api_command(state: &State, request: &Request, id: &str) -> ApiResult {
             // 压缩与评审都要求会话已接入上游，先 resume；失败也继续，由命令本身给出最终错误。
             let _ = state
                 .upstream
-                .request("thread/resume", json!({ "threadId": id, "excludeTurns": true }))
+                .request(
+                    "thread/resume",
+                    json!({ "threadId": id, "excludeTurns": true }),
+                )
                 .await;
             state
                 .upstream
@@ -1384,7 +1387,10 @@ async fn api_command(state: &State, request: &Request, id: &str) -> ApiResult {
         WebCommand::Review => {
             let _ = state
                 .upstream
-                .request("thread/resume", json!({ "threadId": id, "excludeTurns": true }))
+                .request(
+                    "thread/resume",
+                    json!({ "threadId": id, "excludeTurns": true }),
+                )
                 .await;
             // 默认 inline 投递：评审在当前会话内进行，不另开评审会话。
             let value = state
