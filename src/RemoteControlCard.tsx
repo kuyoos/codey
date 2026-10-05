@@ -8,26 +8,52 @@ import { Badge, Button, Input, Label, NumberInput, PasswordInput, Switch, Toolti
 import { SettingsPageHeader } from "./SettingsPageHeader";
 
 /** 与后端 `remote_gateway_status` 回传结构一致。 */
+type RemoteGatewayFrp = {
+  enabled: boolean;
+  serverAddr: string;
+  serverPort: number;
+  token: string;
+  remotePort: number;
+  binary: string;
+  state: string | null;
+  message: string | null;
+  endpoint: string | null;
+  logPath: string | null;
+};
+
 type RemoteGatewayStatus = {
   enabled: boolean;
   port: number;
   token: string;
   url: string | null;
   active: boolean;
+  frp: RemoteGatewayFrp;
 };
 
 const MIN_PORT = 1024;
 const MAX_PORT = 65535;
 const DEFAULT_PORT = 8799;
+const DEFAULT_FRP_SERVER_PORT = 7000;
 
 export function RemoteControlCard() {
   const controlId = useId();
   const portId = controlId + "-port";
   const tokenId = controlId + "-token";
   const urlId = controlId + "-url";
+  const frpAddrId = controlId + "-frp-addr";
+  const frpServerPortId = controlId + "-frp-server-port";
+  const frpTokenId = controlId + "-frp-token";
+  const frpRemotePortId = controlId + "-frp-remote-port";
+  const frpBinaryId = controlId + "-frp-binary";
   const [status, setStatus] = useState<RemoteGatewayStatus | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [port, setPort] = useState(DEFAULT_PORT);
+  const [frpEnabled, setFrpEnabled] = useState(false);
+  const [frpServerAddr, setFrpServerAddr] = useState("");
+  const [frpServerPort, setFrpServerPort] = useState(DEFAULT_FRP_SERVER_PORT);
+  const [frpToken, setFrpToken] = useState("");
+  const [frpRemotePort, setFrpRemotePort] = useState(MIN_PORT);
+  const [frpBinary, setFrpBinary] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
@@ -38,6 +64,13 @@ export function RemoteControlCard() {
     setStatus(next);
     setEnabled(next.enabled);
     setPort(next.port);
+    const frp = next.frp;
+    setFrpEnabled(frp.enabled);
+    setFrpServerAddr(frp.serverAddr);
+    setFrpServerPort(frp.serverPort || DEFAULT_FRP_SERVER_PORT);
+    setFrpToken(frp.token);
+    setFrpRemotePort(frp.remotePort || MIN_PORT);
+    setFrpBinary(frp.binary);
   };
 
   useEffect(() => {
@@ -58,7 +91,16 @@ export function RemoteControlCard() {
   }, []);
 
   const busy = loading || saving || regenerating;
-  const dirty = status !== null && (enabled !== status.enabled || port !== status.port);
+  const dirty =
+    status !== null &&
+    (enabled !== status.enabled ||
+      port !== status.port ||
+      frpEnabled !== status.frp.enabled ||
+      frpServerAddr !== status.frp.serverAddr ||
+      frpServerPort !== status.frp.serverPort ||
+      frpToken !== status.frp.token ||
+      frpRemotePort !== status.frp.remotePort ||
+      frpBinary !== status.frp.binary);
 
   const handleSave = async () => {
     setSaving(true);
@@ -66,6 +108,12 @@ export function RemoteControlCard() {
       const next = await invoke<RemoteGatewayStatus>("save_remote_gateway_config", {
         enabled,
         port,
+        frpEnabled,
+        frpServerAddr,
+        frpServerPort,
+        frpToken,
+        frpRemotePort,
+        frpBinary,
       });
       applyStatus(next);
       toast.success("已保存，重启 Codex 后生效");
@@ -101,6 +149,24 @@ export function RemoteControlCard() {
   };
 
   const active = status?.active === true;
+  const frpState = status?.frp.state ?? null;
+  const frpBadge = (() => {
+    if (!frpEnabled) return <Badge variant="secondary">未启用</Badge>;
+    switch (frpState) {
+      case "running":
+        return <Badge variant="success">已生效</Badge>;
+      case "starting":
+        return <Badge variant="warning">启动中</Badge>;
+      case "failed":
+      case "invalid":
+      case "exited":
+        return <Badge variant="destructive">映射失败</Badge>;
+      case "unknown":
+        return <Badge variant="warning">状态未知</Badge>;
+      default:
+        return <Badge variant="warning">重启后生效</Badge>;
+    }
+  })();
   const copyIcon = (kind: "token" | "url") =>
     copied === kind ? (
       <IconCheck size={13} className="text-success" aria-hidden="true" />
@@ -233,6 +299,122 @@ export function RemoteControlCard() {
                     </small>
                   </div>
                 </div>
+
+                <div className="prompt-field">
+                  <div className="prompt-field-label-row">
+                    <Label className="prompt-field-label">公网映射（frp）</Label>
+                    {frpBadge}
+                  </div>
+                  <div className="prompt-field-control">
+                    <div className="flex items-center justify-between gap-3">
+                      <small className="field-hint">
+                        用 frp 把局域网端口映射到公网，异地也能访问同一页面。
+                      </small>
+                      <Switch
+                        checked={frpEnabled}
+                        disabled={busy}
+                        aria-label="启用公网映射"
+                        onCheckedChange={setFrpEnabled}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {frpEnabled ? (
+                  <>
+                    <div className="prompt-field">
+                      <Label htmlFor={frpAddrId} className="prompt-field-label">
+                        frp 服务器地址
+                      </Label>
+                      <div className="prompt-field-control">
+                        <Input
+                          id={frpAddrId}
+                          value={frpServerAddr}
+                          disabled={busy}
+                          placeholder="frps.example.com"
+                          onChange={(event) => setFrpServerAddr(event.target.value)}
+                          aria-label="frp 服务器地址"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="prompt-field">
+                      <Label htmlFor={frpServerPortId} className="prompt-field-label">
+                        frp 服务器端口
+                      </Label>
+                      <div className="prompt-field-control">
+                        <NumberInput
+                          value={frpServerPort}
+                          minValue={MIN_PORT}
+                          maxValue={MAX_PORT}
+                          disabled={busy}
+                          onChange={setFrpServerPort}
+                          aria-label="frp 服务器端口"
+                        />
+                        <small className="field-hint">frps 的监听端口，默认 {DEFAULT_FRP_SERVER_PORT}。</small>
+                      </div>
+                    </div>
+
+                    <div className="prompt-field">
+                      <Label htmlFor={frpTokenId} className="prompt-field-label">
+                        认证令牌
+                      </Label>
+                      <div className="prompt-field-control">
+                        <PasswordInput
+                          id={frpTokenId}
+                          value={frpToken}
+                          disabled={busy}
+                          placeholder="与 frps 的 auth.token 一致，可留空"
+                          onChange={(event) => setFrpToken(event.target.value)}
+                          aria-label="frp 认证令牌"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="prompt-field">
+                      <Label htmlFor={frpRemotePortId} className="prompt-field-label">
+                        远程端口
+                      </Label>
+                      <div className="prompt-field-control">
+                        <NumberInput
+                          value={frpRemotePort}
+                          minValue={MIN_PORT}
+                          maxValue={MAX_PORT}
+                          disabled={busy}
+                          onChange={setFrpRemotePort}
+                          aria-label="远程端口"
+                        />
+                        <small className="field-hint">frps 上对外开放的端口，需在服务端放行。</small>
+                      </div>
+                    </div>
+
+                    <div className="prompt-field">
+                      <Label htmlFor={frpBinaryId} className="prompt-field-label">
+                        本地 frpc 路径
+                      </Label>
+                      <div className="prompt-field-control">
+                        <Input
+                          id={frpBinaryId}
+                          value={frpBinary}
+                          disabled={busy}
+                          placeholder="留空则自动下载 frpc"
+                          onChange={(event) => setFrpBinary(event.target.value)}
+                          aria-label="本地 frpc 路径"
+                        />
+                      </div>
+                    </div>
+
+                    {status?.frp.endpoint ? (
+                      <small className="field-hint">映射地址：{status.frp.endpoint}</small>
+                    ) : null}
+                    {status?.frp.message ? (
+                      <small className="field-hint">{status.frp.message}</small>
+                    ) : null}
+                    {status?.frp.logPath ? (
+                      <small className="field-hint">frpc 日志：{status.frp.logPath}</small>
+                    ) : null}
+                  </>
+                ) : null}
               </div>
 
               <div className="prompt-optimization-toolbar-actions">

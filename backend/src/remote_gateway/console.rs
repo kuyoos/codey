@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::{
-    CONFIG_FILE_NAME, GatewayConfig, GatewayMode, TOKEN_FILE_NAME, URL_FILE_NAME,
+    CONFIG_FILE_NAME, FrpConfig, GatewayConfig, GatewayMode, TOKEN_FILE_NAME, URL_FILE_NAME, frp,
     load_or_create_config, load_or_create_token, new_token,
 };
 
@@ -42,6 +42,8 @@ fn status() -> Value {
         && url
             .as_deref()
             .is_some_and(|url| url.contains(&format!(":{}", config.port)) && url.contains(&token));
+    // frp 运行状态由网关线程写状态文件，这里只做合并展示。
+    let frp_state = frp::read_status(&home);
     json!({
         "status": "ok",
         "enabled": config.enabled,
@@ -50,6 +52,18 @@ fn status() -> Value {
         "token": token,
         "url": url,
         "active": active,
+        "frp": {
+            "enabled": config.frp.enabled,
+            "serverAddr": config.frp.server_addr,
+            "serverPort": config.frp.server_port,
+            "token": config.frp.token,
+            "remotePort": config.frp.remote_port,
+            "binary": config.frp.binary,
+            "state": frp_state.get("state").cloned().unwrap_or(Value::Null),
+            "message": frp_state.get("message").cloned().unwrap_or(Value::Null),
+            "endpoint": frp_state.get("endpoint").cloned().unwrap_or(Value::Null),
+            "logPath": frp_state.get("logPath").cloned().unwrap_or(Value::Null),
+        },
         "configPath": home.join(CONFIG_FILE_NAME).display().to_string(),
     })
 }
@@ -59,18 +73,65 @@ fn save(args: &Value) -> Result<Value, String> {
         .get("enabled")
         .and_then(Value::as_bool)
         .ok_or_else(|| "缺少参数：enabled".to_string())?;
-    let port = args
-        .get("port")
-        .and_then(Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())
-        .filter(|port| *port >= MIN_PORT)
-        .ok_or_else(|| format!("端口必须是 {MIN_PORT}-65535 之间的整数"))?;
+    let port = required_port(args, "port", "监听端口")?;
     let home = home();
     let mut config = load_or_create_config(&home);
     config.enabled = enabled;
     config.port = port;
+    // 缺省字段沿用现有配置，便于旧版前端或部分更新时保持兼容。
+    let frp_enabled = args
+        .get("frpEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(config.frp.enabled);
+    let server_addr =
+        string_arg(args, "frpServerAddr").unwrap_or(config.frp.server_addr.trim().to_owned());
+    let server_port =
+        optional_port(args, "frpServerPort", "frp 服务器端口")?.unwrap_or(config.frp.server_port);
+    let token = string_arg(args, "frpToken").unwrap_or(config.frp.token.trim().to_owned());
+    let remote_port =
+        optional_port(args, "frpRemotePort", "远程端口")?.unwrap_or(config.frp.remote_port);
+    let binary = string_arg(args, "frpBinary").unwrap_or(config.frp.binary.trim().to_owned());
+    if frp_enabled {
+        if server_addr.is_empty() {
+            return Err("启用端口映射后需要填写 frp 服务器地址".to_owned());
+        }
+        if remote_port < MIN_PORT {
+            return Err(format!("远程端口必须是 {MIN_PORT}-65535 之间的整数"));
+        }
+    }
+    config.frp = FrpConfig {
+        enabled: frp_enabled,
+        server_addr,
+        server_port,
+        token,
+        remote_port,
+        binary,
+    };
     write_config(&home, &config)?;
     Ok(status())
+}
+
+fn string_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_owned())
+}
+
+fn required_port(args: &Value, key: &str, label: &str) -> Result<u16, String> {
+    optional_port(args, key, label)?.ok_or_else(|| format!("缺少参数：{key}"))
+}
+
+/// 解析端口参数；缺失返回 `None`，存在但越界直接报错，避免静默回退掩盖输入错误。
+fn optional_port(args: &Value, key: &str, label: &str) -> Result<Option<u16>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let port = value
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port >= MIN_PORT)
+        .ok_or_else(|| format!("{label}必须是 {MIN_PORT}-65535 之间的整数"))?;
+    Ok(Some(port))
 }
 
 fn regenerate_token() -> Result<Value, String> {

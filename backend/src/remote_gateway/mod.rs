@@ -12,6 +12,7 @@
 //! 因此跟随桌面 app-server 的生命周期，也不会重复监听端口。
 
 pub(crate) mod console;
+mod frp;
 mod http;
 mod shared;
 mod upstream;
@@ -70,6 +71,8 @@ struct GatewayConfig {
     port: u16,
     #[serde(default)]
     mode: GatewayMode,
+    #[serde(default)]
+    frp: FrpConfig,
 }
 
 /// 上游连接方式；控制台只暴露开关与端口，模式留作严格隔离时的兜底。
@@ -91,12 +94,49 @@ fn port_default() -> u16 {
     DEFAULT_PORT
 }
 
+fn frp_server_port_default() -> u16 {
+    7000
+}
+
+/// frp 映射配置；控制台只暴露常用字段，其余保持默认。
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FrpConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    server_addr: String,
+    #[serde(default = "frp_server_port_default")]
+    server_port: u16,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    remote_port: u16,
+    /// 留空表示用自动下载的 frpc；填写后使用本机已有的可执行文件。
+    #[serde(default)]
+    binary: String,
+}
+
+impl Default for FrpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_addr: String::new(),
+            server_port: frp_server_port_default(),
+            token: String::new(),
+            remote_port: 0,
+            binary: String::new(),
+        }
+    }
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             enabled: enabled_default(),
             port: port_default(),
             mode: GatewayMode::default(),
+            frp: FrpConfig::default(),
         }
     }
 }
@@ -306,6 +346,7 @@ async fn serve_forever(
         .local_addr()
         .map(|address| address.port())
         .unwrap_or(http_port);
+    frp::ensure_started(&home, port);
     let state = Arc::new(State {
         upstream: UpstreamLink::Isolated(Arc::clone(&upstream)),
         approvals: Approvals::default(),
@@ -364,6 +405,7 @@ async fn serve_shared(
         .local_addr()
         .map(|address| address.port())
         .unwrap_or(http_port);
+    frp::ensure_started(&home, port);
     let state = Arc::new(State {
         upstream: UpstreamLink::Shared(upstream),
         approvals: Approvals::default(),

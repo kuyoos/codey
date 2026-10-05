@@ -38,6 +38,18 @@ if (import.meta.env.DEV) {
       token: "preview-remote-gateway-token-0123456789abcdef",
       url: "http://192.168.1.20:8799/?token=preview-remote-gateway-token-0123456789abcdef",
       active: true,
+      frp: {
+        enabled: false,
+        serverAddr: "",
+        serverPort: 7000,
+        token: "",
+        remotePort: 0,
+        binary: "",
+        state: "disabled",
+        message: "未启用端口映射",
+        endpoint: null,
+        logPath: null,
+      },
     };
     const configRepairPreview = new URLSearchParams(window.location.search).get("configRepair");
     let previewConfigLoadFailed = configRepairPreview === "load-failure";
@@ -1593,6 +1605,17 @@ if (import.meta.env.DEV) {
           previewRemoteGateway.enabled = args?.enabled === true;
           const port = Number(args?.port);
           if (Number.isInteger(port) && port >= 1024 && port <= 65535) previewRemoteGateway.port = port;
+          const frp = previewRemoteGateway.frp;
+          frp.enabled = args?.frpEnabled === true;
+          if (typeof args?.frpServerAddr === "string") frp.serverAddr = args.frpServerAddr;
+          const serverPort = Number(args?.frpServerPort);
+          if (Number.isInteger(serverPort) && serverPort >= 1024 && serverPort <= 65535) frp.serverPort = serverPort;
+          if (typeof args?.frpToken === "string") frp.token = args.frpToken;
+          const remotePort = Number(args?.frpRemotePort);
+          if (Number.isInteger(remotePort) && remotePort >= 1024 && remotePort <= 65535) frp.remotePort = remotePort;
+          if (typeof args?.frpBinary === "string") frp.binary = args.frpBinary;
+          frp.state = frp.enabled ? "starting" : "disabled";
+          frp.message = frp.enabled ? "已保存，重启 Codex 后启动映射" : "未启用端口映射";
         }
         if (command === "regenerate_remote_gateway_token") {
           previewRemoteGateway.token = `preview-remote-gateway-token-${Date.now().toString(36)}`;
