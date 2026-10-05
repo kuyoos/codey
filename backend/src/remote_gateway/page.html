@@ -291,6 +291,19 @@
     .approval-card .actions .allow { background: var(--accent); border-color: var(--accent); color: #08101c; font-weight: 600; }
 
     /* ---------- 输入区 ---------- */
+    /* 排队待发的消息：贴在输入框上方，可插队立即执行或删除。 */
+    .queue-box {
+      flex: none; border-top: 1px solid var(--line);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+    }
+    .queue-box:not([hidden]) + .runbar { border-top: 0; }
+    .queue-head { padding: 5px 12px 0; color: var(--faint); font-size: 11.5px; }
+    .queue-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; }
+    .queue-text { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .queue-actions { flex: none; display: flex; gap: 4px; }
+    .queue-btn { padding: 3px 9px; border-radius: 8px; background: var(--surface-3); color: var(--text); font-size: 11.5px; }
+    .queue-btn:hover { background: var(--line-2); }
+    .queue-btn.danger { color: var(--danger); }
     /* 运行状态条：紧贴输入框上方，回合进行中显示用时、token 与思考次数。 */
     .runbar {
       flex: none; display: flex; align-items: center; gap: 8px;
@@ -458,7 +471,7 @@
     }
     /* 宽屏时把正文收窄居中，和常见聊天网页一样保持行宽可读。 */
     @media (min-width: 1100px) {
-      .transcript, .composer, .chat-head, .approval-host, .runbar {
+      .transcript, .composer, .chat-head, .approval-host, .runbar, .queue-head, .queue-item {
         padding-left: max(14px, calc((100% - 860px) / 2));
         padding-right: max(14px, calc((100% - 860px) / 2));
       }
@@ -520,6 +533,7 @@
         <svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 5v14"/><path d="M6 13l6 6 6-6"/></svg>
         <span class="new" hidden></span>
       </button>
+      <div class="queue-box" id="queueBox" hidden></div>
       <div class="runbar" id="runbar" hidden></div>
       <form class="composer" id="composer">
         <button class="cmd-btn" id="cmdBtn" type="button" aria-label="命令">/</button>
@@ -641,6 +655,7 @@ const state = {
   autoScroll: true,
   live: new Map(),
   usage: { total: null, turns: {} },
+  queue: [],
   approvals: [],
   reloadTimer: null,
   searchTimer: null,
@@ -1345,6 +1360,61 @@ function adoptRunningTurn() {
   }
 }
 
+/* ================= 排队消息 ================= */
+
+// 排队由上游维护（桌面端也在用同一份队列），网页只读列表并触发「插队立即执行 / 删除」。
+function renderQueue() {
+  const box = $("queueBox");
+  const items = state.queue || [];
+  box.textContent = "";
+  if (!items.length) {
+    box.hidden = true;
+    return;
+  }
+  box.appendChild(el("div", "queue-head", "排队中 " + items.length + " 条"));
+  items.forEach((item, index) => {
+    const row = el("div", "queue-item");
+    row.appendChild(el("span", "queue-text", index + 1 + ". " + (item.text || "（非文本消息）")));
+    const actions = el("div", "queue-actions");
+    const start = el("button", "queue-btn", "立即执行");
+    start.type = "button";
+    start.addEventListener("click", () => queueAction("start", item.id));
+    const remove = el("button", "queue-btn danger", "删除");
+    remove.type = "button";
+    remove.addEventListener("click", () => queueAction("delete", item.id));
+    actions.appendChild(start);
+    actions.appendChild(remove);
+    row.appendChild(actions);
+    box.appendChild(row);
+  });
+  box.hidden = false;
+}
+
+async function loadQueue(id) {
+  if (!id) return;
+  const body = await api("/api/threads/" + encodeURIComponent(id) + "/queue");
+  if (state.threadId !== id) return;
+  state.queue = (body && body.items) || [];
+  renderQueue();
+}
+
+async function queueAction(action, queuedSubmissionId) {
+  if (!state.threadId || !queuedSubmissionId) return;
+  try {
+    const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/queue", {
+      method: "POST",
+      body: JSON.stringify({ action, queuedSubmissionId }),
+    });
+    toast(action === "start" ? "已请求插队执行" : (body && body.deleted === false ? "这条排队消息已经不在了" : "已删除排队消息"));
+    // 立即执行会另起回合，等上游的 turn/started 事件点亮状态条即可，这里只对齐队列列表。
+    loadQueue(state.threadId).catch(() => {});
+    scheduleReload(400);
+  } catch (error) {
+    reportError(error);
+    loadQueue(state.threadId).catch(() => {});
+  }
+}
+
 function renderTranscript(forceScroll) {
   const root = $("transcript");
   const pinned = forceScroll || isPinned(root);
@@ -1689,12 +1759,14 @@ async function openThread(id) {
   state.autoScroll = true;
   state.live.clear();
   state.usage = { total: null, turns: {} };
+  state.queue = [];
   state.approvals = [];
   clearCommand();
   closeSlash();
   cancelSendMode();
   state.slashIndex = 0;
   renderApprovals();
+  renderQueue();
   try { localStorage.setItem(LAST_THREAD_KEY, id); } catch { /* 隐私模式下忽略 */ }
   $("chatTitle").textContent = "载入中…";
   $("chatMeta").textContent = "";
@@ -1713,6 +1785,7 @@ async function openThread(id) {
   await loadTurns(null);
   updateAtBottom();
   loadUsage(id).catch(() => {});
+  loadQueue(id).catch(() => {});
 }
 
 function closeThread(id) {
@@ -2024,6 +2097,7 @@ async function send(text, mode) {
     }
     if (mode === "queue") {
       toast("已排队，等当前回合结束后发送");
+      loadQueue(state.threadId).catch(() => {});
       scheduleReload(600);
       return;
     }
@@ -2147,7 +2221,13 @@ function handleEvent(event) {
   }
   if (event.method === "turn/started") {
     startRun(params.turn);
+    if (state.threadId) loadQueue(state.threadId).catch(() => {});
     scheduleReload(200);
+    return;
+  }
+  // 上游在队列增删或推进时只发一条通知，列表内容要重新取。
+  if (event.method === "thread/queue/changed") {
+    if (state.threadId) loadQueue(state.threadId).catch(() => {});
     return;
   }
   if (event.method === "item/started") {

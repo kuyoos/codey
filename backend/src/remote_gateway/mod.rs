@@ -952,7 +952,9 @@ async fn api(state: &Arc<State>, request: &Request) -> (u16, Value) {
         ("GET", ["api", "threads", id]) => api_thread(state, id).await,
         ("GET", ["api", "threads", id, "turns"]) => api_turns(state, request, id).await,
         ("GET", ["api", "threads", id, "usage"]) => api_usage(state, id).await,
+        ("GET", ["api", "threads", id, "queue"]) => api_queue(state, id).await,
         ("POST", ["api", "threads", id, "messages"]) => api_message(state, request, id).await,
+        ("POST", ["api", "threads", id, "queue"]) => api_queue_action(state, request, id).await,
         ("POST", ["api", "threads", id, "command"]) => api_command(state, request, id).await,
         ("POST", ["api", "threads", id, "interrupt"]) => api_interrupt(state, request, id).await,
         ("POST", ["api", "threads", id, "close"]) => api_close(state, id).await,
@@ -1391,6 +1393,111 @@ async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
     })
 }
 
+/// 网页一次最多列出这么多条排队消息，不需要完整分页；预览只取正文前若干字。
+const QUEUE_LIMIT: u32 = 50;
+const QUEUE_PREVIEW_CHARS: usize = 200;
+
+/// 排队消息在网页上只用一行预览表示：只取文本片段并压掉空白，图片等非文本输入不下发。
+fn queue_item(submission: &Value) -> Value {
+    let text = submission
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(QUEUE_PREVIEW_CHARS).collect();
+    let preview = if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    };
+    json!({
+        "id": submission.get("id").cloned().unwrap_or(Value::Null),
+        "text": if preview.is_empty() { "（非文本消息）".to_owned() } else { preview },
+    })
+}
+
+/// 网页可对排队消息执行的动作：立即插队执行，或删除。都只按 ID 作用于单条提交。
+#[derive(Debug, PartialEq, Eq)]
+enum QueueAction {
+    Delete(String),
+    Start(String),
+}
+
+fn queued_submission_id(body: &Value) -> Result<&str, (u16, Value)> {
+    body.get("queuedSubmissionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| bad("缺少排队消息 ID"))
+}
+
+fn parse_queue_action(body: &Value) -> Result<QueueAction, (u16, Value)> {
+    match body.get("action").and_then(Value::as_str).map(str::trim) {
+        Some("delete") => Ok(QueueAction::Delete(queued_submission_id(body)?.to_owned())),
+        Some("start") => Ok(QueueAction::Start(queued_submission_id(body)?.to_owned())),
+        _ => Err(bad("不支持的排队操作")),
+    }
+}
+
+async fn api_queue(state: &State, id: &str) -> ApiResult {
+    let value = state
+        .upstream
+        .request(
+            "thread/queue/list",
+            json!({ "threadId": id, "limit": QUEUE_LIMIT }),
+        )
+        .await
+        .map_err(upstream_error)?;
+    let items = value
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|data| data.iter().map(queue_item).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(json!({ "items": items }))
+}
+
+async fn api_queue_action(state: &State, request: &Request, id: &str) -> ApiResult {
+    let body = request.json().map_err(|error| bad(&error.to_string()))?;
+    match parse_queue_action(&body)? {
+        QueueAction::Delete(submission) => {
+            let value = state
+                .upstream
+                .request(
+                    "thread/queue/delete",
+                    json!({ "threadId": id, "queuedSubmissionId": submission }),
+                )
+                .await
+                .map_err(upstream_error)?;
+            Ok(json!({
+                "deleted": value.get("deleted").cloned().unwrap_or(json!(true)),
+            }))
+        }
+        QueueAction::Start(submission) => {
+            // 不重写内容，只让这条插队开始；上游返回它开启的回合。
+            let value = state
+                .upstream
+                .request(
+                    "thread/queue/start",
+                    json!({ "threadId": id, "queuedSubmissionId": submission }),
+                )
+                .await
+                .map_err(upstream_error)?;
+            Ok(json!({
+                "started": true,
+                "turn": value.get("turn").cloned().unwrap_or(Value::Null),
+            }))
+        }
+    }
+}
+
 /// 网页可触发的斜杠命令。网关是局域网可达的带令牌入口，只放行这几个固定动作，
 /// 绝不把任意 app-server 方法透传出去。
 #[derive(Debug, PartialEq, Eq)]
@@ -1627,6 +1734,45 @@ mod tests {
         assert!(parse_send_mode(&json!({ "mode": "steer" })).is_err());
         assert!(parse_send_mode(&json!({ "mode": "steer", "turnId": "  " })).is_err());
         assert!(parse_send_mode(&json!({ "mode": "broadcast" })).is_err());
+    }
+
+    #[test]
+    fn queued_items_are_slimmed_and_actions_gated() {
+        // 只保留标识与文本预览：图片等非文本输入不下发，长正文截断，空白压成一行。
+        let item = queue_item(&json!({
+            "id": "q1",
+            "clientUserMessageId": "c1",
+            "input": [
+                { "type": "text", "text": "  第一行\n第二行  " },
+                { "type": "image", "url": "https://example.com/a.png" },
+            ],
+        }));
+        assert_eq!(item["id"], json!("q1"));
+        assert_eq!(item["text"], json!("第一行 第二行"));
+        assert!(item.get("clientUserMessageId").is_none());
+        assert_eq!(
+            queue_item(&json!({ "id": "q2", "input": [{ "type": "image", "url": "x" }] }))["text"],
+            json!("（非文本消息）")
+        );
+        let long = "字".repeat(QUEUE_PREVIEW_CHARS + 5);
+        let preview = queue_item(&json!({ "id": "q3", "input": [{ "type": "text", "text": long }] }));
+        let text = preview["text"].as_str().expect("text");
+        assert!(text.ends_with('…'));
+        assert_eq!(text.chars().count(), QUEUE_PREVIEW_CHARS + 1);
+
+        assert_eq!(
+            parse_queue_action(&json!({ "action": "delete", "queuedSubmissionId": " q1 " })),
+            Ok(QueueAction::Delete("q1".to_owned()))
+        );
+        assert_eq!(
+            parse_queue_action(&json!({ "action": "start", "queuedSubmissionId": "q2" })),
+            Ok(QueueAction::Start("q2".to_owned()))
+        );
+        // 未知动作与缺 ID 一律拒绝，不向上游透传。
+        assert!(parse_queue_action(&json!({ "action": "reorder" })).is_err());
+        assert!(parse_queue_action(&json!({ "action": "delete" })).is_err());
+        assert!(parse_queue_action(&json!({ "action": "start", "queuedSubmissionId": " " })).is_err());
+        assert!(parse_queue_action(&json!({})).is_err());
     }
 
     #[test]
