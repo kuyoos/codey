@@ -41,6 +41,9 @@ const LOCK_FILE_NAME: &str = ".codey-remote-gateway.lock";
 const WS_TOKEN_FILE_NAME: &str = ".codey-remote-gateway.ws-token";
 const DEFAULT_PORT: u16 = 8799;
 const DEFAULT_PAGE_TURNS: u32 = 8;
+/// 网页只展示概要，命令行与输出各保留一小段预览。
+const COMMAND_PREVIEW_CHARS: usize = 200;
+const OUTPUT_PREVIEW_CHARS: usize = 400;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const PAGE: &str = include_str!("page.html");
 
@@ -1092,16 +1095,16 @@ async fn api_turns(state: &State, request: &Request, id: &str) -> ApiResult {
         .await
         .map_err(upstream_error)?;
     let mut turns = value.get("data").cloned().unwrap_or(json!([]));
-    strip_reasoning_text(&mut turns);
+    slim_turns(&mut turns);
     Ok(json!({
         "turns": turns,
         "nextCursor": value.get("nextCursor").cloned().unwrap_or(Value::Null),
     }))
 }
 
-/// 网页只显示思考的步数，不需要推理全文；长回合的推理正文能占响应三分之一以上，
-/// 去掉它可以明显缩短网页加载与渲染时间。
-fn strip_reasoning_text(turns: &mut Value) {
+/// 网页只需要“做了什么”的概要：推理正文、工具参数与结果、命令输出正文、文件 diff
+/// 在真实会话里能占响应九成以上，在网关侧统一裁剪后，网页加载更快、流量更低。
+fn slim_turns(turns: &mut Value) {
     let Some(list) = turns.as_array_mut() else {
         return;
     };
@@ -1110,15 +1113,64 @@ fn strip_reasoning_text(turns: &mut Value) {
             continue;
         };
         for item in items.iter_mut() {
-            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            let Some(object) = item.as_object_mut() else {
                 continue;
-            }
-            if let Some(object) = item.as_object_mut() {
-                let _ = object.remove("summary");
-                let _ = object.remove("content");
+            };
+            match object.get("type").and_then(Value::as_str) {
+                Some("reasoning") => {
+                    let _ = object.remove("summary");
+                    let _ = object.remove("content");
+                }
+                Some("commandExecution") => {
+                    let _ = object.remove("commandActions");
+                    truncate_field(object, "command", COMMAND_PREVIEW_CHARS);
+                    truncate_field(object, "aggregatedOutput", OUTPUT_PREVIEW_CHARS);
+                }
+                Some("mcpToolCall" | "dynamicToolCall") => {
+                    let _ = object.remove("arguments");
+                    let _ = object.remove("result");
+                    let _ = object.remove("appContext");
+                    let _ = object.remove("mcpAppUi");
+                    truncate_field(object, "error", OUTPUT_PREVIEW_CHARS);
+                }
+                Some("functionCallOutput") => {
+                    truncate_field(object, "output", OUTPUT_PREVIEW_CHARS);
+                }
+                Some("webSearch") => {
+                    let _ = object.remove("results");
+                }
+                Some("collabAgentToolCall") => {
+                    let _ = object.remove("agentsStates");
+                    truncate_field(object, "prompt", OUTPUT_PREVIEW_CHARS);
+                }
+                Some("fileChange") => {
+                    let Some(changes) = object.get_mut("changes").and_then(Value::as_array_mut)
+                    else {
+                        continue;
+                    };
+                    for change in changes.iter_mut() {
+                        if let Some(entry) = change.as_object_mut() {
+                            let _ = entry.remove("diff");
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
+}
+
+/// 命令与输出只保留开头一段，超出部分标成截断，网页仍能看出大致内容。
+fn truncate_field(object: &mut serde_json::Map<String, Value>, key: &str, max_chars: usize) {
+    let Some(Value::String(text)) = object.get(key) else {
+        return;
+    };
+    if text.chars().count() <= max_chars {
+        return;
+    }
+    let mut preview: String = text.chars().take(max_chars).collect();
+    preview.push_str("\n…（已截断）");
+    object.insert(key.to_owned(), Value::String(preview));
 }
 
 async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
@@ -1214,26 +1266,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reasoning_text_is_stripped_without_touching_other_items() {
+    fn turn_items_are_slimmed_for_the_web() {
+        let long_output = "行".repeat(OUTPUT_PREVIEW_CHARS + 50);
         let mut turns = json!([
             {
                 "id": "t1",
                 "items": [
                     { "type": "reasoning", "id": "r1", "summary": ["很长的推理"], "content": ["正文"] },
                     { "type": "agentMessage", "id": "a1", "text": "回答" },
-                    { "type": "reasoning", "id": "r2" }
+                    { "type": "commandExecution", "id": "c1", "command": "cargo build", "aggregatedOutput": long_output, "commandActions": [{ "command": "cargo build" }] },
+                    { "type": "mcpToolCall", "id": "m1", "server": "srv", "tool": "tool", "arguments": { "big": "参数" }, "result": { "big": "结果" } },
+                    { "type": "fileChange", "id": "f1", "changes": [{ "path": "src/a.rs", "kind": { "type": "update", "move_path": null }, "diff": "@@ -1,1 +1,2 @@" }] },
+                    { "type": "webSearch", "id": "w1", "query": "问题", "results": [{ "huge": "结果" }] }
                 ]
             },
             { "id": "t2" }
         ]);
-        strip_reasoning_text(&mut turns);
+        slim_turns(&mut turns);
         let items = turns[0]["items"].as_array().expect("items");
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 6);
         assert_eq!(items[0]["type"], json!("reasoning"));
-        assert_eq!(items[0]["id"], json!("r1"));
         assert!(items[0].get("summary").is_none());
         assert!(items[0].get("content").is_none());
         assert_eq!(items[1]["text"], json!("回答"));
-        assert_eq!(items[2]["id"], json!("r2"));
+        assert_eq!(items[2]["command"], json!("cargo build"));
+        assert!(items[2].get("commandActions").is_none());
+        let output = items[2]["aggregatedOutput"].as_str().expect("output");
+        assert!(output.ends_with("…（已截断）"));
+        assert!(output.chars().count() < long_output.chars().count());
+        assert!(items[3].get("arguments").is_none());
+        assert!(items[3].get("result").is_none());
+        assert_eq!(items[3]["server"], json!("srv"));
+        assert!(items[4]["changes"][0].get("diff").is_none());
+        assert_eq!(items[4]["changes"][0]["path"], json!("src/a.rs"));
+        assert_eq!(items[4]["changes"][0]["kind"]["type"], json!("update"));
+        assert!(items[5].get("results").is_none());
+        assert_eq!(items[5]["query"], json!("问题"));
     }
 }

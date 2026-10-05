@@ -4,7 +4,7 @@ import { toast } from "@heroui/react";
 
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
-import { Badge, Button, Input, Label, NumberInput, PasswordInput, Switch, Tooltip } from "./components/ui";
+import { Badge, Button, Input, Label, PasswordInput, Switch, Tooltip } from "./components/ui";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 
 /** 与后端 `remote_gateway_status` 回传结构一致。 */
@@ -35,7 +35,63 @@ const MAX_PORT = 65535;
 const DEFAULT_PORT = 8799;
 const DEFAULT_FRP_SERVER_PORT = 7000;
 
-export function RemoteControlCard() {
+/** 远程控制卡片把保存动作交给控制台全局保存按钮，这里只暴露必要入口。 */
+export type RemoteControlHandle = {
+  save: () => Promise<void>;
+  reset: () => void;
+};
+
+type RemoteControlCardProps = {
+  isBusy?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+  handleRef?: { current: RemoteControlHandle | null };
+};
+
+type PortInputProps = {
+  id: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled?: boolean;
+  ariaLabel: string;
+  onChange: (value: number) => void;
+};
+
+/**
+ * 端口用普通输入框：只接受数字，失焦时夹到合法区间。
+ * 步进按钮会把五位端口挤到显示不全，这里不用。
+ */
+function PortInput({ id, value, min, max, disabled, ariaLabel, onChange }: PortInputProps) {
+  const [text, setText] = useState(() => String(value));
+  useEffect(() => {
+    setText((current) => (Number(current) === value ? current : String(value)));
+  }, [value]);
+  const commit = () => {
+    const parsed = Number.parseInt(text, 10);
+    const next = Number.isFinite(parsed) && parsed > 0 ? Math.min(max, Math.max(min, parsed)) : value;
+    setText(String(next));
+    if (next !== value) onChange(next);
+  };
+  return (
+    <Input
+      id={id}
+      value={text}
+      inputMode="numeric"
+      autoComplete="off"
+      disabled={disabled}
+      aria-label={ariaLabel}
+      onChange={(event) => {
+        const digits = event.target.value.replace(/\D/g, "").slice(0, 5);
+        setText(digits);
+        const parsed = Number.parseInt(digits, 10);
+        if (Number.isFinite(parsed) && parsed >= min && parsed <= max) onChange(parsed);
+      }}
+      onBlur={commit}
+    />
+  );
+}
+
+export function RemoteControlCard({ isBusy = false, onDirtyChange, handleRef }: RemoteControlCardProps) {
   const controlId = useId();
   const portId = controlId + "-port";
   const tokenId = controlId + "-token";
@@ -90,7 +146,7 @@ export function RemoteControlCard() {
     };
   }, []);
 
-  const busy = loading || saving || regenerating;
+  const busy = loading || saving || regenerating || isBusy;
   const dirty =
     status !== null &&
     (enabled !== status.enabled ||
@@ -102,7 +158,12 @@ export function RemoteControlCard() {
       frpRemotePort !== status.frp.remotePort ||
       frpBinary !== status.frp.binary);
 
-  const handleSave = async () => {
+  // 控制台顶部保存按钮负责触发，这里不再单独放保存按钮。
+  const restore = () => {
+    if (status) applyStatus(status);
+  };
+
+  const saveNow = async () => {
     setSaving(true);
     try {
       const next = await invoke<RemoteGatewayStatus>("save_remote_gateway_config", {
@@ -116,13 +177,26 @@ export function RemoteControlCard() {
         frpBinary,
       });
       applyStatus(next);
-      toast.success("已保存，重启 Codex 后生效");
-    } catch (error) {
-      toast.danger(errorText(error));
     } finally {
       setSaving(false);
     }
   };
+
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+    return () => {
+      if (dirty) onDirtyChange?.(false);
+    };
+  }, [dirty, onDirtyChange]);
+
+  // 每次渲染都刷新引用，保证全局保存拿到的是最新草稿。
+  useEffect(() => {
+    if (!handleRef) return;
+    handleRef.current = { save: saveNow, reset: restore };
+    return () => {
+      handleRef.current = null;
+    };
+  });
 
   const handleRegenerate = async () => {
     setRegenerating(true);
@@ -226,13 +300,14 @@ export function RemoteControlCard() {
                         监听端口
                       </Label>
                       <div className="prompt-field-control">
-                        <NumberInput
+                        <PortInput
+                          id={portId}
                           value={port}
-                          minValue={MIN_PORT}
-                          maxValue={MAX_PORT}
+                          min={MIN_PORT}
+                          max={MAX_PORT}
                           disabled={busy}
                           onChange={setPort}
-                          aria-label="监听端口"
+                          ariaLabel="监听端口"
                         />
                         <small className="field-hint">
                           范围 {MIN_PORT}-{MAX_PORT}，局域网内通过该端口访问。
@@ -361,13 +436,14 @@ export function RemoteControlCard() {
                             服务器端口
                           </Label>
                           <div className="prompt-field-control">
-                            <NumberInput
+                            <PortInput
+                              id={frpServerPortId}
                               value={frpServerPort}
-                              minValue={MIN_PORT}
-                              maxValue={MAX_PORT}
+                              min={MIN_PORT}
+                              max={MAX_PORT}
                               disabled={busy}
                               onChange={setFrpServerPort}
-                              aria-label="frp 服务器端口"
+                              ariaLabel="frp 服务器端口"
                             />
                             <small className="field-hint">frps 监听端口，默认 {DEFAULT_FRP_SERVER_PORT}。</small>
                           </div>
@@ -394,13 +470,14 @@ export function RemoteControlCard() {
                             远程端口
                           </Label>
                           <div className="prompt-field-control">
-                            <NumberInput
+                            <PortInput
+                              id={frpRemotePortId}
                               value={frpRemotePort}
-                              minValue={MIN_PORT}
-                              maxValue={MAX_PORT}
+                              min={MIN_PORT}
+                              max={MAX_PORT}
                               disabled={busy}
                               onChange={setFrpRemotePort}
-                              aria-label="远程端口"
+                              ariaLabel="远程端口"
                             />
                             <small className="field-hint">frps 对外开放的端口，需在服务端放行。</small>
                           </div>
@@ -449,18 +526,6 @@ export function RemoteControlCard() {
                     </div>
                   ) : null}
                 </section>
-              </div>
-
-              <div className="prompt-optimization-toolbar-actions">
-                <Button
-                  variant="filled"
-                  size="sm"
-                  loading={saving}
-                  disabled={busy || !dirty}
-                  onClick={() => void handleSave()}
-                >
-                  保存
-                </Button>
               </div>
             </div>
           )}

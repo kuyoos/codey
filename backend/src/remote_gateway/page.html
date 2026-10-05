@@ -181,6 +181,7 @@
       align-self: center; margin: 4px 0 10px; padding: 6px 14px; border-radius: 999px;
       border: 1px solid var(--line); color: var(--muted); font-size: 12.5px;
     }
+    .more-hint { align-self: center; margin: 4px 0 10px; color: var(--faint); font-size: 12px; }
 
     /* ---------- Markdown ---------- */
     .md-p { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
@@ -228,6 +229,13 @@
     }
     .diff-row { display: flex; gap: 8px; padding: 4px 10px; font-size: 12.5px; border-top: 1px solid var(--line); }
     .diff-row .kind { color: var(--warn); flex: none; }
+    .diff-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .diff-row.more { color: var(--faint); }
+    .tool-row { display: flex; align-items: center; gap: 8px; padding: 4px 10px; border-top: 1px solid var(--line); font-size: 12.5px; }
+    .tool-row .icon { color: var(--faint); flex: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .tool-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tool-row.more { color: var(--faint); }
+    .tool-row.is-failed .mono { color: var(--danger); }
     details.raw { border-top: 1px solid var(--line); }
     details.raw > summary {
       display: flex; align-items: center; gap: 8px;
@@ -471,7 +479,11 @@ const APPROVAL_METHODS = new Set([
 ]);
 const TOKEN_KEY = "codey_gateway_token";
 const LAST_THREAD_KEY = "codey_gateway_last_thread";
-const TURNS_PAGE = 8;
+// 网页只保留最近几个回合，翻到上限就不再往回取，避免长会话把正文堆满页面。
+const TURNS_PAGE = 5;
+const MAX_TURNS = 15;
+// 单次改动涉及的文件数量没有上限，网页只列一部分，其余折叠成计数。
+const FILE_ROW_LIMIT = 40;
 
 const state = {
   token: "",
@@ -869,16 +881,85 @@ function userMessage(item) {
   return el("div", "msg user", parts.join("\n"));
 }
 
+// app-server 的 kind 是 { type, move_path } 对象，先归一化成短标签再展示。
+const CHANGE_LABELS = {
+  add: "新增", added: "新增", create: "新增", created: "新增",
+  update: "修改", modified: "修改", modify: "修改", edit: "修改",
+  delete: "删除", deleted: "删除", remove: "删除", removed: "删除",
+  move: "移动", moved: "移动", rename: "移动", renamed: "移动", copy: "复制",
+};
+
+function changeLabel(kind) {
+  if (kind && typeof kind === "object") kind = kind.type || kind.kind || kind.action;
+  return CHANGE_LABELS[String(kind || "").toLowerCase()] || "";
+}
+
 function changeRows(changes) {
   const rows = [];
   for (const change of changes || []) {
     if (typeof change === "string") { rows.push({ kind: "", path: change }); continue; }
-    rows.push({
-      kind: change.kind || change.type || change.action || change.status || "",
-      path: change.path || change.file || change.filename || json(change),
-    });
+    const path = change.path || change.file || change.filename;
+    if (!path) continue;
+    rows.push({ kind: changeLabel(change.kind || change.type || change.action), path });
   }
   return rows;
+}
+
+// 连续的工具与命令合并成一张卡片，只留一行概要，避免长回合堆出上百个卡片。
+const TOOL_TYPES = new Set([
+  "commandExecution", "mcpToolCall", "dynamicToolCall",
+  "functionCallOutput", "webSearch", "collabAgentToolCall",
+]);
+const TOOL_ROW_LIMIT = 8;
+
+function toolRow(item) {
+  switch (item.type) {
+    case "commandExecution": return { icon: "$", text: preview(item.command || "", 120) || "命令" };
+    case "mcpToolCall":
+    case "dynamicToolCall":
+      return { icon: "⚙", text: ((item.server || "") + "." + (item.tool || "")).replace(/^\./, "") || "工具调用" };
+    case "functionCallOutput": return { icon: "↳", text: item.name || "工具输出" };
+    case "webSearch": return { icon: "⌕", text: preview(item.query || "", 120) || "联网搜索" };
+    case "collabAgentToolCall": return { icon: "⧉", text: "子代理 " + (item.tool || "") };
+    default: return { icon: "•", text: item.type || "" };
+  }
+}
+
+function toolGroup(items) {
+  const node = card("⛭", "工具与命令 · " + items.length + " 项", null);
+  for (const item of items.slice(0, TOOL_ROW_LIMIT)) {
+    const row = toolRow(item);
+    const line = el("div", "tool-row" + (String(item.status || "").toLowerCase() === "failed" ? " is-failed" : ""));
+    line.appendChild(el("span", "icon", row.icon));
+    line.appendChild(el("span", "mono", row.text));
+    node.appendChild(line);
+  }
+  if (items.length > TOOL_ROW_LIMIT) {
+    node.appendChild(el("div", "tool-row more", "还有 " + (items.length - TOOL_ROW_LIMIT) + " 项"));
+  }
+  return node;
+}
+
+// 连续的文件改动也只算一张卡片：只列改了哪些文件与改动类型。
+function fileBlock(items) {
+  const rows = [];
+  let status = null;
+  for (const item of items) {
+    for (const row of changeRows(item.changes)) rows.push(row);
+    if (!status) status = item.status;
+  }
+  const node = card("±", "修改了 " + rows.length + " 个文件", statusChip(status));
+  for (const row of rows.slice(0, FILE_ROW_LIMIT)) {
+    const line = el("div", "diff-row");
+    line.appendChild(el("span", "kind", row.kind || "修改"));
+    line.appendChild(el("span", "mono", row.path));
+    line.title = row.path;
+    node.appendChild(line);
+  }
+  if (rows.length > FILE_ROW_LIMIT) {
+    node.appendChild(el("div", "diff-row more", "还有 " + (rows.length - FILE_ROW_LIMIT) + " 个文件"));
+  }
+  return node;
 }
 
 function card(kind, title, chip) {
@@ -942,30 +1023,21 @@ function renderItem(item) {
     // 标题本来就会被 CSS 截成一行，先截好文案可以省掉超长命令的排版开销。
     const node = card("$", preview(item.command || "", 160), statusChip(item.status, item.exitCode));
     if (item.cwd) node.appendChild(el("div", "card-sub mono", item.cwd));
+    // 输出正文在网关侧已截断成预览，这里只展示这一小段。
     const output = item.aggregatedOutput || "";
-    if (output) node.appendChild(rawBlock("输出", output, String(item.status || "").toLowerCase().indexOf("fail") >= 0));
+    if (output) node.appendChild(rawBlock("输出预览", output, String(item.status || "").toLowerCase().indexOf("fail") >= 0));
     return node;
   }
-  if (type === "fileChange") {
-    const rows = changeRows(item.changes);
-    const node = card("±", "文件改动 · " + rows.length + " 处", statusChip(item.status));
-    for (const row of rows) {
-      const line = el("div", "diff-row");
-      if (row.kind) line.appendChild(el("span", "kind", row.kind));
-      line.appendChild(el("span", "mono", row.path));
-      node.appendChild(line);
-    }
-    return node;
-  }
+  // fileChange 由 fileBlock 合并展示，不在这里单独渲染。
   if (type === "mcpToolCall" || type === "dynamicToolCall") {
+    // 参数与结果在网关侧已去掉，卡片只保留“调用了哪个工具”。
     const node = card("⚙", "MCP " + (item.server || "") + "." + (item.tool || ""), statusChip(item.status));
-    const body = [item.arguments ? "参数\n" + json(item.arguments) : "", item.error ? "错误\n" + json(item.error) : "", item.result ? "结果\n" + json(item.result) : ""].filter(Boolean).join("\n\n");
-    if (body) node.appendChild(rawBlock("详情", body, false));
+    if (item.error) node.appendChild(rawBlock("错误", typeof item.error === "string" ? item.error : json(item.error), false));
     return node;
   }
   if (type === "functionCallOutput") {
     const node = card("↳", "工具输出 · " + (item.name || ""));
-    node.appendChild(rawBlock("输出", typeof item.output === "string" ? item.output : json(item.output), false));
+    node.appendChild(rawBlock("输出预览", typeof item.output === "string" ? item.output : json(item.output), false));
     return node;
   }
   if (type === "plan") {
@@ -977,7 +1049,6 @@ function renderItem(item) {
   }
   if (type === "webSearch") {
     const node = card("⌕", "联网搜索 · " + (item.query || ""));
-    node.appendChild(rawBlock("结果", json(item.results), false));
     return node;
   }
   if (type === "imageView" || type === "imageGeneration") {
@@ -987,7 +1058,7 @@ function renderItem(item) {
   }
   if (type === "collabAgentToolCall") {
     const node = card("⧉", "子代理调用 · " + (item.tool || ""));
-    node.appendChild(rawBlock("详情", json({ prompt: item.prompt, agents: item.agentsStates }), false));
+    if (item.prompt) node.appendChild(rawBlock("提示词", typeof item.prompt === "string" ? item.prompt : json(item.prompt), false));
     return node;
   }
   if (type === "subAgentActivity") {
@@ -1054,6 +1125,8 @@ function renderTranscript(forceScroll) {
     more.type = "button";
     more.addEventListener("click", () => loadTurns(state.nextCursor).catch(reportError));
     root.appendChild(more);
+  } else if (state.turns.length >= MAX_TURNS) {
+    root.appendChild(el("div", "more-hint", "仅显示最近 " + MAX_TURNS + " 个回合"));
   }
   const ordered = state.turns.slice().reverse();
   for (const turn of ordered) {
@@ -1069,10 +1142,33 @@ function renderTranscript(forceScroll) {
     // 全文在网关侧就已去掉，既省流量也省渲染。
     const thoughtCount = (turn.items || []).filter((item) => item && item.type === "reasoning").length;
     let thoughtPlaced = !thoughtCount;
+    // 连续的同类条目合并：工具与命令、文件改动各自只留一张卡片。
+    let run = [];
+    let runKind = null;
+    const flushRun = () => {
+      if (!run.length) return;
+      if (runKind === "files") {
+        node.appendChild(fileBlock(run));
+      } else if (run.length > 1) {
+        node.appendChild(toolGroup(run));
+      } else {
+        const single = renderItem(run[0]);
+        if (single) node.appendChild(single);
+      }
+      run = [];
+      runKind = null;
+    };
+    const pushRun = (item, kind) => {
+      if (runKind !== kind) flushRun();
+      runKind = kind;
+      run.push(item);
+    };
     for (const item of turn.items || []) {
-      if (item && item.type === "reasoning") {
+      if (!item) continue;
+      if (item.type === "reasoning") {
         if (!thoughtPlaced) {
           thoughtPlaced = true;
+          flushRun();
           const think = el("div", "think");
           think.appendChild(el("span", "icon", "✳"));
           think.appendChild(el("span", null, "思考 " + thoughtCount + " 次"));
@@ -1080,9 +1176,13 @@ function renderTranscript(forceScroll) {
         }
         continue;
       }
+      if (TOOL_TYPES.has(item.type)) { pushRun(item, "tools"); continue; }
+      if (item.type === "fileChange") { pushRun(item, "files"); continue; }
+      flushRun();
       const rendered = renderItem(item);
       if (rendered) node.appendChild(rendered);
     }
+    flushRun();
     root.appendChild(node);
   }
   if (pinned) pinToBottom(root);
@@ -1241,8 +1341,13 @@ async function loadTurns(cursor) {
   const query = "?limit=" + TURNS_PAGE + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
   const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/turns" + query);
   const turns = body.turns || [];
-  state.turns = cursor ? state.turns.concat(turns) : turns;
-  state.nextCursor = body.nextCursor || null;
+  if (cursor) {
+    const room = Math.max(0, MAX_TURNS - state.turns.length);
+    state.turns = state.turns.concat(turns.slice(0, room));
+  } else {
+    state.turns = turns.slice(0, MAX_TURNS);
+  }
+  state.nextCursor = state.turns.length >= MAX_TURNS ? null : (body.nextCursor || null);
   renderTranscript(!cursor);
 }
 
