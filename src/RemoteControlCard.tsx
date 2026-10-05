@@ -167,6 +167,8 @@ export function RemoteControlCard() {
         return <Badge variant="warning">重启后生效</Badge>;
     }
   })();
+  const frpWarning =
+    frpState === "failed" || frpState === "invalid" || frpState === "exited" || frpState === "unknown";
   const copyIcon = (kind: "token" | "url") =>
     copied === kind ? (
       <IconCheck size={13} className="text-success" aria-hidden="true" />
@@ -200,116 +202,132 @@ export function RemoteControlCard() {
             </small>
           ) : (
             <div className="prompt-optimization-content">
-              <div className="prompt-form-group">
-                <div className="prompt-field">
-                  <div className="prompt-field-label-row">
-                    <Label htmlFor={portId} className="prompt-field-label">
-                      监听端口
-                    </Label>
+              <div className="remote-control-stack">
+                <section className="remote-control-group" aria-labelledby="remote-control-lan-title">
+                  <div className="remote-control-group-header">
+                    <div className="remote-control-group-heading">
+                      <span className="remote-control-group-title" id="remote-control-lan-title">
+                        局域网访问
+                      </span>
+                      <span className="remote-control-group-desc">
+                        同一网络下的手机或电脑用浏览器打开即可查看并继续会话。
+                      </span>
+                    </div>
                     {active ? (
                       <Badge variant="success">已生效</Badge>
                     ) : (
                       <Badge variant="warning">重启后生效</Badge>
                     )}
                   </div>
-                  <div className="prompt-field-control">
-                    <NumberInput
-                      value={port}
-                      minValue={MIN_PORT}
-                      maxValue={MAX_PORT}
-                      disabled={busy}
-                      onChange={setPort}
-                      aria-label="监听端口"
-                    />
-                    <small className="field-hint">
-                      局域网内通过该端口访问，范围 {MIN_PORT}-{MAX_PORT}。
-                    </small>
-                  </div>
-                </div>
 
-                <div className="prompt-field">
-                  <Label htmlFor={tokenId} className="prompt-field-label">
-                    访问密钥
-                  </Label>
-                  <div className="prompt-field-control">
-                    <div className="flex items-center gap-2">
-                      <PasswordInput
-                        id={tokenId}
-                        value={status?.token ?? ""}
-                        readOnly
-                        disabled={loading}
-                        aria-label="访问密钥"
-                      />
-                      <Tooltip content={copied === "token" ? "已复制到剪贴板" : "复制访问密钥"}>
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          className="shrink-0 text-[var(--codey-muted)] hover:text-[var(--codey-text)]"
-                          aria-label="复制访问密钥"
-                          disabled={!status?.token}
-                          onClick={() => void handleCopy("token", status?.token ?? "")}
-                        >
-                          {copyIcon("token")}
-                        </Button>
-                      </Tooltip>
-                      <Button
-                        variant="light"
-                        size="xs"
-                        loading={regenerating}
-                        disabled={busy}
-                        onClick={() => void handleRegenerate()}
-                      >
-                        重新生成
-                      </Button>
+                  <div className="remote-control-fields">
+                    <div className="prompt-field">
+                      <Label htmlFor={portId} className="prompt-field-label">
+                        监听端口
+                      </Label>
+                      <div className="prompt-field-control">
+                        <NumberInput
+                          value={port}
+                          minValue={MIN_PORT}
+                          maxValue={MAX_PORT}
+                          disabled={busy}
+                          onChange={setPort}
+                          aria-label="监听端口"
+                        />
+                        <small className="field-hint">
+                          范围 {MIN_PORT}-{MAX_PORT}，局域网内通过该端口访问。
+                        </small>
+                      </div>
                     </div>
-                    <small className="field-hint">
-                      网页需携带该密钥才能访问；重新生成后需重启 Codex 生效。
-                    </small>
-                  </div>
-                </div>
 
-                <div className="prompt-field">
-                  <Label htmlFor={urlId} className="prompt-field-label">
-                    访问地址
-                  </Label>
-                  <div className="prompt-field-control">
-                    <div className="flex items-center gap-2">
-                      <Input
-                        id={urlId}
-                        value={status?.url ?? ""}
-                        readOnly
-                        placeholder="保存并重启 Codex 后生成"
-                        aria-label="访问地址"
-                      />
-                      <Tooltip content={copied === "url" ? "已复制到剪贴板" : "复制访问地址"}>
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          className="shrink-0 text-[var(--codey-muted)] hover:text-[var(--codey-text)]"
-                          aria-label="复制访问地址"
-                          disabled={!status?.url}
-                          onClick={() => void handleCopy("url", status?.url ?? "")}
-                        >
-                          {copyIcon("url")}
-                        </Button>
-                      </Tooltip>
+                    <div className="prompt-field">
+                      <Label htmlFor={tokenId} className="prompt-field-label">
+                        访问密钥
+                      </Label>
+                      <div className="prompt-field-control">
+                        <div className="remote-control-inline">
+                          <PasswordInput
+                            id={tokenId}
+                            value={status?.token ?? ""}
+                            readOnly
+                            disabled={loading}
+                            aria-label="访问密钥"
+                          />
+                          <Tooltip content={copied === "token" ? "已复制到剪贴板" : "复制访问密钥"}>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              className="shrink-0 text-[var(--codey-muted)] hover:text-[var(--codey-text)]"
+                              aria-label="复制访问密钥"
+                              disabled={!status?.token}
+                              onClick={() => void handleCopy("token", status?.token ?? "")}
+                            >
+                              {copyIcon("token")}
+                            </Button>
+                          </Tooltip>
+                          <Button
+                            variant="light"
+                            size="xs"
+                            className="shrink-0"
+                            loading={regenerating}
+                            disabled={busy}
+                            onClick={() => void handleRegenerate()}
+                          >
+                            重新生成
+                          </Button>
+                        </div>
+                        <small className="field-hint">
+                          网页需携带该密钥才能访问；重新生成后需重启 Codex 生效。
+                        </small>
+                      </div>
                     </div>
-                    <small className="field-hint">
-                      在手机或另一台电脑的浏览器打开该地址即可查看并继续会话。
-                    </small>
-                  </div>
-                </div>
 
-                <div className="prompt-field">
-                  <div className="prompt-field-label-row">
-                    <Label className="prompt-field-label">公网映射（frp）</Label>
-                    {frpBadge}
+                    <div className="prompt-field">
+                      <Label htmlFor={urlId} className="prompt-field-label">
+                        访问地址
+                      </Label>
+                      <div className="prompt-field-control">
+                        <div className="remote-control-inline">
+                          <Input
+                            id={urlId}
+                            value={status?.url ?? ""}
+                            readOnly
+                            placeholder="保存并重启 Codex 后生成"
+                            aria-label="访问地址"
+                          />
+                          <Tooltip content={copied === "url" ? "已复制到剪贴板" : "复制访问地址"}>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              className="shrink-0 text-[var(--codey-muted)] hover:text-[var(--codey-text)]"
+                              aria-label="复制访问地址"
+                              disabled={!status?.url}
+                              onClick={() => void handleCopy("url", status?.url ?? "")}
+                            >
+                              {copyIcon("url")}
+                            </Button>
+                          </Tooltip>
+                        </div>
+                        <small className="field-hint">
+                          在手机或另一台电脑的浏览器打开该地址，即可查看并继续会话。
+                        </small>
+                      </div>
+                    </div>
                   </div>
-                  <div className="prompt-field-control">
-                    <div className="flex items-center justify-between gap-3">
-                      <small className="field-hint">
+                </section>
+
+                <section className="remote-control-group" aria-labelledby="remote-control-frp-title">
+                  <div className="remote-control-group-header">
+                    <div className="remote-control-group-heading">
+                      <span className="remote-control-group-title" id="remote-control-frp-title">
+                        公网映射（frp）
+                      </span>
+                      <span className="remote-control-group-desc">
                         用 frp 把局域网端口映射到公网，异地也能访问同一页面。
-                      </small>
+                      </span>
+                    </div>
+                    <div className="remote-control-group-aside">
+                      {frpBadge}
                       <Switch
                         checked={frpEnabled}
                         disabled={busy}
@@ -318,103 +336,119 @@ export function RemoteControlCard() {
                       />
                     </div>
                   </div>
-                </div>
 
-                {frpEnabled ? (
-                  <>
-                    <div className="prompt-field">
-                      <Label htmlFor={frpAddrId} className="prompt-field-label">
-                        frp 服务器地址
-                      </Label>
-                      <div className="prompt-field-control">
-                        <Input
-                          id={frpAddrId}
-                          value={frpServerAddr}
-                          disabled={busy}
-                          placeholder="frps.example.com"
-                          onChange={(event) => setFrpServerAddr(event.target.value)}
-                          aria-label="frp 服务器地址"
-                        />
+                  {frpEnabled ? (
+                    <div className="remote-control-fields">
+                      <div className="remote-control-grid">
+                        <div className="prompt-field">
+                          <Label htmlFor={frpAddrId} className="prompt-field-label">
+                            服务器地址
+                          </Label>
+                          <div className="prompt-field-control">
+                            <Input
+                              id={frpAddrId}
+                              value={frpServerAddr}
+                              disabled={busy}
+                              placeholder="frps.example.com"
+                              onChange={(event) => setFrpServerAddr(event.target.value)}
+                              aria-label="frp 服务器地址"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="prompt-field">
+                          <Label htmlFor={frpServerPortId} className="prompt-field-label">
+                            服务器端口
+                          </Label>
+                          <div className="prompt-field-control">
+                            <NumberInput
+                              value={frpServerPort}
+                              minValue={MIN_PORT}
+                              maxValue={MAX_PORT}
+                              disabled={busy}
+                              onChange={setFrpServerPort}
+                              aria-label="frp 服务器端口"
+                            />
+                            <small className="field-hint">frps 监听端口，默认 {DEFAULT_FRP_SERVER_PORT}。</small>
+                          </div>
+                        </div>
+
+                        <div className="prompt-field">
+                          <Label htmlFor={frpTokenId} className="prompt-field-label">
+                            认证令牌
+                          </Label>
+                          <div className="prompt-field-control">
+                            <PasswordInput
+                              id={frpTokenId}
+                              value={frpToken}
+                              disabled={busy}
+                              placeholder="与 frps 的 auth.token 一致，可留空"
+                              onChange={(event) => setFrpToken(event.target.value)}
+                              aria-label="frp 认证令牌"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="prompt-field">
+                          <Label htmlFor={frpRemotePortId} className="prompt-field-label">
+                            远程端口
+                          </Label>
+                          <div className="prompt-field-control">
+                            <NumberInput
+                              value={frpRemotePort}
+                              minValue={MIN_PORT}
+                              maxValue={MAX_PORT}
+                              disabled={busy}
+                              onChange={setFrpRemotePort}
+                              aria-label="远程端口"
+                            />
+                            <small className="field-hint">frps 对外开放的端口，需在服务端放行。</small>
+                          </div>
+                        </div>
                       </div>
-                    </div>
 
-                    <div className="prompt-field">
-                      <Label htmlFor={frpServerPortId} className="prompt-field-label">
-                        frp 服务器端口
-                      </Label>
-                      <div className="prompt-field-control">
-                        <NumberInput
-                          value={frpServerPort}
-                          minValue={MIN_PORT}
-                          maxValue={MAX_PORT}
-                          disabled={busy}
-                          onChange={setFrpServerPort}
-                          aria-label="frp 服务器端口"
-                        />
-                        <small className="field-hint">frps 的监听端口，默认 {DEFAULT_FRP_SERVER_PORT}。</small>
+                      <div className="prompt-field">
+                        <Label htmlFor={frpBinaryId} className="prompt-field-label">
+                          本地 frpc 路径
+                        </Label>
+                        <div className="prompt-field-control">
+                          <Input
+                            id={frpBinaryId}
+                            value={frpBinary}
+                            disabled={busy}
+                            placeholder="留空则自动下载 frpc"
+                            onChange={(event) => setFrpBinary(event.target.value)}
+                            aria-label="本地 frpc 路径"
+                          />
+                          <small className="field-hint">留空时自动下载官方 frpc 到本地缓存。</small>
+                        </div>
                       </div>
-                    </div>
 
-                    <div className="prompt-field">
-                      <Label htmlFor={frpTokenId} className="prompt-field-label">
-                        认证令牌
-                      </Label>
-                      <div className="prompt-field-control">
-                        <PasswordInput
-                          id={frpTokenId}
-                          value={frpToken}
-                          disabled={busy}
-                          placeholder="与 frps 的 auth.token 一致，可留空"
-                          onChange={(event) => setFrpToken(event.target.value)}
-                          aria-label="frp 认证令牌"
-                        />
-                      </div>
+                      {status?.frp.endpoint || status?.frp.message || status?.frp.logPath ? (
+                        <div className="remote-control-status">
+                          {status?.frp.endpoint ? (
+                            <div className="remote-control-status-row">
+                              <span className="remote-control-status-key">映射地址</span>
+                              <span className="remote-control-status-value">{status.frp.endpoint}</span>
+                            </div>
+                          ) : null}
+                          {status?.frp.message ? (
+                            <div className={`remote-control-status-row${frpWarning ? " is-warning" : ""}`}>
+                              <span className="remote-control-status-key">状态</span>
+                              <span className="remote-control-status-value">{status.frp.message}</span>
+                            </div>
+                          ) : null}
+                          {status?.frp.logPath ? (
+                            <div className="remote-control-status-row">
+                              <span className="remote-control-status-key">日志</span>
+                              <span className="remote-control-status-value">{status.frp.logPath}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
-
-                    <div className="prompt-field">
-                      <Label htmlFor={frpRemotePortId} className="prompt-field-label">
-                        远程端口
-                      </Label>
-                      <div className="prompt-field-control">
-                        <NumberInput
-                          value={frpRemotePort}
-                          minValue={MIN_PORT}
-                          maxValue={MAX_PORT}
-                          disabled={busy}
-                          onChange={setFrpRemotePort}
-                          aria-label="远程端口"
-                        />
-                        <small className="field-hint">frps 上对外开放的端口，需在服务端放行。</small>
-                      </div>
-                    </div>
-
-                    <div className="prompt-field">
-                      <Label htmlFor={frpBinaryId} className="prompt-field-label">
-                        本地 frpc 路径
-                      </Label>
-                      <div className="prompt-field-control">
-                        <Input
-                          id={frpBinaryId}
-                          value={frpBinary}
-                          disabled={busy}
-                          placeholder="留空则自动下载 frpc"
-                          onChange={(event) => setFrpBinary(event.target.value)}
-                          aria-label="本地 frpc 路径"
-                        />
-                      </div>
-                    </div>
-
-                    {status?.frp.endpoint ? (
-                      <small className="field-hint">映射地址：{status.frp.endpoint}</small>
-                    ) : null}
-                    {status?.frp.message ? (
-                      <small className="field-hint">{status.frp.message}</small>
-                    ) : null}
-                    {status?.frp.logPath ? (
-                      <small className="field-hint">frpc 日志：{status.frp.logPath}</small>
-                    ) : null}
-                  </>
-                ) : null}
+                  ) : null}
+                </section>
               </div>
 
               <div className="prompt-optimization-toolbar-actions">

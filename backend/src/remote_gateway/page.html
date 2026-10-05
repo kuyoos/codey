@@ -55,7 +55,8 @@
     }
 
     /* ---------- 骨架 ---------- */
-    .app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+    /* 高度由脚本按可见视口写入，避免移动端地址栏/键盘把输入栏顶到屏幕外。 */
+    .app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
     .topbar {
       flex: none; display: flex; align-items: center; gap: 6px;
       padding: calc(env(safe-area-inset-top, 0px) + 8px) 10px 8px;
@@ -191,6 +192,16 @@
       font-size: 13px; background: var(--surface-3);
     }
     .md-link { text-decoration: none; border-bottom: 1px solid rgba(91, 140, 255, .4); }
+    .md-del { color: var(--muted); text-decoration: line-through; }
+    .md-img { display: block; max-width: 100%; border-radius: 10px; margin: 8px 0; }
+    .md-hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+    .md-task { display: flex; align-items: flex-start; gap: 7px; }
+    .md-task input { flex: none; margin: 4px 0 0; accent-color: var(--accent); }
+    .md-table { display: block; width: 100%; margin: 9px 0; border-collapse: collapse; overflow-x: auto; font-size: 13px; }
+    .md-table th, .md-table td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; vertical-align: top; }
+    .md-table th { background: var(--surface-2); font-weight: 600; }
+    .md-list .md-list { margin: 2px 0 2px 2px; }
+    .md-h5 { font-size: 14.5px; } .md-h6 { font-size: 14px; color: var(--muted); }
     .code-block { margin: 9px 0; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; background: #0c0e12; }
     .code-head {
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -256,7 +267,7 @@
     /* ---------- 输入区 ---------- */
     .composer {
       flex: none; display: flex; align-items: flex-end; gap: 8px;
-      padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 10px);
+      padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
       background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
       border-top: 1px solid var(--line);
     }
@@ -594,7 +605,24 @@ async function api(path, options) {
 
 /* ================= Markdown 渲染（只生成 DOM，不注入 HTML） ================= */
 
-const INLINE = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]*\]\([^)\s]+\)|https?:\/\/[^\s<>()]+|\*[^*\n]+\*)/g;
+// 行内标记：粗斜体 / 粗体 / 斜体 / 删除线 / 行内代码 / 图片 / 链接 / 裸链接。
+// 刻意不解析 _强调_，避免把 foo_bar 这类标识符拆成斜体。
+const INLINE = /(\*\*\*[^*\n]+\*\*\*|\*\*[^*\n]+\*\*|~~[^~\n]+~~|`[^`\n]+`|!\[[^\]\n]*\]\([^)\s]+\)|\[[^\]\n]*\]\([^)\s]+\)|https?:\/\/[^\s<>()]+|\*[^*\n]+\*)/g;
+
+/** 只放行常规协议，避免 javascript: 之类的链接。 */
+function safeHref(url) {
+  return /^(https?:|mailto:)/i.test(url) ? url : null;
+}
+
+function externalLink(label, url) {
+  const href = safeHref(url);
+  if (!href) return document.createTextNode(label || url);
+  const link = el("a", "md-link", label || href);
+  link.href = href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
 
 function renderInline(parent, text) {
   const value = String(text === undefined || text === null ? "" : text);
@@ -604,27 +632,33 @@ function renderInline(parent, text) {
   while ((match = INLINE.exec(value)) !== null) {
     if (match.index > last) parent.appendChild(document.createTextNode(value.slice(last, match.index)));
     const token = match[0];
-    if (token.startsWith("**")) {
+    if (token.startsWith("***")) {
+      const strong = el("strong");
+      strong.appendChild(el("em", null, token.slice(3, -3)));
+      parent.appendChild(strong);
+    } else if (token.startsWith("**")) {
       parent.appendChild(el("strong", null, token.slice(2, -2)));
+    } else if (token.startsWith("~~")) {
+      parent.appendChild(el("span", "md-del", token.slice(2, -2)));
     } else if (token.startsWith("`")) {
       parent.appendChild(el("code", "md-code", token.slice(1, -1)));
-    } else if (token.startsWith("[")) {
-      const parts = /^\[([^\]]*)\]\(([^)]+)\)$/.exec(token);
-      if (parts) {
-        const link = el("a", "md-link", parts[1]);
-        link.href = parts[2];
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        parent.appendChild(link);
+    } else if (token.startsWith("![")) {
+      const parts = /^!\[([^\]]*)\]\(([^)\s]+)\)$/.exec(token);
+      const href = parts && safeHref(parts[2]);
+      if (href) {
+        const image = el("img", "md-img");
+        image.src = href;
+        image.alt = parts[1] || "";
+        image.loading = "lazy";
+        parent.appendChild(image);
       } else {
         parent.appendChild(document.createTextNode(token));
       }
+    } else if (token.startsWith("[")) {
+      const parts = /^\[([^\]]*)\]\(([^)\s]+)\)$/.exec(token);
+      parent.appendChild(parts ? externalLink(parts[1], parts[2]) : document.createTextNode(token));
     } else if (token.startsWith("http")) {
-      const link = el("a", "md-link", token);
-      link.href = token;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      parent.appendChild(link);
+      parent.appendChild(externalLink(token, token));
     } else {
       parent.appendChild(el("em", null, token.slice(1, -1)));
     }
@@ -648,33 +682,92 @@ function codeBlock(language, code) {
   return wrap;
 }
 
+const FENCE = /^\s*(```|~~~)\s*([A-Za-z0-9_+#.-]*)\s*$/;
+const HEADING = /^(#{1,6})\s+(.*)$/;
+const HR = /^\s*([-*_])\s*(?:\1\s*){2,}$/;
+const BULLET = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+const QUOTE = /^\s*>\s?/;
+const TABLE_SEP = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+const TASK = /^\[([ xX])\]\s+(.*)$/;
+
+function splitRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+/** 解析一层列表；缩进更深的子项递归挂到当前条目下，返回 [节点, 下一行号]。 */
+function parseList(lines, start) {
+  const first = BULLET.exec(lines[start]);
+  const root = el(/\d/.test(first[2]) ? "ol" : "ul", "md-list");
+  const base = first[1].length;
+  let index = start;
+  let current = null;
+  while (index < lines.length) {
+    const hit = BULLET.exec(lines[index]);
+    if (!hit) break;
+    const indent = hit[1].length;
+    if (indent < base) break;
+    if (indent > base && current) {
+      const nested = parseList(lines, index);
+      current.appendChild(nested[0]);
+      index = nested[1];
+      continue;
+    }
+    current = el("li");
+    const task = TASK.exec(hit[3]);
+    if (task) {
+      const label = el("label", "md-task");
+      const box = el("input");
+      box.type = "checkbox";
+      box.disabled = true;
+      box.checked = task[1].toLowerCase() === "x";
+      label.appendChild(box);
+      const span = el("span");
+      renderInline(span, task[2]);
+      label.appendChild(span);
+      current.appendChild(label);
+    } else {
+      renderInline(current, hit[3]);
+    }
+    root.appendChild(current);
+    index += 1;
+  }
+  return [root, index];
+}
+
 function renderMarkdown(parent, text) {
-  const lines = String(text === undefined || text === null ? "" : text).split("\n");
-  let paragraph = [];
-  let index = 0;
+  const lines = String(text === undefined || text === null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
+  const paragraph = [];
   const flush = () => {
     if (!paragraph.length) return;
     const node = el("p", "md-p");
     renderInline(node, paragraph.join("\n"));
     parent.appendChild(node);
-    paragraph = [];
+    paragraph.length = 0;
   };
+  let index = 0;
   while (index < lines.length) {
     const line = lines[index];
-    const fence = /^\s*```\s*([A-Za-z0-9_+-]*)\s*$/.exec(line);
+    const fence = FENCE.exec(line);
     if (fence) {
       flush();
+      const close = new RegExp("^\\s*" + fence[1] + "\\s*$");
       const body = [];
       index += 1;
-      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+      while (index < lines.length && !close.test(lines[index])) {
         body.push(lines[index]);
         index += 1;
       }
       index += 1;
-      parent.appendChild(codeBlock(fence[1], body.join("\n")));
+      parent.appendChild(codeBlock(fence[2], body.join("\n")));
       continue;
     }
-    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (HR.test(line)) {
+      flush();
+      parent.appendChild(el("hr", "md-hr"));
+      index += 1;
+      continue;
+    }
+    const heading = HEADING.exec(line);
     if (heading) {
       flush();
       const node = el("div", "md-h md-h" + heading[1].length);
@@ -683,26 +776,47 @@ function renderMarkdown(parent, text) {
       index += 1;
       continue;
     }
-    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+    if (line.indexOf("|") >= 0 && index + 1 < lines.length && TABLE_SEP.test(lines[index + 1])) {
       flush();
-      const list = el("ul", "md-list");
-      while (index < lines.length) {
-        const item = /^\s*(?:[-*+]|\d+\.)\s+(.*)$/.exec(lines[index]);
-        if (!item) break;
-        const node = el("li");
-        renderInline(node, item[1]);
-        list.appendChild(node);
+      const table = el("table", "md-table");
+      const thead = el("thead");
+      const headRow = el("tr");
+      for (const cell of splitRow(line)) {
+        const th = el("th");
+        renderInline(th, cell);
+        headRow.appendChild(th);
+      }
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+      const tbody = el("tbody");
+      index += 2;
+      while (index < lines.length && lines[index].trim() && lines[index].indexOf("|") >= 0) {
+        const row = el("tr");
+        for (const cell of splitRow(lines[index])) {
+          const td = el("td");
+          renderInline(td, cell);
+          row.appendChild(td);
+        }
+        tbody.appendChild(row);
         index += 1;
       }
-      parent.appendChild(list);
+      table.appendChild(tbody);
+      parent.appendChild(table);
       continue;
     }
-    if (/^\s*>\s?/.test(line)) {
+    if (BULLET.test(line)) {
+      flush();
+      const parsed = parseList(lines, index);
+      parent.appendChild(parsed[0]);
+      index = parsed[1];
+      continue;
+    }
+    if (QUOTE.test(line)) {
       flush();
       const quote = el("blockquote", "md-quote");
-      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+      while (index < lines.length && QUOTE.test(lines[index])) {
         const node = el("div");
-        renderInline(node, lines[index].replace(/^\s*>\s?/, ""));
+        renderInline(node, lines[index].replace(QUOTE, ""));
         quote.appendChild(node);
         index += 1;
       }
@@ -718,6 +832,16 @@ function renderMarkdown(parent, text) {
     index += 1;
   }
   flush();
+}
+
+/** 流式输出：按帧节流重渲染整段 Markdown，避免逐字追加时用户看到未格式化的原文。 */
+function renderLive(live) {
+  if (live.frame) return;
+  live.frame = requestAnimationFrame(() => {
+    live.frame = 0;
+    live.node.textContent = "";
+    renderMarkdown(live.node, live.text);
+  });
 }
 
 /* ================= 消息与工具卡片 ================= */
@@ -1194,7 +1318,9 @@ function scheduleReload(delay) {
 function autoGrow() {
   const input = $("input");
   input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, Math.round(window.innerHeight * 0.4)) + "px";
+  const viewport = window.visualViewport;
+  const limit = Math.round(((viewport && viewport.height) || window.innerHeight) * 0.4);
+  input.style.height = Math.min(input.scrollHeight, limit) + "px";
 }
 
 /* ================= 审批 ================= */
@@ -1264,10 +1390,11 @@ function handleEvent(event) {
   const params = event.params || {};
   if (state.threadId && params.threadId && params.threadId !== state.threadId) return;
   if (event.method === "item/agentMessage/delta") {
-    const node = state.live.get(params.itemId);
-    if (node) {
-      node.textContent += params.delta || "";
-      node.classList.add("caret");
+    const live = state.live.get(params.itemId);
+    if (live) {
+      live.text += params.delta || "";
+      live.node.classList.add("caret");
+      renderLive(live);
       if (isPinned($("transcript"))) scrollToBottom();
       else $("toBottom").querySelector(".new").hidden = false;
     } else {
@@ -1287,7 +1414,7 @@ function handleEvent(event) {
     if (item.type === "agentMessage" && item.id) {
       const node = agentMessage("");
       node.classList.add("caret");
-      state.live.set(item.id, node);
+      state.live.set(item.id, { node, text: typeof item.text === "string" ? item.text : "", frame: 0 });
       $("transcript").appendChild(node);
       if (isPinned($("transcript"))) scrollToBottom();
       return;
@@ -1303,6 +1430,17 @@ function handleEvent(event) {
     return;
   }
   if (event.method === "item/completed") {
+    const item = params.item || {};
+    const live = item.id ? state.live.get(item.id) : null;
+    if (live && item.type === "agentMessage") {
+      // 用完成事件里的最终文本重渲染，避免整段重载时服务器尚未返回这条消息。
+      if (typeof item.text === "string" && item.text) live.text = item.text;
+      live.node.textContent = "";
+      renderMarkdown(live.node, live.text);
+      live.node.classList.remove("caret");
+      state.live.delete(item.id);
+      return;
+    }
     scheduleReload(350);
   }
 }
@@ -1338,7 +1476,27 @@ function readToken() {
 
 /* ================= 启动 ================= */
 
+/**
+ * 把 app 高度锁到当前可见视口。移动端地址栏收放与软键盘弹出会改变可见高度，
+ * 只靠 100dvh 在部分浏览器上会让底部输入栏落到屏幕外，这里用显式像素高度兜底。
+ */
+function syncViewport() {
+  const viewport = window.visualViewport;
+  const height = Math.round((viewport && viewport.height) || window.innerHeight || 0);
+  if (height > 0) $("app").style.height = height + "px";
+}
+
 function bind() {
+  syncViewport();
+  window.addEventListener("resize", syncViewport);
+  window.addEventListener("orientationchange", syncViewport);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncViewport);
+    window.visualViewport.addEventListener("scroll", syncViewport);
+  }
+  // 键盘弹出/收起后可见高度会跳变，输入框聚焦前后各同步一次。
+  $("input").addEventListener("focus", () => setTimeout(syncViewport, 250));
+  $("input").addEventListener("blur", () => setTimeout(syncViewport, 250));
   $("backBtn").addEventListener("click", () => {
     if (history.state && history.state.view === "chat") history.back();
     else showListView();
