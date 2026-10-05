@@ -603,6 +603,12 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     // 启动器只接收首次握手；之后 app-server 重启时仍必须能执行 CLI。
     let readiness = (app_server && managed_launch).then(CliWrapperReadiness::begin);
     let mut input_router: Option<std::process::Child> = None;
+    // 共享模式要接管桌面 app-server 的 stdio，管道必须在 spawn 后立刻交给网关；状态与
+    // `input_router` 一样声明在闭包外，闭包内只赋值。
+    #[cfg(windows)]
+    let mut shared_upstream: Option<crate::remote_gateway::SharedUpstream> = None;
+    #[cfg(windows)]
+    let mut shared_source: Option<Box<dyn std::io::Read + Send>> = None;
     let launch = (|| -> Result<std::process::Child> {
         anyhow::ensure!(
             target.is_absolute(),
@@ -640,13 +646,13 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
         // 同一包装进程内接管这条 stdio：桌面数据流逐行直通，网页请求注入同一会话，因此
         // 桌面正在运行的会话也能收发；桌面自身的协议流、握手与降级语义都不受影响。
         #[cfg(windows)]
-        let shared_upstream = if app_server && managed_launch {
-            crate::remote_gateway::prepare_upstream(&target, &rewritten_args, &runtime_overrides)
-        } else {
-            None
-        };
-        #[cfg(windows)]
-        let mut shared_source: Option<Box<dyn std::io::Read + Send>> = None;
+        if app_server && managed_launch {
+            shared_upstream = crate::remote_gateway::prepare_upstream(
+                &target,
+                &rewritten_args,
+                &runtime_overrides,
+            );
+        }
         let mut command = std::process::Command::new(&target);
         command.args(rewritten_args);
         #[cfg(windows)]
@@ -708,8 +714,12 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             #[cfg(windows)]
             match shared_upstream.as_ref() {
                 // 共享模式由网关把已改写的桌面输入直通给 app-server。
-                Some(_) => shared_source = Some(Box::new(relay_output)),
-                None => command.stdin(relay_output),
+                Some(_) => {
+                    shared_source = Some(Box::new(relay_output));
+                }
+                None => {
+                    command.stdin(relay_output);
+                }
             }
             #[cfg(not(windows))]
             command.stdin(relay_output);
