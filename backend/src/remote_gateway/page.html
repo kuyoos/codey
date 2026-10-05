@@ -913,6 +913,26 @@ function rawBlock(label, text, open) {
   return details;
 }
 
+/**
+ * 一个回合的思考过程合并成一个折叠块。app-server 会按推理步骤拆成很多条
+ * （长回合能到上百条），逐条渲染会凭空多出几十个卡片、把页面撑得极长；
+ * 折叠状态下也不放进大段文本，展开时才填充。
+ */
+function reasoningBlock(text) {
+  const details = el("details", "card");
+  const summary = el("summary");
+  summary.appendChild(el("span", "icon", "✳"));
+  summary.appendChild(el("span", "raw-label", "思考过程"));
+  summary.appendChild(copyButton(text));
+  details.appendChild(summary);
+  const pre = el("pre", "card-pre");
+  details.appendChild(pre);
+  details.addEventListener("toggle", () => {
+    if (details.open && !pre.textContent) pre.textContent = text;
+  });
+  return details;
+}
+
 function statusChip(status, exitCode) {
   const value = String(status || "").toLowerCase();
   const table = {
@@ -936,18 +956,7 @@ function renderItem(item) {
   const type = item && item.type;
   if (type === "userMessage") return userMessage(item);
   if (type === "agentMessage") return agentMessage(item.text || "");
-  if (type === "reasoning") {
-    const text = reasoningText(item);
-    if (!text) return null;
-    const details = el("details", "card");
-    const summary = el("summary");
-    summary.appendChild(el("span", "icon", "✳"));
-    summary.appendChild(el("span", "raw-label", "思考过程"));
-    summary.appendChild(copyButton(text));
-    details.appendChild(summary);
-    details.appendChild(el("pre", "card-pre", text));
-    return details;
-  }
+  if (type === "reasoning") return null;
   if (type === "commandExecution") {
     const node = card("$", item.command || "", statusChip(item.status, item.exitCode));
     if (item.cwd) node.appendChild(el("div", "card-sub mono", item.cwd));
@@ -1062,7 +1071,25 @@ function renderTranscript(forceScroll) {
     const chip = statusChip(turn.status, null);
     if (chip) head.appendChild(chip);
     node.appendChild(head);
+    // 桌面端把一个回合的思考收成一行；这里先把同一回合的思考合并，再在第一次
+    // 出现的位置放进去，避免长回合被上百个折叠卡片撑长。
+    const thoughts = [];
     for (const item of turn.items || []) {
+      if (item && item.type === "reasoning") {
+        const text = reasoningText(item);
+        if (text) thoughts.push(text);
+      }
+    }
+    const thoughtText = thoughts.join("\n\n");
+    let thoughtPlaced = !thoughtText;
+    for (const item of turn.items || []) {
+      if (item && item.type === "reasoning") {
+        if (!thoughtPlaced) {
+          thoughtPlaced = true;
+          node.appendChild(reasoningBlock(thoughtText));
+        }
+        continue;
+      }
       const rendered = renderItem(item);
       if (rendered) node.appendChild(rendered);
     }
