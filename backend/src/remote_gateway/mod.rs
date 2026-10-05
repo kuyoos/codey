@@ -1091,10 +1091,34 @@ async fn api_turns(state: &State, request: &Request, id: &str) -> ApiResult {
         .request("thread/turns/list", params)
         .await
         .map_err(upstream_error)?;
+    let mut turns = value.get("data").cloned().unwrap_or(json!([]));
+    strip_reasoning_text(&mut turns);
     Ok(json!({
-        "turns": value.get("data").cloned().unwrap_or(json!([])),
+        "turns": turns,
         "nextCursor": value.get("nextCursor").cloned().unwrap_or(Value::Null),
     }))
+}
+
+/// 网页只显示思考的步数，不需要推理全文；长回合的推理正文能占响应三分之一以上，
+/// 去掉它可以明显缩短网页加载与渲染时间。
+fn strip_reasoning_text(turns: &mut Value) {
+    let Some(list) = turns.as_array_mut() else {
+        return;
+    };
+    for turn in list.iter_mut() {
+        let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                continue;
+            }
+            if let Some(object) = item.as_object_mut() {
+                let _ = object.remove("summary");
+                let _ = object.remove("content");
+            }
+        }
+    }
 }
 
 async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
@@ -1182,5 +1206,34 @@ async fn api_approval(state: &State, request: &Request, id: &str) -> ApiResult {
             404,
             json!({ "error": { "message": "审批请求不存在或已过期" } }),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_text_is_stripped_without_touching_other_items() {
+        let mut turns = json!([
+            {
+                "id": "t1",
+                "items": [
+                    { "type": "reasoning", "id": "r1", "summary": ["很长的推理"], "content": ["正文"] },
+                    { "type": "agentMessage", "id": "a1", "text": "回答" },
+                    { "type": "reasoning", "id": "r2" }
+                ]
+            },
+            { "id": "t2" }
+        ]);
+        strip_reasoning_text(&mut turns);
+        let items = turns[0]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], json!("reasoning"));
+        assert_eq!(items[0]["id"], json!("r1"));
+        assert!(items[0].get("summary").is_none());
+        assert!(items[0].get("content").is_none());
+        assert_eq!(items[1]["text"], json!("回答"));
+        assert_eq!(items[2]["id"], json!("r2"));
     }
 }
