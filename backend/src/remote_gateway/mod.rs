@@ -1103,7 +1103,7 @@ async fn api_turns(state: &State, request: &Request, id: &str) -> ApiResult {
     }))
 }
 
-/// 网页只需要“做了什么”的概要：推理正文、工具参数与结果、命令输出正文、文件 diff
+/// 网页只需要“做了什么”的概要：推理正文、工具参数与结果、命令输出正文、文件改动清单与图片结果
 /// 在真实会话里能占响应九成以上，在网关侧统一裁剪后，网页加载更快、流量更低。
 fn slim_turns(turns: &mut Value) {
     let Some(list) = turns.as_array_mut() else {
@@ -1143,16 +1143,22 @@ fn slim_turns(turns: &mut Value) {
                     let _ = object.remove("agentsStates");
                     truncate_field(object, "prompt", OUTPUT_PREVIEW_CHARS);
                 }
-                Some("fileChange") => {
-                    let Some(changes) = object.get_mut("changes").and_then(Value::as_array_mut)
-                    else {
-                        continue;
-                    };
-                    for change in changes.iter_mut() {
-                        if let Some(entry) = change.as_object_mut() {
-                            let _ = entry.remove("diff");
-                        }
+                // 网页只显示「图片 N 项」的计数，图片路径与生成结果都不再下发。
+                Some("imageView") => {
+                    let _ = object.remove("path");
+                }
+                Some("imageGeneration") => {
+                    for key in ["result", "revisedPrompt", "savedPath"] {
+                        let _ = object.remove(key);
                     }
+                }
+                Some("fileChange") => {
+                    // 网页只显示「修改 N 个文件」的计数，改了哪些文件、怎么改的都不再下发。
+                    let count = object
+                        .remove("changes")
+                        .and_then(|changes| changes.as_array().map(Vec::len))
+                        .unwrap_or(0);
+                    object.insert("changeCount".to_owned(), json!(count));
                 }
                 _ => {}
             }
@@ -1482,14 +1488,16 @@ mod tests {
                     { "type": "mcpToolCall", "id": "m1", "server": "srv", "tool": "tool", "arguments": { "big": "参数" }, "result": { "big": "结果" } },
                     { "type": "functionCallOutput", "id": "o1", "name": "shell", "output": long_output },
                     { "type": "fileChange", "id": "f1", "changes": [{ "path": "src/a.rs", "kind": { "type": "update", "move_path": null }, "diff": "@@ -1,1 +1,2 @@" }] },
-                    { "type": "webSearch", "id": "w1", "query": "问题", "results": [{ "huge": "结果" }] }
+                    { "type": "webSearch", "id": "w1", "query": "问题", "results": [{ "huge": "结果" }] },
+                    { "type": "imageView", "id": "v1", "path": "file:///tmp/a.png" },
+                    { "type": "imageGeneration", "id": "g1", "status": "completed", "result": "data:image/png;base64,AAAA", "revisedPrompt": "改过的提示词", "savedPath": "file:///tmp/b.png" }
                 ]
             },
             { "id": "t2" }
         ]);
         slim_turns(&mut turns);
         let items = turns[0]["items"].as_array().expect("items");
-        assert_eq!(items.len(), 7);
+        assert_eq!(items.len(), 9);
         assert_eq!(items[0]["type"], json!("reasoning"));
         assert!(items[0].get("summary").is_none());
         assert!(items[0].get("content").is_none());
@@ -1505,11 +1513,18 @@ mod tests {
         let output = items[4]["output"].as_str().expect("output");
         assert!(output.ends_with("…（已截断）"));
         assert!(output.chars().count() < long_output.chars().count());
-        assert!(items[5]["changes"][0].get("diff").is_none());
-        assert_eq!(items[5]["changes"][0]["path"], json!("src/a.rs"));
-        assert_eq!(items[5]["changes"][0]["kind"]["type"], json!("update"));
+        // 文件改动只留计数，改动清单与 diff 都不再下发。
+        assert!(items[5].get("changes").is_none());
+        assert_eq!(items[5]["changeCount"], json!(1));
         assert!(items[6].get("results").is_none());
         assert_eq!(items[6]["query"], json!("问题"));
+        // 图片只留计数所需字段，路径、提示词与生成结果都不再下发。
+        assert!(items[7].get("path").is_none());
+        assert_eq!(items[7]["type"], json!("imageView"));
+        assert!(items[8].get("result").is_none());
+        assert!(items[8].get("revisedPrompt").is_none());
+        assert!(items[8].get("savedPath").is_none());
+        assert_eq!(items[8]["status"], json!("completed"));
     }
 
     #[test]

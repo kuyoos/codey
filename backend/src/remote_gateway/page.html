@@ -161,6 +161,8 @@
     .turn-head { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 11.5px; }
     .turn-head .line { flex: 1; height: 1px; background: var(--line); }
     .turn-head .meta { color: var(--faint); white-space: nowrap; }
+    /* 回合收尾统计：耗时、token 与思考次数放在回合末尾，运行中的那份显示在状态条里。 */
+    .turn-foot { color: var(--faint); font-size: 11.5px; margin-top: 8px; }
     .turn.flash { animation: flash 1.2s ease; }
     @keyframes flash { 0%, 100% { background: transparent; } 20% { background: var(--accent-dim); } }
     .chip {
@@ -239,15 +241,6 @@
       margin: 0; padding: 9px 10px; background: #0c0e12; border-top: 1px solid var(--line);
       font-size: 12.5px; white-space: pre-wrap; word-break: break-word; max-height: 340px; overflow: auto;
     }
-    .diff-row { display: flex; gap: 8px; padding: 4px 10px; font-size: 12.5px; border-top: 1px solid var(--line); }
-    .diff-row .kind { color: var(--warn); flex: none; }
-    .diff-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .diff-row.more { color: var(--faint); }
-    .tool-row { display: flex; align-items: center; gap: 8px; padding: 4px 10px; border-top: 1px solid var(--line); font-size: 12.5px; }
-    .tool-row .icon { color: var(--faint); flex: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
-    .tool-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tool-row.more { color: var(--faint); }
-    .tool-row.is-failed .mono { color: var(--danger); }
     details.raw { border-top: 1px solid var(--line); }
     details.raw > summary {
       display: flex; align-items: center; gap: 8px;
@@ -259,8 +252,8 @@
     .raw-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     summary .copy { flex: none; color: var(--muted); font-size: 11.5px; padding: 2px 7px; border-radius: 6px; }
     summary .copy:hover { background: var(--surface-3); color: var(--text); }
-    /* 思考、工具与命令都只留一行计数，和聊天里的元信息一样轻。 */
-    .think, .tool-note {
+    /* 工具、命令、文件改动与图片都只留一行计数，和聊天里的元信息一样轻。 */
+    .tool-note {
       display: inline-flex; align-items: center; gap: 6px; align-self: flex-start;
       margin: 4px 0; padding: 3px 10px; border-radius: 999px;
       background: var(--surface-2); color: var(--faint); font-size: 12px;
@@ -294,6 +287,21 @@
     .approval-card .actions .allow { background: var(--accent); border-color: var(--accent); color: #08101c; font-weight: 600; }
 
     /* ---------- 输入区 ---------- */
+    /* 运行状态条：紧贴输入框上方，回合进行中显示用时、token 与思考次数。 */
+    .runbar {
+      flex: none; display: flex; align-items: center; gap: 8px;
+      padding: 7px 12px; border-top: 1px solid var(--line);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      color: var(--muted); font-size: 12.5px;
+    }
+    .runbar .run-dot {
+      width: 7px; height: 7px; flex: none; border-radius: 50%;
+      background: var(--accent); animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse { 50% { opacity: .25; } }
+    .runbar .run-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* 状态条自带顶边，紧挨着的输入框不再重复画线。 */
+    .runbar:not([hidden]) + .composer { border-top: 0; }
     .composer {
       flex: none; display: flex; align-items: flex-end; gap: 8px;
       padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
@@ -435,7 +443,7 @@
     }
     /* 宽屏时把正文收窄居中，和常见聊天网页一样保持行宽可读。 */
     @media (min-width: 1100px) {
-      .transcript, .composer, .chat-head, .approval-host {
+      .transcript, .composer, .chat-head, .approval-host, .runbar {
         padding-left: max(14px, calc((100% - 860px) / 2));
         padding-right: max(14px, calc((100% - 860px) / 2));
       }
@@ -497,6 +505,7 @@
         <svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 5v14"/><path d="M6 13l6 6 6-6"/></svg>
         <span class="new" hidden></span>
       </button>
+      <div class="runbar" id="runbar" hidden></div>
       <form class="composer" id="composer">
         <button class="cmd-btn" id="cmdBtn" type="button" aria-label="命令">/</button>
         <textarea id="input" rows="1" placeholder="输入消息…" enterkeyhint="send" aria-label="消息内容"></textarea>
@@ -574,8 +583,6 @@ const LAST_THREAD_KEY = "codey_gateway_last_thread";
 // 网页只保留最近几个回合，翻到上限就不再往回取，避免长会话把正文堆满页面。
 const TURNS_PAGE = 5;
 const MAX_TURNS = 15;
-// 单次改动涉及的文件数量没有上限，网页只列一部分，其余折叠成计数。
-const FILE_ROW_LIMIT = 40;
 // 网页可触发的斜杠命令，一一对应网关的命令白名单，不会把输入原样透传给上游。
 const SLASH_COMMANDS = [
   { name: "compact", usage: "/compact", title: "压缩上下文", desc: "把较早的对话压成摘要，腾出上下文空间" },
@@ -593,6 +600,10 @@ const state = {
   turns: [],
   nextCursor: null,
   activeTurnId: null,
+  activeTurn: null,
+  runTimer: null,
+  runTicks: 0,
+  autoScroll: true,
   live: new Map(),
   usage: { total: null, turns: {} },
   approvals: [],
@@ -686,13 +697,16 @@ function formatDuration(ms) {
   return Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分";
 }
 
-function turnMeta(turn) {
+// 回合收尾统计：耗时、token 与思考次数都放在回合末尾；运行中的那份由输入框上方的状态条显示。
+function turnStats(turn) {
   const parts = [];
   const duration = formatDuration(turn && turn.durationMs);
   if (duration) parts.push("耗时 " + duration);
   const usage = state.usage.turns[(turn && turn.id) || ""];
   const tokens = usage && formatTokens(usage.total_tokens);
   if (tokens) parts.push(tokens + " tokens");
+  const thoughts = ((turn && turn.items) || []).filter((item) => item && item.type === "reasoning").length;
+  if (thoughts) parts.push("思考 " + thoughts + " 次");
   return parts.join(" · ");
 }
 
@@ -1039,63 +1053,31 @@ function editMessage(text) {
   toast("已填入输入框，修改后发送");
 }
 
-// app-server 的 kind 是 { type, move_path } 对象，先归一化成短标签再展示。
-const CHANGE_LABELS = {
-  add: "新增", added: "新增", create: "新增", created: "新增",
-  update: "修改", modified: "修改", modify: "修改", edit: "修改",
-  delete: "删除", deleted: "删除", remove: "删除", removed: "删除",
-  move: "移动", moved: "移动", rename: "移动", renamed: "移动", copy: "复制",
-};
-
-function changeLabel(kind) {
-  if (kind && typeof kind === "object") kind = kind.type || kind.kind || kind.action;
-  return CHANGE_LABELS[String(kind || "").toLowerCase()] || "";
-}
-
-function changeRows(changes) {
-  const rows = [];
-  for (const change of changes || []) {
-    if (typeof change === "string") { rows.push({ kind: "", path: change }); continue; }
-    const path = change.path || change.file || change.filename;
-    if (!path) continue;
-    rows.push({ kind: changeLabel(change.kind || change.type || change.action), path });
-  }
-  return rows;
-}
-
-// 工具与命令只留一行计数，和思考一样轻；正文在网关侧已裁掉，网页不再逐项渲染。
+// 工具、命令、文件改动与图片都只留一行计数，和思考一样轻；正文与路径在网关侧已裁掉。
 const TOOL_TYPES = new Set([
   "commandExecution", "mcpToolCall", "dynamicToolCall",
   "functionCallOutput", "webSearch", "collabAgentToolCall",
 ]);
 
-function toolGroup(items) {
+function countNote(icon, text) {
   const node = el("div", "tool-note");
-  node.appendChild(el("span", "icon", "⛭"));
-  node.appendChild(el("span", null, "工具与命令 " + items.length + " 项"));
+  node.appendChild(el("span", "icon", icon));
+  node.appendChild(el("span", null, text));
   return node;
 }
 
-// 连续的文件改动也只算一张卡片：只列改了哪些文件与改动类型。
+function toolGroup(items) {
+  return countNote("⛭", "工具与命令 " + items.length + " 项");
+}
+
+// 文件改动只报数量：改了哪些文件、怎么改的都不再下发，也不再展示。
 function fileBlock(items) {
-  const rows = [];
-  let status = null;
-  for (const item of items) {
-    for (const row of changeRows(item.changes)) rows.push(row);
-    if (!status) status = item.status;
-  }
-  const node = card("±", "修改了 " + rows.length + " 个文件", statusChip(status));
-  for (const row of rows.slice(0, FILE_ROW_LIMIT)) {
-    const line = el("div", "diff-row");
-    line.appendChild(el("span", "kind", row.kind || "修改"));
-    line.appendChild(el("span", "mono", row.path));
-    line.title = row.path;
-    node.appendChild(line);
-  }
-  if (rows.length > FILE_ROW_LIMIT) {
-    node.appendChild(el("div", "diff-row more", "还有 " + (rows.length - FILE_ROW_LIMIT) + " 个文件"));
-  }
-  return node;
+  const count = items.reduce((sum, item) => sum + (Number(item.changeCount) || 0), 0);
+  return countNote("±", "修改 " + count + " 个文件");
+}
+
+function imageGroup(items) {
+  return countNote("▤", "图片 " + items.length + " 项");
 }
 
 function card(kind, title, chip) {
@@ -1187,11 +1169,6 @@ function renderItem(item) {
     const node = card("⌕", "联网搜索 · " + (item.query || ""));
     return node;
   }
-  if (type === "imageView" || type === "imageGeneration") {
-    const node = card("▤", type === "imageView" ? "查看图片" : "生成图片");
-    node.appendChild(el("div", "card-sub mono", item.path || ""));
-    return node;
-  }
   if (type === "collabAgentToolCall") {
     const node = card("⧉", "子代理调用 · " + (item.tool || ""));
     if (item.prompt) node.appendChild(rawBlock("提示词", typeof item.prompt === "string" ? item.prompt : json(item.prompt), false));
@@ -1231,12 +1208,105 @@ function pinToBottom(root) {
 function scrollToBottom() {
   pinToBottom($("transcript"));
   $("toBottom").hidden = true;
+  $("toBottom").querySelector(".new").hidden = true;
+  state.autoScroll = true;
 }
 
 function updateToBottom() {
   const root = $("transcript");
   const show = root.scrollHeight - root.scrollTop - root.clientHeight > 120;
   $("toBottom").hidden = !show;
+}
+
+// 只有停在底部时才跟随新消息：滚上去看历史时不再被拽回底部，改由「回到最新」提示有新内容。
+function updateAutoScroll() {
+  state.autoScroll = isPinned($("transcript"));
+  if (state.autoScroll) $("toBottom").querySelector(".new").hidden = true;
+}
+
+function updateAtBottom() {
+  updateToBottom();
+  updateAutoScroll();
+}
+
+/* ================= 运行状态条 ================= */
+
+// 回合进行中把已用时、token 与思考次数贴在输入框上方；结束时这些数字落到回合末尾。
+function startRun(turn) {
+  const id = (turn && turn.id) || state.activeTurnId || null;
+  const started = Number(turn && turn.startedAt);
+  if (!state.activeTurn || (id && state.activeTurn.id !== id)) {
+    state.activeTurn = {
+      id,
+      startedAt: Number.isFinite(started) && started > 0 ? started : Math.floor(Date.now() / 1000),
+      reasonings: 0,
+    };
+  }
+  state.activeTurnId = id;
+  if (!state.runTimer) {
+    state.runTicks = 0;
+    state.runTimer = setInterval(runTick, 1000);
+  }
+  renderRunbar();
+}
+
+function runTick() {
+  renderRunbar();
+  state.runTicks += 1;
+  // token 在回合进行中持续增长，隔几秒补一次；落盘聚合有成本，不要太频繁。
+  if (state.runTicks % 8 === 0 && state.threadId) loadUsage(state.threadId, true).catch(() => {});
+}
+
+function endRun() {
+  clearInterval(state.runTimer);
+  state.runTimer = null;
+  state.runTicks = 0;
+  state.activeTurn = null;
+  state.activeTurnId = null;
+  renderRunbar();
+}
+
+function renderRunbar() {
+  const bar = $("runbar");
+  const turn = state.activeTurn;
+  $("stopBtn").hidden = !state.activeTurnId;
+  if (!turn && !state.command) {
+    bar.hidden = true;
+    bar.textContent = "";
+    return;
+  }
+  bar.textContent = "";
+  bar.appendChild(el("span", "run-dot"));
+  const parts = [state.command ? state.command.title + "中" : "运行中"];
+  if (turn) {
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - turn.startedAt);
+    parts.push(formatDuration(elapsed * 1000) || elapsed + " 秒");
+    const tokens = state.usage.turns[turn.id] && formatTokens(state.usage.turns[turn.id].total_tokens);
+    if (tokens) parts.push(tokens + " tokens");
+    if (turn.reasonings) parts.push("思考 " + turn.reasonings + " 次");
+  }
+  bar.appendChild(el("span", "run-text", parts.join(" · ")));
+  bar.hidden = false;
+}
+
+// 网页可能在回合开始后才打开：从已载入的回合里认领运行中的那条，状态条才有数据。
+function adoptRunningTurn() {
+  const running = state.turns.find((turn) => turn && turn.status === "inProgress");
+  if (running) {
+    const thoughts = (running.items || []).filter((item) => item && item.type === "reasoning").length;
+    if (state.activeTurn && state.activeTurn.id === running.id) {
+      state.activeTurn.reasonings = Math.max(state.activeTurn.reasonings, thoughts);
+      state.activeTurnId = running.id;
+    } else {
+      startRun(running);
+      state.activeTurn.reasonings = thoughts;
+    }
+    renderRunbar();
+    return;
+  }
+  // 认领过的回合已经出现在列表里且已结束，说明完成事件没收到，兜底收起状态条。
+  const mine = state.turns.find((turn) => turn && turn.id === state.activeTurnId);
+  if (mine && mine.status && mine.status !== "inProgress") endRun();
 }
 
 function renderTranscript(forceScroll) {
@@ -1250,7 +1320,7 @@ function renderTranscript(forceScroll) {
     empty.appendChild(el("div", "big", "选择一个对话"));
     empty.appendChild(el("div", null, isMobile() ? "点左上角返回列表，选择一个会话开始。" : "左侧列出本机全部对话，包含桌面端没有打开的会话。"));
     root.appendChild(empty);
-    updateToBottom();
+    updateAtBottom();
     return;
   }
   if (!state.turns.length) {
@@ -1271,22 +1341,17 @@ function renderTranscript(forceScroll) {
     const head = el("div", "turn-head");
     const stamp = turn.createdAt || turn.startedAt || turn.completedAt;
     head.appendChild(el("span", null, stamp ? relTime(stamp) : "回合"));
-    const meta = turnMeta(turn);
-    if (meta) head.appendChild(el("span", "meta", meta));
     head.appendChild(el("span", "line"));
     const chip = statusChip(turn.status, null);
     if (chip) head.appendChild(chip);
     node.appendChild(head);
-    // 思考过程只显示步数：app-server 会按推理步骤拆成很多条（长回合上百条），
-    // 全文在网关侧就已去掉，既省流量也省渲染。
-    const thoughtCount = (turn.items || []).filter((item) => item && item.type === "reasoning").length;
-    let thoughtPlaced = !thoughtCount;
-    // 连续的同类条目合并：工具与命令、文件改动各自只留一张卡片。
+    // 连续的同类条目合并成一行计数：工具与命令、文件改动、图片各自只留一条。
     let run = [];
     let runKind = null;
     const flushRun = () => {
       if (!run.length) return;
-      node.appendChild(runKind === "files" ? fileBlock(run) : toolGroup(run));
+      const render = runKind === "files" ? fileBlock : runKind === "images" ? imageGroup : toolGroup;
+      node.appendChild(render(run));
       run = [];
       runKind = null;
     };
@@ -1297,29 +1362,26 @@ function renderTranscript(forceScroll) {
     };
     for (const item of turn.items || []) {
       if (!item) continue;
-      if (item.type === "reasoning") {
-        if (!thoughtPlaced) {
-          thoughtPlaced = true;
-          flushRun();
-          const think = el("div", "think");
-          think.appendChild(el("span", "icon", "✳"));
-          think.appendChild(el("span", null, "思考 " + thoughtCount + " 次"));
-          node.appendChild(think);
-        }
-        continue;
-      }
+      // 思考正文与步数都不在这里展开，次数统一放在回合末尾的统计里。
+      if (item.type === "reasoning") continue;
       if (TOOL_TYPES.has(item.type)) { pushRun(item, "tools"); continue; }
       if (item.type === "fileChange") { pushRun(item, "files"); continue; }
+      if (item.type === "imageView" || item.type === "imageGeneration") { pushRun(item, "images"); continue; }
       flushRun();
       const rendered = renderItem(item);
       if (rendered) node.appendChild(rendered);
     }
     flushRun();
+    // 回合结束后才在末尾补统计；运行中的那份由输入框上方的状态条实时显示。
+    if (turn.status !== "inProgress") {
+      const stats = turnStats(turn);
+      if (stats) node.appendChild(el("div", "turn-foot", stats));
+    }
     root.appendChild(node);
   }
   if (pinned) pinToBottom(root);
   else root.scrollTop = keep;
-  updateToBottom();
+  updateAtBottom();
 }
 
 function renderThreads() {
@@ -1548,17 +1610,21 @@ async function loadTurns(cursor) {
     state.turns = turns.slice(0, MAX_TURNS);
   }
   state.nextCursor = state.turns.length >= MAX_TURNS ? null : (body.nextCursor || null);
-  renderTranscript(!cursor);
+  // 不强制回到底部：只有用户本来就停在底部时才跟随，翻历史时不会被拽下去。
+  renderTranscript(false);
+  adoptRunningTurn();
 }
 
 // 用量单独懒加载：网关要扫盘聚合，先渲染正文再补 token，不拖慢会话打开。
-async function loadUsage(id) {
+// keepScroll 为真时只更新状态条与回合统计，不重排正文，避免定时刷新把页面滚到底部。
+async function loadUsage(id, keepScroll) {
   const usage = await api("/api/threads/" + encodeURIComponent(id) + "/usage");
   if (state.threadId !== id || !usage || typeof usage !== "object") return;
   state.usage = { total: usage.total || null, turns: usage.turns || {} };
   renderChatHead();
+  renderRunbar();
   // 运行中的回合靠事件流增量渲染，重排会打断它，等回合结束再补上用量。
-  if (!state.live.size) renderTranscript(false);
+  if (!keepScroll && !state.live.size) renderTranscript(false);
 }
 
 function showListView() {
@@ -1571,11 +1637,13 @@ function showChatView() {
 
 async function openThread(id) {
   if (state.threadId && state.threadId !== id) closeThread(state.threadId);
+  endRun();
   state.threadId = id;
   state.detail = null;
   state.turns = [];
   state.nextCursor = null;
   state.activeTurnId = null;
+  state.autoScroll = true;
   state.live.clear();
   state.usage = { total: null, turns: {} };
   state.approvals = [];
@@ -1599,7 +1667,7 @@ async function openThread(id) {
   renderModels();
   updateModelChip();
   await loadTurns(null);
-  scrollToBottom();
+  updateAtBottom();
   loadUsage(id).catch(() => {});
 }
 
@@ -1767,8 +1835,7 @@ async function runCommand(cmd, arg) {
     }
     // 压缩与评审都会另起一个不可打断的回合，期间只提示状态，避免继续发送被上游拒绝。
     setCommand(cmd);
-    if (body.turn && body.turn.id) state.activeTurnId = body.turn.id;
-    renderChatHead();
+    startRun(body.turn);
     toast(cmd.name === "compact" ? "已开始压缩上下文" : "已开始代码评审");
     scheduleReload(600);
   } catch (error) {
@@ -1848,8 +1915,9 @@ async function send() {
       method: "POST",
       body: JSON.stringify({ text, model: $("model").value || null, effort: $("effort").value || null }),
     });
-    state.activeTurnId = (body.turn && body.turn.id) || null;
-    renderChatHead();
+    // 自己发出的消息一定跟到底部，同时开启状态条统计。
+    state.autoScroll = true;
+    startRun(body.turn);
     scheduleReload(500);
   } catch (error) {
     input.value = text;
@@ -1958,7 +2026,8 @@ function handleEvent(event) {
       live.text += params.delta || "";
       live.node.classList.add("caret");
       renderLive(live);
-      if (isPinned($("transcript"))) scrollToBottom();
+      // 只在自己停在底部时跟随流式输出，翻历史时不打断。
+      if (state.autoScroll) scrollToBottom();
       else $("toBottom").querySelector(".new").hidden = false;
     } else {
       scheduleReload(300);
@@ -1966,9 +2035,7 @@ function handleEvent(event) {
     return;
   }
   if (event.method === "turn/started") {
-    state.activeTurnId = (params.turn && params.turn.id) || state.activeTurnId;
-    $("stopBtn").hidden = false;
-    renderChatHead();
+    startRun(params.turn);
     scheduleReload(200);
     return;
   }
@@ -1979,18 +2046,29 @@ function handleEvent(event) {
       node.classList.add("caret");
       state.live.set(item.id, { node, text: typeof item.text === "string" ? item.text : "", frame: 0 });
       $("transcript").appendChild(node);
-      if (isPinned($("transcript"))) scrollToBottom();
+      if (state.autoScroll) scrollToBottom();
+      else $("toBottom").querySelector(".new").hidden = false;
+      return;
+    }
+    // 思考条目只累计次数，状态条上即时可见，不必为它们重载整段正文。
+    if (item.type === "reasoning") {
+      if (state.activeTurn) {
+        state.activeTurn.reasonings += 1;
+        renderRunbar();
+      }
       return;
     }
     scheduleReload(400);
     return;
   }
   if (event.method === "turn/completed") {
-    state.activeTurnId = null;
+    endRun();
     clearCommand();
-    $("stopBtn").hidden = true;
     renderChatHead();
     scheduleReload(250);
+    // 回合结束的用量要等 rollout 落盘，稍后再补一次，回合末尾的 token 才是最终值。
+    const id = state.threadId;
+    if (id) setTimeout(() => { if (state.threadId === id) loadUsage(id).catch(() => {}); }, 1500);
     return;
   }
   if (event.method === "item/completed") {
@@ -2011,11 +2089,22 @@ function handleEvent(event) {
 
 function connectEvents() {
   const source = new EventSource("/api/events?token=" + encodeURIComponent(state.token));
-  source.onopen = () => setStatus("已连接", "on");
+  // 断线期间可能错过回合结束事件，重连后补一次对齐，避免状态条一直停在运行中。
+  let dropped = false;
+  source.onopen = () => {
+    setStatus("已连接", "on");
+    if (dropped) {
+      dropped = false;
+      scheduleReload(200);
+    }
+  };
   source.onmessage = (message) => {
     try { handleEvent(JSON.parse(message.data)); } catch { /* 忽略单条坏事件 */ }
   };
-  source.onerror = () => setStatus("重连中…", "warn");
+  source.onerror = () => {
+    dropped = true;
+    setStatus("重连中…", "warn");
+  };
 }
 
 /* ================= 令牌门 ================= */
@@ -2119,12 +2208,10 @@ function bind() {
     }
   });
   $("toBottom").addEventListener("click", () => {
-    const root = $("transcript");
-    pinToBottom(root);
-    $("toBottom").hidden = true;
-    $("toBottom").querySelector(".new").hidden = true;
+    scrollToBottom();
+    updateToBottom();
   });
-  $("transcript").addEventListener("scroll", updateToBottom, { passive: true });
+  $("transcript").addEventListener("scroll", updateAtBottom, { passive: true });
   window.addEventListener("popstate", () => showListView());
   window.addEventListener("beforeunload", () => { if (state.threadId) closeThread(state.threadId); });
   window.addEventListener("keydown", (event) => {
@@ -2157,7 +2244,8 @@ async function boot() {
   // 网关与桌面共用同一条上游连接，没有独立连接状态时用轮询兜底补齐桌面端发起的回合。
   setInterval(() => {
     if (!state.threadId || state.activeTurnId) return;
-    if (!isPinned($("transcript"))) return;
+    // 用户翻历史时不再打断，等回到最新再续上。
+    if (!state.autoScroll) return;
     loadTurns(null).catch(() => {});
   }, 5000);
   try {
