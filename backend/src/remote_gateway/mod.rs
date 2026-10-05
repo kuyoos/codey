@@ -1292,6 +1292,32 @@ fn collect_rollout_files(dir: &Path, session_id: &str, found: &mut Vec<PathBuf>)
     }
 }
 
+/// 网页在会话回合运行中再次发送时的投递方式：引导并入当前回合，或排队等回合结束后执行。
+#[derive(Debug, PartialEq, Eq)]
+enum SendMode {
+    Start,
+    Steer(String),
+    Queue,
+}
+
+/// 解析发送方式；引导必须带上正在运行的回合 ID，与上游 `expectedTurnId` 的前置条件一致。
+fn parse_send_mode(body: &Value) -> Result<SendMode, (u16, Value)> {
+    match body.get("mode").and_then(Value::as_str).map(str::trim) {
+        None | Some("") | Some("start") => Ok(SendMode::Start),
+        Some("steer") => {
+            let turn_id = body
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|turn| !turn.is_empty())
+                .ok_or_else(|| bad("缺少正在运行的回合 ID"))?;
+            Ok(SendMode::Steer(turn_id.to_owned()))
+        }
+        Some("queue") => Ok(SendMode::Queue),
+        Some(_) => Err(bad("不支持的消息发送方式")),
+    }
+}
+
 async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
     let body = request.json().map_err(|error| bad(&error.to_string()))?;
     let text = body
@@ -1300,36 +1326,69 @@ async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .ok_or_else(|| bad("消息内容为空"))?;
-    let mut params = json!({
-        "threadId": id,
-        "input": [{ "type": "text", "text": text }],
-    });
-    // app-server 没有单独的会话设置接口，模型与推理强度只能随回合覆盖，并会沿用到后续回合。
-    if let Some(model) = body.get("model").and_then(Value::as_str) {
-        params["model"] = json!(model);
-    }
-    if let Some(effort) = body.get("effort").and_then(Value::as_str) {
-        params["effort"] = json!(effort);
-    }
-    // 发送前把会话接入上游；失败也继续尝试，由 turn/start 决定最终结果，但保留原因用于解释失败。
-    let resume_error = state
-        .upstream
-        .request(
-            "thread/resume",
-            json!({ "threadId": id, "excludeTurns": true }),
-        )
-        .await
-        .err();
-    let value = match state.upstream.request("turn/start", params).await {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(upstream_error(describe_send_failure(
-                error,
-                resume_error.as_ref(),
-            )));
+    let mode = parse_send_mode(&body)?;
+    let input = json!([{ "type": "text", "text": text }]);
+    // 引导与排队都只作用于正在运行的回合：上游此刻已持有该会话，再 resume 只会撞上写入者冲突，
+    // 因此直接在当前连接上投递。新回合需要先接入会话，失败也继续，由 turn/start 决定最终结果。
+    let (method, params, resume_error) = match &mode {
+        SendMode::Start => {
+            let mut params = json!({ "threadId": id, "input": input });
+            // app-server 没有单独的会话设置接口，模型与推理强度只能随回合覆盖，并会沿用到后续回合。
+            if let Some(model) = body.get("model").and_then(Value::as_str) {
+                params["model"] = json!(model);
+            }
+            if let Some(effort) = body.get("effort").and_then(Value::as_str) {
+                params["effort"] = json!(effort);
+            }
+            let resume_error = state
+                .upstream
+                .request(
+                    "thread/resume",
+                    json!({ "threadId": id, "excludeTurns": true }),
+                )
+                .await
+                .err();
+            ("turn/start", params, resume_error)
         }
+        SendMode::Steer(turn_id) => (
+            "turn/steer",
+            json!({
+                "threadId": id,
+                "expectedTurnId": turn_id,
+                "clientUserMessageId": uuid::Uuid::new_v4().to_string(),
+                "input": input,
+            }),
+            None,
+        ),
+        SendMode::Queue => (
+            "thread/queue/add",
+            json!({
+                "threadId": id,
+                "clientUserMessageId": uuid::Uuid::new_v4().to_string(),
+                "input": input,
+            }),
+            None,
+        ),
     };
-    Ok(json!({ "turn": value.get("turn").cloned().unwrap_or(Value::Null) }))
+    let value = state
+        .upstream
+        .request(method, params)
+        .await
+        .map_err(|error| upstream_error(describe_send_failure(error, resume_error.as_ref())))?;
+    Ok(match &mode {
+        SendMode::Start => json!({
+            "mode": "start",
+            "turn": value.get("turn").cloned().unwrap_or(Value::Null),
+        }),
+        SendMode::Steer(turn_id) => json!({
+            "mode": "steer",
+            "turnId": value.get("turnId").cloned().unwrap_or(json!(turn_id)),
+        }),
+        SendMode::Queue => json!({
+            "mode": "queue",
+            "queuedSubmission": value.get("queuedSubmission").cloned().unwrap_or(Value::Null),
+        }),
+    })
 }
 
 /// 网页可触发的斜杠命令。网关是局域网可达的带令牌入口，只放行这几个固定动作，
@@ -1546,6 +1605,28 @@ mod tests {
             session_id_from_rollout("rollout-2026-10-05T09-27-08.jsonl"),
             None
         );
+    }
+
+    #[test]
+    fn send_mode_gates_steer_and_queue() {
+        // 缺省与显式 start 都走新回合，保持既有行为。
+        assert_eq!(parse_send_mode(&json!({})), Ok(SendMode::Start));
+        assert_eq!(
+            parse_send_mode(&json!({ "mode": "start" })),
+            Ok(SendMode::Start)
+        );
+        assert_eq!(
+            parse_send_mode(&json!({ "mode": "queue" })),
+            Ok(SendMode::Queue)
+        );
+        assert_eq!(
+            parse_send_mode(&json!({ "mode": "steer", "turnId": " t1 " })),
+            Ok(SendMode::Steer("t1".to_owned()))
+        );
+        // 引导必须带正在运行的回合 ID，未知方式一律拒绝，不向上游透传。
+        assert!(parse_send_mode(&json!({ "mode": "steer" })).is_err());
+        assert!(parse_send_mode(&json!({ "mode": "steer", "turnId": "  " })).is_err());
+        assert!(parse_send_mode(&json!({ "mode": "broadcast" })).is_err());
     }
 
     #[test]

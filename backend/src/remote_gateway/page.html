@@ -382,6 +382,16 @@
     .sheet-close {
       width: 100%; height: 44px; border-radius: 12px; background: var(--accent); color: #08101c; font-weight: 600;
     }
+    /* 运行中再次发送：选择把消息并入当前回合，还是排队等回合结束后发送。 */
+    .sheet-actions { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+    .choice {
+      display: block; width: 100%; text-align: left; padding: 11px 12px; border-radius: 12px;
+      background: var(--surface-2); border: 1px solid var(--line); color: var(--text);
+    }
+    .choice:hover { background: var(--surface-3); }
+    .choice-title { display: block; font-weight: 600; font-size: 13.5px; }
+    .choice-desc { display: block; color: var(--faint); font-size: 12px; line-height: 1.5; margin-top: 2px; }
+    .sheet-close.ghost { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); }
     /* 会话导航：列出每个回合的用户输入，点击跳到对应位置。 */
     .nav-list { max-height: min(56vh, 440px); overflow-y: auto; margin: 2px 0 10px; }
     .nav-item {
@@ -555,6 +565,26 @@
     <div class="status-list" id="statusList"></div>
     <div class="sheet-note">用量来自本机落盘的会话记录，随回合完成更新。</div>
     <button class="sheet-close" id="statusClose" type="button">关闭</button>
+  </div>
+</div>
+
+<div class="overlay" id="sendModeOverlay" hidden></div>
+<div class="sheet" id="sendModeSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="发送方式">
+    <div class="grabber"></div>
+    <div class="sheet-title">当前回合运行中</div>
+    <div class="sheet-note">这条消息要如何发送？</div>
+    <div class="sheet-actions">
+      <button class="choice" id="steerChoice" type="button">
+        <span class="choice-title">引导当前回合</span>
+        <span class="choice-desc">并入正在运行的回合，让模型立刻调整方向</span>
+      </button>
+      <button class="choice" id="queueChoice" type="button">
+        <span class="choice-title">排队等待</span>
+        <span class="choice-desc">先收下，等当前回合结束后自动发送</span>
+      </button>
+    </div>
+    <button class="sheet-close ghost" id="sendModeClose" type="button">取消</button>
   </div>
 </div>
 
@@ -1653,6 +1683,7 @@ async function openThread(id) {
   state.approvals = [];
   clearCommand();
   closeSlash();
+  cancelSendMode();
   state.slashIndex = 0;
   renderApprovals();
   try { localStorage.setItem(LAST_THREAD_KEY, id); } catch { /* 隐私模式下忽略 */ }
@@ -1799,7 +1830,16 @@ function submitInput() {
       }
     }
   }
-  send();
+  if (state.command) {
+    toast("正在" + state.command.title + "，请稍候", "warn");
+    return;
+  }
+  // 回合运行中：先让用户选引导还是排队，选完再投递。
+  if (state.activeTurnId) {
+    openSendMode(text);
+    return;
+  }
+  send(text, "start");
 }
 
 async function runCommand(cmd, arg) {
@@ -1913,23 +1953,72 @@ function closeStatus() {
   $("statusSheet").hidden = true;
 }
 
-async function send() {
-  const input = $("input");
-  const text = input.value.trim();
+/* ---------- 运行中发送方式 ---------- */
+
+// 回合正在运行时，先把消息存下来，让用户选择引导还是排队，选完再真正投递。
+let pendingSend = null;
+
+function openSendMode(text) {
+  pendingSend = text;
+  closeSlash();
+  // 收起软键盘，避免移动端面板被输入法挡住；消息留在输入框里，取消后还能接着编辑。
+  $("input").blur();
+  $("sendModeOverlay").hidden = false;
+  $("sendModeSheet").hidden = false;
+}
+
+function hideSendMode() {
+  $("sendModeOverlay").hidden = true;
+  $("sendModeSheet").hidden = true;
+}
+
+// 取消时把消息留在输入框里，用户能继续编辑后再发。
+function cancelSendMode() {
+  pendingSend = null;
+  hideSendMode();
+}
+
+function chooseSendMode(mode) {
+  const text = pendingSend;
+  pendingSend = null;
+  hideSendMode();
+  if (text) send(text, mode);
+}
+
+async function send(text, mode) {
   if (!text || !state.threadId) return;
   if (state.command) {
     toast("正在" + state.command.title + "，请稍候", "warn");
     return;
   }
+  const input = $("input");
   input.value = "";
   autoGrow();
+  closeSlash();
   try {
+    const payload = { text, model: $("model").value || null, effort: $("effort").value || null };
+    // 运行中的回合：引导并入当前回合，排队交给上游在本回合结束后执行，都不新起回合。
+    if (mode === "steer" || mode === "queue") {
+      payload.mode = mode;
+      if (mode === "steer") payload.turnId = state.activeTurnId;
+    }
     const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/messages", {
       method: "POST",
-      body: JSON.stringify({ text, model: $("model").value || null, effort: $("effort").value || null }),
+      body: JSON.stringify(payload),
     });
-    // 自己发出的消息一定跟到底部，同时开启状态条统计。
+    // 自己发出的消息一定跟到底部。
     state.autoScroll = true;
+    if (mode === "steer") {
+      toast("已引导当前回合");
+      scheduleReload(500);
+      return;
+    }
+    if (mode === "queue") {
+      toast("已排队，等当前回合结束后发送");
+      scheduleReload(600);
+      return;
+    }
+    // 新回合开启状态条统计。
     startRun(body.turn);
     scheduleReload(500);
   } catch (error) {
@@ -2204,6 +2293,10 @@ function bind() {
   window.addEventListener("pointercancel", () => { slashHold = false; });
   $("statusClose").addEventListener("click", closeStatus);
   $("statusOverlay").addEventListener("click", closeStatus);
+  $("sendModeClose").addEventListener("click", cancelSendMode);
+  $("sendModeOverlay").addEventListener("click", cancelSendMode);
+  $("steerChoice").addEventListener("click", () => chooseSendMode("steer"));
+  $("queueChoice").addEventListener("click", () => chooseSendMode("queue"));
   $("input").addEventListener("blur", (event) => {
     if (slashHold) return;
     const next = event.relatedTarget;
@@ -2249,6 +2342,7 @@ function bind() {
       closeSheet();
       closeNav();
       closeStatus();
+      cancelSendMode();
     }
   });
 }
