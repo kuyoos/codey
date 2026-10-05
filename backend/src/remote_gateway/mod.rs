@@ -953,6 +953,7 @@ async fn api(state: &Arc<State>, request: &Request) -> (u16, Value) {
         ("GET", ["api", "threads", id, "turns"]) => api_turns(state, request, id).await,
         ("GET", ["api", "threads", id, "usage"]) => api_usage(state, id).await,
         ("POST", ["api", "threads", id, "messages"]) => api_message(state, request, id).await,
+        ("POST", ["api", "threads", id, "command"]) => api_command(state, request, id).await,
         ("POST", ["api", "threads", id, "interrupt"]) => api_interrupt(state, request, id).await,
         ("POST", ["api", "threads", id, "close"]) => api_close(state, id).await,
         ("POST", ["api", "approvals", id]) => api_approval(state, request, id).await,
@@ -1325,6 +1326,91 @@ async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
     Ok(json!({ "turn": value.get("turn").cloned().unwrap_or(Value::Null) }))
 }
 
+/// 网页可触发的斜杠命令。网关是局域网可达的带令牌入口，只放行这几个固定动作，
+/// 绝不把任意 app-server 方法透传出去。
+#[derive(Debug, PartialEq, Eq)]
+enum WebCommand {
+    Compact,
+    Review,
+    Rename(String),
+}
+
+const COMMAND_NAME_MAX_CHARS: usize = 200;
+
+/// 把请求体解析成白名单命令；未知命令、缺失或超长参数都在这里直接拒绝。
+fn parse_web_command(body: &Value) -> Result<WebCommand, (u16, Value)> {
+    let command = body
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| bad("缺少命令"))?;
+    match command {
+        "compact" => Ok(WebCommand::Compact),
+        "review" => Ok(WebCommand::Review),
+        "rename" => {
+            let name = body
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| bad("缺少新名称"))?;
+            if name.chars().count() > COMMAND_NAME_MAX_CHARS {
+                return Err(bad("名称过长"));
+            }
+            Ok(WebCommand::Rename(name.to_owned()))
+        }
+        _ => Err(bad("不支持的命令")),
+    }
+}
+
+async fn api_command(state: &State, request: &Request, id: &str) -> ApiResult {
+    let body = request.json().map_err(|error| bad(&error.to_string()))?;
+    let command = parse_web_command(&body)?;
+    match command {
+        WebCommand::Compact => {
+            // 压缩与评审都要求会话已接入上游，先 resume；失败也继续，由命令本身给出最终错误。
+            let _ = state
+                .upstream
+                .request("thread/resume", json!({ "threadId": id, "excludeTurns": true }))
+                .await;
+            state
+                .upstream
+                .request("thread/compact/start", json!({ "threadId": id }))
+                .await
+                .map_err(upstream_error)?;
+            Ok(json!({ "started": "compact" }))
+        }
+        WebCommand::Review => {
+            let _ = state
+                .upstream
+                .request("thread/resume", json!({ "threadId": id, "excludeTurns": true }))
+                .await;
+            // 默认 inline 投递：评审在当前会话内进行，不另开评审会话。
+            let value = state
+                .upstream
+                .request(
+                    "review/start",
+                    json!({ "threadId": id, "target": { "type": "uncommittedChanges" } }),
+                )
+                .await
+                .map_err(upstream_error)?;
+            Ok(json!({
+                "started": "review",
+                "turn": value.get("turn").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        WebCommand::Rename(name) => {
+            state
+                .upstream
+                .request("thread/name/set", json!({ "threadId": id, "name": name }))
+                .await
+                .map_err(upstream_error)?;
+            Ok(json!({ "name": name }))
+        }
+    }
+}
+
 async fn api_interrupt(state: &State, request: &Request, id: &str) -> ApiResult {
     let body = request.json().map_err(|error| bad(&error.to_string()))?;
     let turn_id = body
@@ -1439,5 +1525,28 @@ mod tests {
             session_id_from_rollout("rollout-2026-10-05T09-27-08.jsonl"),
             None
         );
+    }
+
+    #[test]
+    fn web_commands_are_whitelisted() {
+        assert_eq!(
+            parse_web_command(&json!({ "command": "compact" })),
+            Ok(WebCommand::Compact)
+        );
+        assert_eq!(
+            parse_web_command(&json!({ "command": " review " })),
+            Ok(WebCommand::Review)
+        );
+        assert_eq!(
+            parse_web_command(&json!({ "command": "rename", "name": " 新标题 " })),
+            Ok(WebCommand::Rename("新标题".to_owned()))
+        );
+        // 未知命令与缺失参数一律拒绝，不做任何上游透传。
+        assert!(parse_web_command(&json!({ "command": "delete" })).is_err());
+        assert!(parse_web_command(&json!({ "command": "rename" })).is_err());
+        assert!(parse_web_command(&json!({ "command": "rename", "name": "   " })).is_err());
+        assert!(parse_web_command(&json!({})).is_err());
+        let long = "长".repeat(COMMAND_NAME_MAX_CHARS + 1);
+        assert!(parse_web_command(&json!({ "command": "rename", "name": long })).is_err());
     }
 }

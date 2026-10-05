@@ -299,6 +299,7 @@
       padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
       background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
       border-top: 1px solid var(--line);
+      position: relative;
     }
     .composer textarea {
       flex: 1; min-width: 0; resize: none; max-height: 40vh; min-height: 42px;
@@ -306,6 +307,11 @@
       background: var(--surface-2); border: 1px solid var(--line); line-height: 1.5;
     }
     .composer textarea:focus { border-color: var(--accent); }
+    .composer .cmd-btn {
+      width: var(--tap); height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
+      background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-weight: 600;
+    }
+    .composer .cmd-btn:active { color: var(--accent); border-color: var(--accent); }
     .composer .send {
       width: var(--tap); height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
       background: var(--accent); color: #08101c;
@@ -313,6 +319,30 @@
     .composer .send:disabled { opacity: .45; }
     .composer .stop { background: var(--surface-2); border: 1px solid var(--line-2); color: var(--danger); border-radius: 13px; }
     .composer svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ---------- 斜杠命令补全 ---------- */
+    .slash {
+      position: absolute; left: 12px; right: 12px; bottom: calc(100% + 8px); z-index: 15;
+      max-height: min(46vh, 320px); overflow-y: auto; overscroll-behavior: contain;
+      background: var(--surface-2); border: 1px solid var(--line-2); border-radius: var(--radius);
+      box-shadow: var(--shadow); animation: rise .14s ease;
+    }
+    .slash-item {
+      display: flex; gap: 10px; width: 100%; text-align: left;
+      padding: 10px 12px; border-bottom: 1px solid var(--line);
+    }
+    .slash-item:last-child { border-bottom: 0; }
+    .slash-item.active, .slash-item:hover { background: var(--surface-3); }
+    .slash-cmd { flex: none; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: var(--accent); }
+    .slash-body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
+    .slash-title { font-size: 13.5px; }
+    .slash-desc { color: var(--faint); font-size: 12px; line-height: 1.45; }
+    .status-list { max-height: min(56vh, 440px); overflow-y: auto; margin: 2px 0 10px; }
+    .status-row { display: flex; gap: 12px; padding: 9px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .status-row:last-child { border-bottom: 0; }
+    .status-row .k { flex: none; width: 76px; color: var(--muted); }
+    .status-row .v { min-width: 0; flex: 1; word-break: break-all; }
+    .status-row .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     .to-bottom {
       position: absolute; right: 16px; bottom: 84px; width: 38px; height: 38px; border-radius: 50%;
       background: var(--surface-3); border: 1px solid var(--line-2); box-shadow: var(--shadow);
@@ -409,6 +439,10 @@
         padding-left: max(14px, calc((100% - 860px) / 2));
         padding-right: max(14px, calc((100% - 860px) / 2));
       }
+      .slash {
+        left: max(14px, calc((100% - 860px) / 2));
+        right: max(14px, calc((100% - 860px) / 2));
+      }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::after, *::before { animation: none !important; scroll-behavior: auto !important; }
@@ -464,6 +498,7 @@
         <span class="new" hidden></span>
       </button>
       <form class="composer" id="composer">
+        <button class="cmd-btn" id="cmdBtn" type="button" aria-label="命令">/</button>
         <textarea id="input" rows="1" placeholder="输入消息…" enterkeyhint="send" aria-label="消息内容"></textarea>
         <button class="icon-btn stop" id="stopBtn" type="button" hidden aria-label="停止生成">
           <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" style="fill:currentColor;stroke:none"/></svg>
@@ -471,6 +506,9 @@
         <button class="send" id="sendBtn" type="submit" aria-label="发送">
           <svg viewBox="0 0 24 24"><path d="M5 12h13"/><path d="M12 5l7 7-7 7"/></svg>
         </button>
+        <div class="slash" id="slashPanel" hidden>
+          <div id="slashList" role="listbox" aria-label="可用命令"></div>
+        </div>
       </form>
     </section>
   </div>
@@ -496,6 +534,17 @@
     <div class="sheet-title">会话导航</div>
     <div class="nav-list" id="navList"></div>
     <button class="sheet-close" id="navClose" type="button">关闭</button>
+  </div>
+</div>
+
+<div class="overlay" id="statusOverlay" hidden></div>
+<div class="sheet" id="statusSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="会话状态">
+    <div class="grabber"></div>
+    <div class="sheet-title">会话状态</div>
+    <div class="status-list" id="statusList"></div>
+    <div class="sheet-note">用量来自本机落盘的会话记录，随回合完成更新。</div>
+    <button class="sheet-close" id="statusClose" type="button">关闭</button>
   </div>
 </div>
 
@@ -527,6 +576,13 @@ const TURNS_PAGE = 5;
 const MAX_TURNS = 15;
 // 单次改动涉及的文件数量没有上限，网页只列一部分，其余折叠成计数。
 const FILE_ROW_LIMIT = 40;
+// 网页可触发的斜杠命令，一一对应网关的命令白名单，不会把输入原样透传给上游。
+const SLASH_COMMANDS = [
+  { name: "compact", usage: "/compact", title: "压缩上下文", desc: "把较早的对话压成摘要，腾出上下文空间" },
+  { name: "review", usage: "/review", title: "代码评审", desc: "评审工作区里还没有提交的改动" },
+  { name: "rename", usage: "/rename", title: "重命名会话", desc: "修改当前会话的标题", arg: "新标题" },
+  { name: "status", usage: "/status", title: "会话状态", desc: "查看模型、目录与累计用量" },
+];
 
 const state = {
   token: "",
@@ -542,6 +598,9 @@ const state = {
   approvals: [],
   reloadTimer: null,
   searchTimer: null,
+  slashIndex: 0,
+  command: null,
+  commandTimer: null,
   loaded: false,
 };
 
@@ -1316,7 +1375,8 @@ function renderChatHead() {
   if (thread) {
     if (thread.cwd) meta.push(thread.cwd);
     if (state.detail.model) meta.push(state.detail.model);
-    if (state.activeTurnId) meta.push("运行中");
+    if (state.command) meta.push(state.command.title + "中");
+    else if (state.activeTurnId) meta.push("运行中");
     const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
     if (total) meta.push("累计 " + total + " tokens");
   }
@@ -1519,6 +1579,9 @@ async function openThread(id) {
   state.live.clear();
   state.usage = { total: null, turns: {} };
   state.approvals = [];
+  clearCommand();
+  closeSlash();
+  state.slashIndex = 0;
   renderApprovals();
   try { localStorage.setItem(LAST_THREAD_KEY, id); } catch { /* 隐私模式下忽略 */ }
   $("chatTitle").textContent = "载入中…";
@@ -1548,10 +1611,227 @@ function closeThread(id) {
 
 /* ================= 动作 ================= */
 
+/* ---------- 斜杠命令 ---------- */
+
+// 只有「/」开头且还没输入空格的片段才算命令名补全；`/rename 标题` 这类整串交给提交处理。
+function slashMatches(text) {
+  const match = /^\/([a-zA-Z]*)$/.exec(text);
+  if (!match) return [];
+  const keyword = match[1].toLowerCase();
+  return SLASH_COMMANDS.filter((cmd) => !keyword || cmd.name.indexOf(keyword) === 0);
+}
+
+function slashVisible() {
+  return !$("slashPanel").hidden;
+}
+
+function closeSlash() {
+  if (slashVisible()) $("slashPanel").hidden = true;
+}
+
+function renderSlash(matches) {
+  const panel = $("slashPanel");
+  const list = $("slashList");
+  list.textContent = "";
+  if (!matches.length) {
+    panel.hidden = true;
+    return;
+  }
+  state.slashIndex = Math.max(0, Math.min(state.slashIndex, matches.length - 1));
+  matches.forEach((cmd, index) => {
+    const item = el("button", "slash-item" + (index === state.slashIndex ? " active" : ""));
+    item.type = "button";
+    item.setAttribute("role", "option");
+    item.appendChild(el("span", "slash-cmd", cmd.usage));
+    const body = el("span", "slash-body");
+    body.appendChild(el("span", "slash-title", cmd.title));
+    body.appendChild(el("span", "slash-desc", cmd.desc));
+    item.appendChild(body);
+    item.addEventListener("click", () => runCommand(cmd, ""));
+    list.appendChild(item);
+  });
+  panel.hidden = false;
+}
+
+function updateSlash() {
+  if (!state.threadId) {
+    closeSlash();
+    return;
+  }
+  const matches = slashMatches($("input").value.trim());
+  if (!matches.length) {
+    closeSlash();
+    return;
+  }
+  if (!slashVisible()) state.slashIndex = 0;
+  renderSlash(matches);
+}
+
+// 输入框右侧的「/」按钮：没内容时补一个斜杠并聚焦，方便在手机上调出命令面板。
+function toggleSlash() {
+  const input = $("input");
+  if (slashVisible()) {
+    closeSlash();
+    return;
+  }
+  if (!input.value.trim()) {
+    input.value = "/";
+    autoGrow();
+  }
+  input.focus();
+  updateSlash();
+}
+
+function parseSlashCommand(text) {
+  const match = /^\/([a-zA-Z]+)(?:\s+([\s\S]*))?$/.exec(text);
+  if (!match) return null;
+  return {
+    cmd: SLASH_COMMANDS.find((item) => item.name === match[1].toLowerCase()) || null,
+    arg: (match[2] || "").trim(),
+  };
+}
+
+// 面板打开时回车优先执行高亮命令；否则整串 `/rename 标题` 直接执行，普通文本才当消息发送。
+function submitInput() {
+  const input = $("input");
+  const text = input.value.trim();
+  if (!text || !state.threadId) return;
+  if (slashVisible()) {
+    const matches = slashMatches(text);
+    const cmd = matches[state.slashIndex] || matches[0];
+    if (cmd) {
+      runCommand(cmd, "");
+      return;
+    }
+  }
+  if (text.charAt(0) === "/") {
+    const parsed = parseSlashCommand(text);
+    if (!parsed || !parsed.cmd) {
+      toast("不支持的命令 " + text.split(/\s+/)[0], "bad");
+      return;
+    }
+    runCommand(parsed.cmd, parsed.arg);
+    return;
+  }
+  send();
+}
+
+async function runCommand(cmd, arg) {
+  if (!state.threadId) return;
+  const input = $("input");
+  // 需要参数的命令先补全用法，等用户填完再回车执行。
+  if (cmd.arg && !arg) {
+    input.value = cmd.usage + " ";
+    autoGrow();
+    closeSlash();
+    input.focus();
+    toast("用法：" + cmd.usage + " " + cmd.arg);
+    return;
+  }
+  if (state.command) {
+    toast("正在" + state.command.title + "，请稍候", "warn");
+    return;
+  }
+  input.value = "";
+  autoGrow();
+  closeSlash();
+  if (cmd.name === "status") {
+    openStatus();
+    return;
+  }
+  const payload = { command: cmd.name };
+  if (cmd.arg) payload.name = arg;
+  try {
+    const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/command", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (cmd.name === "rename") {
+      const name = body.name || arg;
+      if (state.detail && state.detail.thread) state.detail.thread.name = name;
+      const hit = state.threads.find((thread) => thread.id === state.threadId);
+      if (hit) hit.name = name;
+      renderChatHead();
+      renderThreads();
+      toast("已重命名为「" + name + "」");
+      return;
+    }
+    // 压缩与评审都会另起一个不可打断的回合，期间只提示状态，避免继续发送被上游拒绝。
+    setCommand(cmd);
+    if (body.turn && body.turn.id) state.activeTurnId = body.turn.id;
+    renderChatHead();
+    toast(cmd.name === "compact" ? "已开始压缩上下文" : "已开始代码评审");
+    scheduleReload(600);
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function setCommand(cmd) {
+  clearTimeout(state.commandTimer);
+  state.command = cmd;
+  state.commandTimer = setTimeout(clearCommand, 180000);
+  renderComposerState();
+}
+
+function clearCommand() {
+  if (!state.command) return;
+  clearTimeout(state.commandTimer);
+  state.commandTimer = null;
+  state.command = null;
+  renderComposerState();
+}
+
+function renderComposerState() {
+  const busy = !!state.command;
+  $("sendBtn").disabled = busy;
+  $("input").placeholder = busy ? state.command.title + "中…" : "输入消息…";
+  renderChatHead();
+}
+
+/* ---------- 会话状态 ---------- */
+
+function statusRows() {
+  const thread = (state.detail && state.detail.thread) || {};
+  const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
+  return [
+    ["标题", thread.name || preview(thread.preview) || "（未命名）"],
+    ["会话 ID", state.threadId || "—", true],
+    ["模型", (state.detail && state.detail.model) || "跟随会话"],
+    ["推理强度", $("effort").value || "默认"],
+    ["工作目录", thread.cwd || "—", true],
+    ["累计用量", total ? total + " tokens" : "—"],
+    ["已载入回合", state.turns.length + " 个"],
+    ["运行状态", state.command ? state.command.title + "中" : (state.activeTurnId ? "运行中" : "空闲")],
+  ];
+}
+
+function openStatus() {
+  const root = $("statusList");
+  root.textContent = "";
+  for (const [key, value, mono] of statusRows()) {
+    const row = el("div", "status-row");
+    row.appendChild(el("span", "k", key));
+    row.appendChild(el("span", "v" + (mono ? " mono" : ""), String(value)));
+    root.appendChild(row);
+  }
+  $("statusOverlay").hidden = false;
+  $("statusSheet").hidden = false;
+}
+
+function closeStatus() {
+  $("statusOverlay").hidden = true;
+  $("statusSheet").hidden = true;
+}
+
 async function send() {
   const input = $("input");
   const text = input.value.trim();
   if (!text || !state.threadId) return;
+  if (state.command) {
+    toast("正在" + state.command.title + "，请稍候", "warn");
+    return;
+  }
   input.value = "";
   autoGrow();
   try {
@@ -1698,6 +1978,7 @@ function handleEvent(event) {
   }
   if (event.method === "turn/completed") {
     state.activeTurnId = null;
+    clearCommand();
     $("stopBtn").hidden = true;
     renderChatHead();
     scheduleReload(250);
@@ -1797,13 +2078,35 @@ function bind() {
     clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(() => loadThreads().catch(reportError), 300);
   });
-  $("composer").addEventListener("submit", (event) => { event.preventDefault(); send(); });
+  $("composer").addEventListener("submit", (event) => { event.preventDefault(); submitInput(); });
   $("stopBtn").addEventListener("click", stop);
-  $("input").addEventListener("input", autoGrow);
+  $("cmdBtn").addEventListener("click", toggleSlash);
+  $("statusClose").addEventListener("click", closeStatus);
+  $("statusOverlay").addEventListener("click", closeStatus);
+  $("input").addEventListener("input", () => { autoGrow(); updateSlash(); });
   $("input").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    if (event.isComposing) return;
+    if (slashVisible()) {
+      const matches = slashMatches($("input").value.trim());
+      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && matches.length) {
+        event.preventDefault();
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        state.slashIndex = (state.slashIndex + step + matches.length) % matches.length;
+        renderSlash(matches);
+        return;
+      }
+      if (event.key === "Tab" && matches.length) {
+        event.preventDefault();
+        const cmd = matches[state.slashIndex] || matches[0];
+        $("input").value = cmd.usage + (cmd.arg ? " " : "");
+        autoGrow();
+        updateSlash();
+        return;
+      }
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      send();
+      submitInput();
     }
   });
   $("toBottom").addEventListener("click", () => {
@@ -1817,8 +2120,10 @@ function bind() {
   window.addEventListener("beforeunload", () => { if (state.threadId) closeThread(state.threadId); });
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
+      closeSlash();
       closeSheet();
       closeNav();
+      closeStatus();
     }
   });
 }
