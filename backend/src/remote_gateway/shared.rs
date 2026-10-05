@@ -156,7 +156,7 @@ fn spawn_reader(
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            if let Some(value) = serde_json::from_slice::<Value>(&line).ok() {
+            if let Ok(value) = serde_json::from_slice::<Value>(&line) {
                 if let Some(id) = value.get("id").and_then(Value::as_str)
                     && let Some(reply) = pending.lock().expect("待响应请求表不可用").remove(id)
                 {

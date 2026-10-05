@@ -124,12 +124,8 @@ pub(crate) fn prepare_upstream(
         );
         return None;
     }
-    let Some(guard) = acquire_lock(&home) else {
-        return None;
-    };
-    let Some(token) = load_or_create_token(&home) else {
-        return None;
-    };
+    let guard = acquire_lock(&home)?;
+    let token = load_or_create_token(&home)?;
     let _ = LOCK_GUARD.set(guard);
     let overrides = overrides.to_vec();
     if config.mode == GatewayMode::Isolated {
