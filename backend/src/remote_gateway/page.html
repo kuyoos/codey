@@ -1306,7 +1306,10 @@ function adoptRunningTurn() {
   }
   // 认领过的回合已经出现在列表里且已结束，说明完成事件没收到，兜底收起状态条。
   const mine = state.turns.find((turn) => turn && turn.id === state.activeTurnId);
-  if (mine && mine.status && mine.status !== "inProgress") endRun();
+  if (mine && mine.status && mine.status !== "inProgress") {
+    endRun();
+    renderChatHead();
+  }
 }
 
 function renderTranscript(forceScroll) {
