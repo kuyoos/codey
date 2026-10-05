@@ -58,7 +58,7 @@ test(`starting ${operation} discards older status flights and queued injection r
     assert.ok(handler);
     const calls = [];
     const context = {
-      config: {}, dirty: false,
+      config: {}, dirty: false, remoteDirty: false, remoteControlRef: { current: null },
       runOperation: async (_name, run) => run(),
       setNotice: () => {},
       withTimeout: (promise) => promise,
