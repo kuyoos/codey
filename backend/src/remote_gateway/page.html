@@ -1674,7 +1674,13 @@ function toggleSlash() {
     closeSlash();
     return;
   }
-  if (!input.value.trim()) {
+  const text = input.value.trim();
+  // 已有草稿时不覆盖输入框，只提示命令入口，避免误触丢掉正在写的内容。
+  if (text && !slashMatches(text).length) {
+    toast("命令要用 / 开头，例如 /compact");
+    return;
+  }
+  if (!text) {
     input.value = "/";
     autoGrow();
   }
@@ -1691,27 +1697,26 @@ function parseSlashCommand(text) {
   };
 }
 
-// 面板打开时回车优先执行高亮命令；否则整串 `/rename 标题` 直接执行，普通文本才当消息发送。
+// 已知命令（含 `/rename 标题` 这种带参数写法）直接执行；命令名只输入了一半时回车
+// 执行面板里高亮的那条；其余一律按普通消息发送，不把以 `/` 开头的正文挡下来。
 function submitInput() {
   const input = $("input");
   const text = input.value.trim();
   if (!text || !state.threadId) return;
-  if (slashVisible()) {
-    const matches = slashMatches(text);
-    const cmd = matches[state.slashIndex] || matches[0];
-    if (cmd) {
-      runCommand(cmd, "");
-      return;
-    }
-  }
   if (text.charAt(0) === "/") {
     const parsed = parseSlashCommand(text);
-    if (!parsed || !parsed.cmd) {
-      toast("不支持的命令 " + text.split(/\s+/)[0], "bad");
+    if (parsed && parsed.cmd) {
+      runCommand(parsed.cmd, parsed.arg);
       return;
     }
-    runCommand(parsed.cmd, parsed.arg);
-    return;
+    if (slashVisible()) {
+      const matches = slashMatches(text);
+      const cmd = matches[state.slashIndex] || matches[0];
+      if (cmd) {
+        runCommand(cmd, "");
+        return;
+      }
+    }
   }
   send();
 }
@@ -1728,6 +1733,14 @@ async function runCommand(cmd, arg) {
     toast("用法：" + cmd.usage + " " + cmd.arg);
     return;
   }
+  // 状态只在网页本地汇总，不受正在运行的命令影响。
+  if (cmd.name === "status") {
+    input.value = "";
+    autoGrow();
+    closeSlash();
+    openStatus();
+    return;
+  }
   if (state.command) {
     toast("正在" + state.command.title + "，请稍候", "warn");
     return;
@@ -1735,10 +1748,6 @@ async function runCommand(cmd, arg) {
   input.value = "";
   autoGrow();
   closeSlash();
-  if (cmd.name === "status") {
-    openStatus();
-    return;
-  }
   const payload = { command: cmd.name };
   if (cmd.arg) payload.name = arg;
   try {
