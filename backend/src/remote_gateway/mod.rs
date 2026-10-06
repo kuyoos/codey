@@ -1755,7 +1755,8 @@ mod tests {
             json!("（非文本消息）")
         );
         let long = "字".repeat(QUEUE_PREVIEW_CHARS + 5);
-        let preview = queue_item(&json!({ "id": "q3", "input": [{ "type": "text", "text": long }] }));
+        let preview =
+            queue_item(&json!({ "id": "q3", "input": [{ "type": "text", "text": long }] }));
         let text = preview["text"].as_str().expect("text");
         assert!(text.ends_with('…'));
         assert_eq!(text.chars().count(), QUEUE_PREVIEW_CHARS + 1);
@@ -1771,7 +1772,9 @@ mod tests {
         // 未知动作与缺 ID 一律拒绝，不向上游透传。
         assert!(parse_queue_action(&json!({ "action": "reorder" })).is_err());
         assert!(parse_queue_action(&json!({ "action": "delete" })).is_err());
-        assert!(parse_queue_action(&json!({ "action": "start", "queuedSubmissionId": " " })).is_err());
+        assert!(
+            parse_queue_action(&json!({ "action": "start", "queuedSubmissionId": " " })).is_err()
+        );
         assert!(parse_queue_action(&json!({})).is_err());
     }
 
