@@ -317,8 +317,20 @@
     }
     @keyframes pulse { 50% { opacity: .25; } }
     .runbar .run-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    /* 状态条自带顶边，紧挨着的输入框不再重复画线。 */
-    .runbar:not([hidden]) + .composer { border-top: 0; }
+    /* 连接状态条：贴在输入框上方，回合运行时让位给运行状态条，避免两行状态叠在一起。 */
+    .connbar {
+      flex: none; display: flex; align-items: center; gap: 8px;
+      padding: 6px 12px; border-top: 1px solid var(--line);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      color: var(--muted); font-size: 12.5px;
+    }
+    /* 这里只留小圆点与文字，不再画成顶部那种胶囊。 */
+    .connbar .status { padding: 0; background: transparent; font-size: 12.5px; }
+    .runbar:not([hidden]) ~ .connbar { display: none; }
+    /* 相邻的状态条与输入框只留一条边线。 */
+    .runbar:not([hidden]) ~ .composer,
+    .connbar:not([hidden]) + .composer,
+    .queue-box:not([hidden]) ~ .connbar { border-top: 0; }
     .composer {
       flex: none; display: flex; align-items: flex-end; gap: 8px;
       padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
@@ -448,6 +460,12 @@
     .gate-card button { width: 100%; height: 44px; margin-top: 12px; border-radius: 11px; background: var(--accent); color: #08101c; font-weight: 600; }
     .gate-card code { background: var(--surface-3); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
 
+    /* 进入会话后顶栏只留返回与刷新：品牌字样不再重复占位。 */
+    .app[data-view="chat"] .logo, .app[data-view="chat"] .brand { display: none; }
+    /* 连接状态只显示一处：列表页在顶栏，进入会话后移到输入框上方。 */
+    .app[data-view="chat"] .status-top { display: none; }
+    .app[data-view="list"] .connbar { display: none; }
+
     /* ---------- 响应式：手机上是「列表 ⇄ 对话」两屏 ---------- */
     @media (max-width: 860px) {
       body { font-size: 16px; }
@@ -471,7 +489,7 @@
     }
     /* 宽屏时把正文收窄居中，和常见聊天网页一样保持行宽可读。 */
     @media (min-width: 1100px) {
-      .transcript, .composer, .chat-head, .approval-host, .runbar, .queue-head, .queue-item {
+      .transcript, .composer, .chat-head, .approval-host, .runbar, .connbar, .queue-head, .queue-item {
         padding-left: max(14px, calc((100% - 860px) / 2));
         padding-right: max(14px, calc((100% - 860px) / 2));
       }
@@ -494,7 +512,7 @@
     </button>
     <span class="logo" aria-hidden="true">C</span>
     <span class="brand">Codey</span>
-    <span class="status" id="statusPill"><span class="dot"></span><span id="statusText">连接中…</span></span>
+    <span class="status status-top" id="statusPillTop"><span class="dot"></span><span id="statusTextTop">连接中…</span></span>
     <span class="grow"></span>
     <button class="icon-btn" id="refreshBtn" type="button" aria-label="刷新会话列表">
       <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 10-2.6 5.9"/><path d="M20 5v6h-6"/></svg>
@@ -535,6 +553,9 @@
       </button>
       <div class="queue-box" id="queueBox" hidden></div>
       <div class="runbar" id="runbar" hidden></div>
+      <div class="connbar" id="connBar">
+        <span class="status" id="statusPill"><span class="dot"></span><span id="statusText">连接中…</span></span>
+      </div>
       <form class="composer" id="composer">
         <button class="cmd-btn" id="cmdBtn" type="button" aria-label="命令">/</button>
         <textarea id="input" rows="1" placeholder="输入消息…" enterkeyhint="send" aria-label="消息内容"></textarea>
@@ -789,6 +810,9 @@ function toast(message, kind) {
 function setStatus(text, kind) {
   $("statusText").textContent = text;
   $("statusPill").className = "status" + (kind ? " " + kind : "");
+  // 列表页顶栏里的同一状态，两处一起更新；显示哪一处由当前视图的样式决定。
+  $("statusTextTop").textContent = text;
+  $("statusPillTop").className = "status status-top" + (kind ? " " + kind : "");
 }
 
 /* ================= 接口 ================= */
@@ -1773,8 +1797,9 @@ async function openThread(id) {
   $("transcript").textContent = "";
   renderThreads();
   renderTranscript(true);
+  // 打开会话后顶栏只留返回与刷新；手机上这个状态还负责「列表 ⇄ 对话」两屏切换。
+  showChatView();
   if (isMobile()) {
-    showChatView();
     try { history.pushState({ view: "chat", id }, ""); } catch { /* 忽略 */ }
   }
   const detail = await api("/api/threads/" + encodeURIComponent(id));
