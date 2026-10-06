@@ -1277,7 +1277,8 @@ fn collect_token_usage_in(root: &Path, session_id: &str) -> Value {
                 Ok(_) => {}
                 Err(_) => break,
             }
-            if !line.contains("\"token_usage_record\"") && !line.contains("\"model_context_window\"")
+            if !line.contains("\"token_usage_record\"")
+                && !line.contains("\"model_context_window\"")
             {
                 continue;
             }
@@ -1429,7 +1430,8 @@ async fn api_upload_image(request: &Request, id: &str) -> ApiResult {
     std::fs::create_dir_all(&dir)
         .map_err(|error| server_error(format!("创建图片目录失败：{error}")))?;
     let path = dir.join(format!("{}.{extension}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&path, &bytes).map_err(|error| server_error(format!("保存图片失败：{error}")))?;
+    std::fs::write(&path, &bytes)
+        .map_err(|error| server_error(format!("保存图片失败：{error}")))?;
     Ok(json!({ "path": path.display().to_string() }))
 }
 
@@ -2003,7 +2005,10 @@ mod tests {
         let path = dir.join(format!("{:032x}.png", std::process::id()));
         std::fs::write(&path, b"png").expect("写入图片");
         let uploaded = path.display().to_string();
-        let missing = dir.join(format!("{:032x}.png", std::process::id() + 1)).display().to_string();
+        let missing = dir
+            .join(format!("{:032x}.png", std::process::id() + 1))
+            .display()
+            .to_string();
 
         let body = json!({ "images": [uploaded.clone()] });
         assert_eq!(message_images(&body, thread_id), Ok(vec![uploaded]));
@@ -2019,13 +2024,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            message_images(
-                &json!({ "images": [missing] }),
-                thread_id
-            )
-            .is_err()
-        );
+        assert!(message_images(&json!({ "images": [missing] }), thread_id).is_err());
         assert!(message_images(&json!({ "images": ["  "] }), thread_id).is_err());
         assert!(message_images(&json!({ "images": "x" }), thread_id).is_err());
 
@@ -2055,7 +2054,11 @@ mod tests {
                 "turn_token_usage": { "total_tokens": 240 },
                 "thread_token_usage": { "total_tokens": 360 } } }),
         ];
-        let text = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&file, text).expect("写入会话");
 
         let usage = collect_token_usage_in(&root, session);
