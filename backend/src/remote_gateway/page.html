@@ -1859,7 +1859,8 @@ function updateSlash() {
   renderSlash(matches);
 }
 
-// 输入框右侧的「/」按钮是命令面板的唯一入口：没内容时补一个斜杠并聚焦。
+// 输入框右侧的「/」按钮是命令面板的唯一入口，和输入框里已有内容无关：
+// 空输入时补一个斜杠方便接着过滤，已有草稿时原样保留并列出全部命令。
 function toggleSlash() {
   const input = $("input");
   if (slashVisible()) {
@@ -1868,18 +1869,14 @@ function toggleSlash() {
   }
   if (!state.threadId) return;
   const text = input.value.trim();
-  // 已有草稿时不覆盖输入框，只提示命令入口，避免误触丢掉正在写的内容。
-  if (text && !slashMatches(text).length) {
-    toast("命令要用 / 开头，例如 /compact");
-    return;
-  }
   if (!text) {
     input.value = "/";
     autoGrow();
   }
   input.focus();
   state.slashIndex = 0;
-  renderSlash(slashMatches(input.value.trim()));
+  const matches = slashMatches(input.value.trim());
+  renderSlash(matches.length ? matches : SLASH_COMMANDS);
 }
 
 function parseSlashCommand(text) {
@@ -1912,6 +1909,8 @@ function submitInput() {
       }
     }
   }
+  // 走到这里就是普通消息，命令面板不再需要，先收起来避免挡着新内容。
+  closeSlash();
   if (state.command) {
     toast("正在" + state.command.title + "，请稍候", "warn");
     return;
@@ -1927,8 +1926,18 @@ function submitInput() {
 async function runCommand(cmd, arg) {
   if (!state.threadId) return;
   const input = $("input");
+  // 输入框里已有普通草稿时不清空它：立即执行的命令跑完草稿还在，需要参数的命令
+  // 只提示用法，等用户自己空出输入框再选一次，避免误触丢掉正在写的内容。
+  const draft = input.value.trim();
+  const onlyCommand = !draft || draft.charAt(0) === "/";
   // 需要参数的命令先补全用法，等用户填完再回车执行。
   if (cmd.arg && !arg) {
+    if (!onlyCommand) {
+      closeSlash();
+      input.focus();
+      toast("用法：" + cmd.usage + " " + cmd.arg);
+      return;
+    }
     input.value = cmd.usage + " ";
     autoGrow();
     closeSlash();
@@ -1938,8 +1947,10 @@ async function runCommand(cmd, arg) {
   }
   // 状态只在网页本地汇总，不受正在运行的命令影响。
   if (cmd.name === "status") {
-    input.value = "";
-    autoGrow();
+    if (onlyCommand) {
+      input.value = "";
+      autoGrow();
+    }
     closeSlash();
     openStatus();
     return;
@@ -1948,8 +1959,10 @@ async function runCommand(cmd, arg) {
     toast("正在" + state.command.title + "，请稍候", "warn");
     return;
   }
-  input.value = "";
-  autoGrow();
+  if (onlyCommand) {
+    input.value = "";
+    autoGrow();
+  }
   closeSlash();
   const payload = { command: cmd.name };
   if (cmd.arg) payload.name = arg;
