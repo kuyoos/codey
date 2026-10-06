@@ -509,10 +509,10 @@
     .gate-card button { width: 100%; height: 44px; margin-top: 12px; border-radius: 11px; background: var(--accent); color: #08101c; font-weight: 600; }
     .gate-card code { background: var(--surface-3); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
 
-    /* 进入会话后顶栏只留返回与刷新：品牌字样不再重复占位。 */
-    .app[data-view="chat"] .logo, .app[data-view="chat"] .brand { display: none; }
+    /* 会话页不再单独占一条顶栏：返回按钮并进标题行，标题行自己顶到安全区。 */
+    .app[data-view="chat"] .topbar { display: none; }
+    .app[data-view="chat"] .chat-head { padding-top: calc(env(safe-area-inset-top, 0px) + 9px); }
     /* 连接状态只显示一处：列表页在顶栏，进入会话后移到输入框上方。 */
-    .app[data-view="chat"] .status-top { display: none; }
     .app[data-view="list"] .connbar { display: none; }
 
     /* ---------- 响应式：手机上是「列表 ⇄ 对话」两屏 ---------- */
@@ -524,7 +524,9 @@
       .app[data-view="chat"] .back-btn { display: grid; }
       .app[data-view="chat"] .sidebar { display: none; }
       .app[data-view="list"] .chat { display: none; }
-      .chip-btn { max-width: 44vw; }
+      /* 返回按钮并入标题行后横向空间变紧：收窄间距与模型胶囊，尽量把标题留给用户。 */
+      .chat-head { padding: 8px 10px; gap: 6px; }
+      .chip-btn { max-width: 40vw; }
       .chip-btn .k { display: none; }
       .transcript { padding: 12px 12px 4px; }
       .msg.user { max-width: 92%; }
@@ -556,16 +558,10 @@
 <body>
 <div class="app" id="app" data-view="list">
   <header class="topbar">
-    <button class="icon-btn back-btn" id="backBtn" type="button" aria-label="返回会话列表">
-      <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
-    </button>
     <span class="logo" aria-hidden="true">C</span>
     <span class="brand">Codey</span>
     <span class="status status-top" id="statusPillTop"><span class="dot"></span><span id="statusTextTop">连接中…</span></span>
     <span class="grow"></span>
-    <button class="icon-btn" id="refreshBtn" type="button" aria-label="刷新会话列表">
-      <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 10-2.6 5.9"/><path d="M20 5v6h-6"/></svg>
-    </button>
   </header>
 
   <div class="body">
@@ -583,6 +579,9 @@
 
     <section class="chat" id="chatPane">
       <div class="chat-head">
+        <button class="icon-btn back-btn" id="backBtn" type="button" aria-label="返回会话列表">
+          <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
         <div class="chat-titles">
           <div class="chat-title" id="chatTitle">选择一个对话</div>
           <div class="chat-meta" id="chatMeta"></div>
@@ -1707,7 +1706,7 @@ function renderChatHead() {
   const meta = [];
   if (thread) {
     if (thread.cwd) meta.push(thread.cwd);
-    if (state.detail.model) meta.push(state.detail.model);
+    if (state.detail.model) meta.push(modelLabel(state.detail.model));
     if (state.command) meta.push(state.command.title + "中");
     else if (state.activeTurnId) meta.push("运行中");
     const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
@@ -1756,9 +1755,18 @@ function renderContextRing() {
 
 function updateModelChip() {
   const model = currentModel();
-  const name = (state.detail && state.detail.model) || (model && (model.displayName || model.id)) || "跟随会话";
+  const raw = (state.detail && state.detail.model) || (model && (model.displayName || model.id)) || "";
+  const name = modelLabel(raw) || "跟随会话";
   const effort = $("effort").value;
   $("modelChipText").textContent = effort ? name + " · " + effort : name;
+}
+
+// 模型 id 可能带线路前缀（`route-xxxx/model-name`），界面只显示模型名称本身。
+function modelLabel(value) {
+  const text = String(value == null ? "" : value).trim();
+  const cut = text.lastIndexOf("/");
+  if (cut === -1) return text;
+  return text.slice(cut + 1).trim() || text;
 }
 
 /* ================= 模型与强度 ================= */
@@ -1942,6 +1950,8 @@ async function loadUsage(id, keepScroll) {
 
 function showListView() {
   $("app").dataset.view = "list";
+  // 顶栏的刷新按钮已经去掉，回到列表时顺手取一次，保证新会话能出现。
+  loadThreads().catch(() => {});
 }
 
 function showChatView() {
@@ -2705,9 +2715,6 @@ function bind() {
   $("backBtn").addEventListener("click", () => {
     if (history.state && history.state.view === "chat") history.back();
     else showListView();
-  });
-  $("refreshBtn").addEventListener("click", () => {
-    Promise.all([loadThreads(), loadModels()]).catch(reportError);
   });
   $("modelChip").addEventListener("click", openSheet);
   $("sheetClose").addEventListener("click", closeSheet);
