@@ -99,6 +99,24 @@
     .chip-btn:hover { border-color: var(--line-2); }
     .chip-btn .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chip-btn .k { color: var(--faint); font-size: 11px; }
+    /* 上下文圆圈：贴在标题栏右侧，只表示最近一次请求占模型窗口的比例。 */
+    .ctx-ring {
+      position: relative; flex: none; width: 28px; height: 28px;
+      display: grid; place-items: center; color: var(--accent);
+    }
+    .ctx-ring svg { width: 28px; height: 28px; transform: rotate(-90deg); }
+    .ctx-ring circle { fill: none; stroke-width: 3.5; }
+    .ctx-ring .ctx-track { stroke: var(--surface-3); }
+    .ctx-ring .ctx-fill {
+      stroke: currentColor; stroke-linecap: round;
+      stroke-dasharray: 97.39; stroke-dashoffset: 97.39;
+      transition: stroke-dashoffset .3s ease;
+    }
+    .ctx-ring.warn { color: var(--warn); }
+    .ctx-ring .ctx-pct {
+      position: absolute; color: var(--muted); font-size: 9px; font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
 
     .body { flex: 1; display: flex; min-height: 0; position: relative; }
 
@@ -185,6 +203,8 @@
       border-radius: 16px 16px 4px 16px; padding: 9px 12px;
     }
     .msg.agent { max-width: 100%; }
+    /* 用户消息里的图片只报张数，不在这里展开，避免正文被大图挤开。 */
+    .msg.user .msg-images { margin-top: 4px; color: var(--faint); font-size: 12px; }
     /* 编辑与复制默认隐藏，悬停或聚焦时出现，触屏设备上常驻，避免正文被按钮挤占。 */
     .msg-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; opacity: 0; transition: opacity .15s ease; }
     .msg.user:hover .msg-actions, .msg.user:focus-within .msg-actions { opacity: 1; }
@@ -329,8 +349,30 @@
     .runbar:not([hidden]) ~ .connbar { display: none; }
     /* 相邻的状态条与输入框只留一条边线。 */
     .runbar:not([hidden]) ~ .composer,
-    .connbar:not([hidden]) + .composer,
+    .runbar:not([hidden]) ~ .attach-bar,
+    .connbar:not([hidden]) ~ .composer,
+    .connbar:not([hidden]) ~ .attach-bar,
+    .attach-bar:not([hidden]) + .composer,
     .queue-box:not([hidden]) ~ .connbar { border-top: 0; }
+    /* 待发送的图片：和状态条一样贴在输入框上方，横向滚动不换行。 */
+    .attach-bar {
+      flex: none; display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; overflow-x: auto; overscroll-behavior-x: contain;
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      border-top: 1px solid var(--line); -webkit-overflow-scrolling: touch;
+    }
+    .attach-thumb {
+      position: relative; flex: none; width: 54px; height: 54px; overflow: hidden;
+      border-radius: 10px; border: 1px solid var(--line-2); background: var(--surface-2);
+    }
+    .attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .attach-thumb.pending { display: grid; place-items: center; color: var(--faint); font-size: 10.5px; }
+    .attach-remove {
+      position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%;
+      display: grid; place-items: center; background: rgba(15, 17, 21, .82); color: var(--text);
+      font-size: 12px; line-height: 1;
+    }
+    .attach-hint { flex: none; color: var(--faint); font-size: 11.5px; }
     .composer {
       flex: none; display: flex; align-items: flex-end; gap: 8px;
       padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
@@ -349,6 +391,13 @@
       background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-weight: 600;
     }
     .composer .cmd-btn:active { color: var(--accent); border-color: var(--accent); }
+    /* 图片按钮比「/」窄一点，手机上四个按钮加输入框才不会太挤。 */
+    .composer .attach-btn {
+      width: 38px; height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
+      background: var(--surface-2); border: 1px solid var(--line); color: var(--muted);
+    }
+    .composer .attach-btn:active { color: var(--accent); border-color: var(--accent); }
+    .composer .attach-btn[disabled] { opacity: .45; }
     .composer .send {
       width: var(--tap); height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
       background: var(--accent); color: #08101c;
@@ -489,7 +538,7 @@
     }
     /* 宽屏时把正文收窄居中，和常见聊天网页一样保持行宽可读。 */
     @media (min-width: 1100px) {
-      .transcript, .composer, .chat-head, .approval-host, .runbar, .connbar, .queue-head, .queue-item {
+      .transcript, .composer, .chat-head, .approval-host, .runbar, .connbar, .attach-bar, .queue-head, .queue-item {
         padding-left: max(14px, calc((100% - 860px) / 2));
         padding-right: max(14px, calc((100% - 860px) / 2));
       }
@@ -538,6 +587,13 @@
           <div class="chat-title" id="chatTitle">选择一个对话</div>
           <div class="chat-meta" id="chatMeta"></div>
         </div>
+        <span class="ctx-ring" id="ctxRing" hidden aria-label="上下文用量">
+          <svg viewBox="0 0 36 36" aria-hidden="true">
+            <circle class="ctx-track" cx="18" cy="18" r="15.5"/>
+            <circle class="ctx-fill" cx="18" cy="18" r="15.5"/>
+          </svg>
+          <span class="ctx-pct" id="ctxPct"></span>
+        </span>
         <button class="icon-btn" id="navBtn" type="button" aria-label="会话导航">
           <svg viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
         </button>
@@ -556,7 +612,11 @@
       <div class="connbar" id="connBar">
         <span class="status" id="statusPill"><span class="dot"></span><span id="statusText">连接中…</span></span>
       </div>
+      <div class="attach-bar" id="attachBar" hidden></div>
       <form class="composer" id="composer">
+        <button class="attach-btn" id="imgBtn" type="button" aria-label="添加图片">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="M4 18l5-5 4 4 3-3 4 4"/></svg>
+        </button>
         <button class="cmd-btn" id="cmdBtn" type="button" aria-label="命令">/</button>
         <textarea id="input" rows="1" placeholder="输入消息…" enterkeyhint="send" aria-label="消息内容"></textarea>
         <button class="icon-btn stop" id="stopBtn" type="button" hidden aria-label="停止生成">
@@ -568,6 +628,7 @@
         <div class="slash" id="slashPanel" hidden>
           <div id="slashList" role="listbox" aria-label="可用命令"></div>
         </div>
+        <input id="fileInput" type="file" accept="image/*" multiple hidden>
       </form>
     </section>
   </div>
@@ -676,11 +737,15 @@ const state = {
   autoScroll: true,
   live: new Map(),
   usage: { total: null, turns: {} },
+  attachments: [],
+  uploads: 0,
+  attachSeq: 0,
   queue: [],
   approvals: [],
   reloadTimer: null,
   searchTimer: null,
   slashIndex: 0,
+  slashMatches: [],
   command: null,
   commandTimer: null,
   loaded: false,
@@ -700,6 +765,64 @@ function el(tag, className, text) {
 
 function mono(text) {
   return el("span", "mono", text);
+}
+
+/* 手机上软键盘收起会把整个输入区往下挪：合成器在 touchend 时按新位置重新命中元素，
+   click 就落到正文上而不是按钮上，「/」和命令项因此点了没反应。这里自己判定点按：
+   pointerdown 记下按下位置，pointerup 仍在原处抬起才算数，与按钮有没有被挪走无关。
+   键盘触发（detail 为 0 的 click）仍走原生路径，保证读屏与键盘可用。 */
+const TAP_HANDLERS = new Map();
+
+function onTap(selector, handler) {
+  TAP_HANDLERS.set(selector, handler);
+}
+
+function tapTarget(node) {
+  if (!node || typeof node.closest !== "function") return null;
+  for (const selector of TAP_HANDLERS.keys()) {
+    const target = node.closest(selector);
+    if (target) return { selector, target };
+  }
+  return null;
+}
+
+let tapStart = null;
+
+function bindTap() {
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || (event.pointerType === "mouse" && event.button !== 0)) return;
+    const hit = tapTarget(event.target);
+    if (!hit) return;
+    // 不把焦点交给按钮：输入框保持聚焦，软键盘就不会收起把按钮挪走。
+    event.preventDefault();
+    tapStart = {
+      selector: hit.selector,
+      node: hit.target,
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      at: Date.now(),
+    };
+  });
+  window.addEventListener("pointerup", (event) => {
+    const start = tapStart;
+    tapStart = null;
+    if (!start || event.pointerId !== start.id) return;
+    if (Date.now() - start.at > 800) return;
+    if (Math.abs(event.clientX - start.x) > 12 || Math.abs(event.clientY - start.y) > 12) return;
+    const handler = TAP_HANDLERS.get(start.selector);
+    if (handler) handler(start.node, event);
+  });
+  window.addEventListener("pointercancel", () => {
+    tapStart = null;
+  });
+  document.addEventListener("click", (event) => {
+    if (event.detail !== 0) return;
+    const hit = tapTarget(event.target);
+    if (!hit) return;
+    const handler = TAP_HANDLERS.get(hit.selector);
+    if (handler) handler(hit.target, event);
+  });
 }
 
 function preview(text, limit) {
@@ -1094,14 +1217,25 @@ function messageText(item) {
   const parts = [];
   for (const part of (item && item.content) || []) {
     if (part && part.type === "text" && part.text) parts.push(part.text);
-    else if (part && part.type) parts.push("[" + part.type + "]");
+    else if (part && part.type && !IMAGE_INPUT_TYPES.has(part.type)) parts.push("[" + part.type + "]");
   }
   return parts.join("\n");
 }
 
+// 用户消息里的图片输入在网页上只用张数表示。
+const IMAGE_INPUT_TYPES = new Set(["image", "localImage"]);
+
+function messageImageCount(item) {
+  return ((item && item.content) || []).filter((part) => part && IMAGE_INPUT_TYPES.has(part.type)).length;
+}
+
 function userMessage(item) {
   const text = messageText(item);
-  const node = el("div", "msg user", text);
+  const node = el("div", "msg user");
+  if (text) node.appendChild(el("div", "msg-text", text));
+  const images = messageImageCount(item);
+  if (images) node.appendChild(el("div", "msg-images", "图片 " + images + " 张"));
+  if (!text) return node;
   const actions = el("div", "msg-actions");
   const copy = el("button", null, "复制");
   copy.type = "button";
@@ -1580,6 +1714,44 @@ function renderChatHead() {
     if (total) meta.push("累计 " + total + " tokens");
   }
   $("chatMeta").textContent = meta.join(" · ");
+  renderContextRing();
+}
+
+// 上下文用量：分子是最近一次请求的真实占用，分母是模型窗口，都来自落盘用量；
+// 缺任一项就整块隐藏，不显示一个没有依据的百分比。
+const CTX_CIRCUMFERENCE = 2 * Math.PI * 15.5;
+
+function contextInfo() {
+  const context = state.usage.context;
+  const used = Number(context && context.used);
+  const window = Number(context && context.window);
+  if (!Number.isFinite(used) || !Number.isFinite(window) || used <= 0 || window <= 0) return null;
+  const ratio = Math.max(0, Math.min(1, used / window));
+  const percent = Math.round(ratio * 100);
+  return {
+    used,
+    window,
+    ratio,
+    percent,
+    label: "上下文已用 " + formatTokens(used) + " / " + formatTokens(window) + "（" + percent + "%）",
+  };
+}
+
+function renderContextRing() {
+  const ring = $("ctxRing");
+  const info = contextInfo();
+  if (!info) {
+    ring.hidden = true;
+    ring.removeAttribute("title");
+    ring.removeAttribute("aria-label");
+    return;
+  }
+  ring.hidden = false;
+  ring.classList.toggle("warn", info.ratio >= 0.85);
+  ring.querySelector(".ctx-fill").style.strokeDashoffset = String(CTX_CIRCUMFERENCE * (1 - info.ratio));
+  $("ctxPct").textContent = info.percent + "%";
+  ring.title = info.label;
+  ring.setAttribute("aria-label", info.label);
 }
 
 function updateModelChip() {
@@ -1737,8 +1909,12 @@ async function loadModels() {
 }
 
 async function loadTurns(cursor) {
+  // 记下请求发出时的会话：响应回来时用户可能已经切走，那份数据不能再写进当前视图，
+  // 否则上一个会话里运行中的回合会被当场认领，状态条就挂到别的会话上了。
+  const id = state.threadId;
   const query = "?limit=" + TURNS_PAGE + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
-  const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/turns" + query);
+  const body = await api("/api/threads/" + encodeURIComponent(id) + "/turns" + query);
+  if (state.threadId !== id) return;
   const turns = body.turns || [];
   if (cursor) {
     const room = Math.max(0, MAX_TURNS - state.turns.length);
@@ -1757,7 +1933,7 @@ async function loadTurns(cursor) {
 async function loadUsage(id, keepScroll) {
   const usage = await api("/api/threads/" + encodeURIComponent(id) + "/usage");
   if (state.threadId !== id || !usage || typeof usage !== "object") return;
-  state.usage = { total: usage.total || null, turns: usage.turns || {} };
+  state.usage = { total: usage.total || null, turns: usage.turns || {}, context: usage.context || null };
   renderChatHead();
   renderRunbar();
   // 运行中的回合靠事件流增量渲染，重排会打断它，等回合结束再补上用量。
@@ -1782,7 +1958,8 @@ async function openThread(id) {
   state.activeTurnId = null;
   state.autoScroll = true;
   state.live.clear();
-  state.usage = { total: null, turns: {} };
+  state.usage = { total: null, turns: {}, context: null };
+  state.attachments = [];
   state.queue = [];
   state.approvals = [];
   clearCommand();
@@ -1791,6 +1968,7 @@ async function openThread(id) {
   state.slashIndex = 0;
   renderApprovals();
   renderQueue();
+  renderAttachBar();
   try { localStorage.setItem(LAST_THREAD_KEY, id); } catch { /* 隐私模式下忽略 */ }
   $("chatTitle").textContent = "载入中…";
   $("chatMeta").textContent = "";
@@ -1803,11 +1981,14 @@ async function openThread(id) {
     try { history.pushState({ view: "chat", id }, ""); } catch { /* 忽略 */ }
   }
   const detail = await api("/api/threads/" + encodeURIComponent(id));
+  // 切会话时上一个请求可能才返回：晚到的响应一律丢弃，否则会把旧会话的内容写进当前视图。
+  if (state.threadId !== id) return;
   state.detail = detail;
   renderChatHead();
   renderModels();
   updateModelChip();
   await loadTurns(null);
+  if (state.threadId !== id) return;
   updateAtBottom();
   loadUsage(id).catch(() => {});
   loadQueue(id).catch(() => {});
@@ -1848,6 +2029,7 @@ function closeSlash() {
 function renderSlash(matches) {
   const panel = $("slashPanel");
   const list = $("slashList");
+  state.slashMatches = matches;
   list.textContent = "";
   if (!matches.length) {
     panel.hidden = true;
@@ -1863,7 +2045,8 @@ function renderSlash(matches) {
     body.appendChild(el("span", "slash-title", cmd.title));
     body.appendChild(el("span", "slash-desc", cmd.desc));
     item.appendChild(body);
-    item.addEventListener("click", () => runCommand(cmd, ""));
+    // 命令由统一的点按分发执行，不在这里挂 click：手机上那一次 click 常常落不到按钮上。
+    item.dataset.index = String(index);
     list.appendChild(item);
   });
   panel.hidden = false;
@@ -1918,7 +2101,12 @@ function parseSlashCommand(text) {
 function submitInput() {
   const input = $("input");
   const text = input.value.trim();
-  if (!text || !state.threadId) return;
+  // 只发图片、不带文字也是一条合法消息。
+  if ((!text && !attachmentPaths().length) || !state.threadId) return;
+  if (attachmentsPending()) {
+    toast("图片还在上传，请稍候", "warn");
+    return;
+  }
   if (text.charAt(0) === "/") {
     const parsed = parseSlashCommand(text);
     if (parsed && parsed.cmd) {
@@ -2033,7 +2221,7 @@ function clearCommand() {
 
 function renderComposerState() {
   const busy = !!state.command;
-  $("sendBtn").disabled = busy;
+  $("sendBtn").disabled = busy || attachmentsPending();
   $("input").placeholder = busy ? state.command.title + "中…" : "输入消息…";
   renderChatHead();
 }
@@ -2043,6 +2231,7 @@ function renderComposerState() {
 function statusRows() {
   const thread = (state.detail && state.detail.thread) || {};
   const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
+  const context = contextInfo();
   return [
     ["标题", thread.name || preview(thread.preview) || "（未命名）"],
     ["会话 ID", state.threadId || "—", true],
@@ -2050,6 +2239,7 @@ function statusRows() {
     ["推理强度", $("effort").value || "默认"],
     ["工作目录", thread.cwd || "—", true],
     ["累计用量", total ? total + " tokens" : "—"],
+    ["上下文用量", context ? formatTokens(context.used) + " / " + formatTokens(context.window) + "（" + context.percent + "%）" : "—"],
     ["已载入回合", state.turns.length + " 个"],
     ["运行状态", state.command ? state.command.title + "中" : (state.activeTurnId ? "运行中" : "空闲")],
   ];
@@ -2102,21 +2292,31 @@ function chooseSendMode(mode) {
   const text = pendingSend;
   pendingSend = null;
   hideSendMode();
-  if (text) send(text, mode);
+  // 空文本也可能是合法的「只发图片」消息，所以只按 null 判断取消。
+  if (text !== null) send(text, mode);
 }
 
 async function send(text, mode) {
-  if (!text || !state.threadId) return;
+  const images = attachmentPaths();
+  if ((!text && !images.length) || !state.threadId) return;
   if (state.command) {
     toast("正在" + state.command.title + "，请稍候", "warn");
     return;
   }
+  if (attachmentsPending()) {
+    toast("图片还在上传，请稍候", "warn");
+    return;
+  }
   const input = $("input");
+  // 发送失败时把草稿与图片一起还回来，用户不用重新选一遍。
+  const draft = state.attachments.slice();
   input.value = "";
   autoGrow();
   closeSlash();
+  clearAttachments();
   try {
     const payload = { text, model: $("model").value || null, effort: $("effort").value || null };
+    if (images.length) payload.images = images;
     // 运行中的回合：引导并入当前回合，排队交给上游在本回合结束后执行，都不新起回合。
     if (mode === "steer" || mode === "queue") {
       payload.mode = mode;
@@ -2144,6 +2344,9 @@ async function send(text, mode) {
     scheduleReload(500);
   } catch (error) {
     input.value = text;
+    state.attachments = draft;
+    renderAttachBar();
+    renderComposerState();
     autoGrow();
     reportError(error);
   }
@@ -2175,6 +2378,118 @@ function autoGrow() {
   const viewport = window.visualViewport;
   const limit = Math.round(((viewport && viewport.height) || window.innerHeight) * 0.4);
   input.style.height = Math.min(input.scrollHeight, limit) + "px";
+}
+
+/* ================= 图片输入 ================= */
+
+// 网关的请求体上限是 2 MiB，Base64 会再放大三分之一，所以单张限制在 1.4 MiB 以内。
+const ATTACH_MAX_BYTES = 1.4 * 1024 * 1024;
+const ATTACH_MAX_COUNT = 4;
+
+// 图片先在网页侧预览，再由网关落盘换成路径；上传完成前不允许发送，避免漏图。
+function renderAttachBar() {
+  const bar = $("attachBar");
+  bar.textContent = "";
+  if (!state.attachments.length) {
+    bar.hidden = true;
+    return;
+  }
+  for (const item of state.attachments) {
+    const thumb = el("div", "attach-thumb" + (item.path ? "" : " pending"));
+    if (item.path) {
+      const image = el("img");
+      image.src = item.dataUrl;
+      image.alt = item.name || "待发送的图片";
+      thumb.appendChild(image);
+    } else {
+      thumb.appendChild(el("span", null, "上传中"));
+    }
+    const remove = el("button", "attach-remove", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "移除这张图片");
+    remove.dataset.id = item.id;
+    thumb.appendChild(remove);
+    bar.appendChild(thumb);
+  }
+  bar.hidden = false;
+}
+
+function removeAttachment(id) {
+  state.attachments = state.attachments.filter((item) => item.id !== id);
+  renderAttachBar();
+  renderComposerState();
+}
+
+function clearAttachments() {
+  state.attachments = [];
+  renderAttachBar();
+}
+
+function attachmentsPending() {
+  return state.uploads > 0 || state.attachments.some((item) => !item.path);
+}
+
+function attachmentPaths() {
+  return state.attachments.filter((item) => item.path).map((item) => item.path);
+}
+
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取图片失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addImages(files) {
+  const list = Array.from(files || []);
+  $("fileInput").value = "";
+  const threadId = state.threadId;
+  if (!list.length || !threadId) return;
+  for (const file of list) {
+    if (state.attachments.length + state.uploads >= ATTACH_MAX_COUNT) {
+      toast("一条消息最多 " + ATTACH_MAX_COUNT + " 张图片", "warn");
+      return;
+    }
+    if (!/^image\//.test(file.type || "")) {
+      toast("只能发送图片文件", "warn");
+      continue;
+    }
+    if (file.size > ATTACH_MAX_BYTES) {
+      toast((file.name || "这张图片") + " 超过 1.4 MB，请先压缩", "bad");
+      continue;
+    }
+    const id = String(++state.attachSeq);
+    state.uploads += 1;
+    state.attachments.push({ id, name: file.name, dataUrl: "", path: "" });
+    renderAttachBar();
+    renderComposerState();
+    try {
+      const dataUrl = await readImage(file);
+      const body = await api("/api/threads/" + encodeURIComponent(threadId) + "/images", {
+        method: "POST",
+        body: JSON.stringify({ name: file.name, dataUrl }),
+      });
+      // 上传期间可能已经切走，这时结果直接丢弃，不再挂到新会话上。
+      if (state.threadId !== threadId) return;
+      if (!body || !body.path) throw new Error("图片上传失败");
+      const item = state.attachments.find((entry) => entry.id === id);
+      if (item) {
+        item.dataUrl = dataUrl;
+        item.path = body.path;
+      }
+    } catch (error) {
+      if (state.threadId === threadId) {
+        state.attachments = state.attachments.filter((entry) => entry.id !== id);
+        reportError(error);
+      }
+    } finally {
+      state.uploads -= 1;
+      renderAttachBar();
+      renderComposerState();
+    }
+  }
 }
 
 /* ================= 审批 ================= */
@@ -2407,7 +2722,18 @@ function bind() {
   });
   $("composer").addEventListener("submit", (event) => { event.preventDefault(); submitInput(); });
   $("stopBtn").addEventListener("click", stop);
-  $("cmdBtn").addEventListener("click", toggleSlash);
+  // 「/」与命令项都走统一点按分发，手机上输入栏被键盘挪走也不会丢掉这一次点按。
+  bindTap();
+  onTap("#cmdBtn", toggleSlash);
+  onTap("#imgBtn", () => $("fileInput").click());
+  onTap(".slash-item", (node) => {
+    const cmd = state.slashMatches[Number(node.dataset.index)];
+    if (cmd) runCommand(cmd, "");
+  });
+  onTap(".attach-remove", (node) => removeAttachment(node.dataset.id));
+  $("fileInput").addEventListener("change", () => {
+    addImages($("fileInput").files).catch(reportError);
+  });
   // 命令面板：点空白处或输入框失焦都收起；面板内的按下会先让输入框失焦，那一次不算。
   let slashHold = false;
   document.addEventListener("pointerdown", (event) => {

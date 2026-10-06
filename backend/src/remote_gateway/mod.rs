@@ -26,6 +26,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -906,6 +907,10 @@ fn bad(message: &str) -> (u16, Value) {
     (400, json!({ "error": { "message": message } }))
 }
 
+fn server_error(message: impl std::fmt::Display) -> (u16, Value) {
+    (500, json!({ "error": { "message": message.to_string() } }))
+}
+
 fn upstream_error(error: Value) -> (u16, Value) {
     (502, json!({ "error": error }))
 }
@@ -954,6 +959,7 @@ async fn api(state: &Arc<State>, request: &Request) -> (u16, Value) {
         ("GET", ["api", "threads", id, "usage"]) => api_usage(state, id).await,
         ("GET", ["api", "threads", id, "queue"]) => api_queue(state, id).await,
         ("POST", ["api", "threads", id, "messages"]) => api_message(state, request, id).await,
+        ("POST", ["api", "threads", id, "images"]) => api_upload_image(request, id).await,
         ("POST", ["api", "threads", id, "queue"]) => api_queue_action(state, request, id).await,
         ("POST", ["api", "threads", id, "command"]) => api_command(state, request, id).await,
         ("POST", ["api", "threads", id, "interrupt"]) => api_interrupt(state, request, id).await,
@@ -1162,6 +1168,23 @@ fn slim_turns(turns: &mut Value) {
                         .unwrap_or(0);
                     object.insert("changeCount".to_owned(), json!(count));
                 }
+                // 用户消息里的图片只留类型：网页只用它数张数，本机路径不必下发。
+                Some("userMessage") => {
+                    if let Some(parts) = object.get_mut("content").and_then(Value::as_array_mut) {
+                        for part in parts.iter_mut().filter(|part| {
+                            matches!(
+                                part.get("type").and_then(Value::as_str),
+                                Some("image" | "localImage")
+                            )
+                        }) {
+                            if let Some(part) = part.as_object_mut() {
+                                for key in ["url", "path", "detail", "fileId"] {
+                                    let _ = part.remove(key);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1202,11 +1225,11 @@ async fn api_usage(state: &State, id: &str) -> ApiResult {
                 .and_then(session_id_from_rollout)
         });
     let Some(session_id) = session_id else {
-        return Ok(json!({ "total": Value::Null, "turns": {} }));
+        return Ok(json!({ "total": Value::Null, "turns": {}, "context": Value::Null }));
     };
     let usage = tokio::task::spawn_blocking(move || collect_token_usage(&session_id))
         .await
-        .unwrap_or_else(|_| json!({ "total": Value::Null, "turns": {} }));
+        .unwrap_or_else(|_| json!({ "total": Value::Null, "turns": {}, "context": Value::Null }));
     Ok(usage)
 }
 
@@ -1226,13 +1249,21 @@ fn session_id_from_rollout(path: &str) -> Option<String> {
 /// 按 sessionId 在 sessions 树里递归匹配分段文件；文件名以 `rollout-<时间戳>` 开头，
 /// 字典序即时间序，后写的分段持有更大的累计值。只解析含 token 记录的行。
 fn collect_token_usage(session_id: &str) -> Value {
-    let mut files = Vec::new();
     let root = crate::codex_config::codex_home().join("sessions");
-    collect_rollout_files(&root, session_id, &mut files);
+    collect_token_usage_in(&root, session_id)
+}
+
+fn collect_token_usage_in(root: &Path, session_id: &str) -> Value {
+    let mut files = Vec::new();
+    collect_rollout_files(root, session_id, &mut files);
     files.sort();
     let mut turns = serde_json::Map::new();
     let mut total: Option<Value> = None;
     let mut best_total = -1i64;
+    // 上下文圆圈要的是「最近一次请求占了多少」与窗口大小，不是累计值：`usage` 与
+    // `model_context_window` 分别落在不同行的 payload 里，逐行覆盖后留下的就是最新值。
+    let mut context_used: Option<i64> = None;
+    let mut context_window: Option<i64> = None;
     for file in files {
         let Ok(handle) = std::fs::File::open(&file) else {
             continue;
@@ -1246,7 +1277,8 @@ fn collect_token_usage(session_id: &str) -> Value {
                 Ok(_) => {}
                 Err(_) => break,
             }
-            if !line.contains("\"token_usage_record\"") {
+            if !line.contains("\"token_usage_record\"") && !line.contains("\"model_context_window\"")
+            {
                 continue;
             }
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
@@ -1271,9 +1303,38 @@ fn collect_token_usage(session_id: &str) -> Value {
                     total = Some(thread_usage.clone());
                 }
             }
+            let window = payload
+                .get("info")
+                .and_then(|info| info.get("model_context_window"))
+                .and_then(Value::as_i64)
+                .or_else(|| payload.get("model_context_window").and_then(Value::as_i64));
+            if let Some(window) = window {
+                context_window = Some(window);
+            }
+            let used = payload
+                .get("usage")
+                .and_then(|usage| usage.get("total_tokens"))
+                .and_then(Value::as_i64);
+            if let Some(used) = used {
+                context_used = Some(used);
+            }
         }
     }
-    json!({ "total": total.unwrap_or(Value::Null), "turns": turns })
+    json!({
+        "total": total.unwrap_or(Value::Null),
+        "turns": turns,
+        "context": context_value(context_used, context_window),
+    })
+}
+
+/// 上下文用量缺任何一项都不能瞎猜：宁可让网页隐藏圆圈，也不要显示一个错的百分比。
+fn context_value(used: Option<i64>, window: Option<i64>) -> Value {
+    match (used, window) {
+        (Some(used), Some(window)) if used > 0 && window > 0 => {
+            json!({ "used": used, "window": window })
+        }
+        _ => Value::Null,
+    }
 }
 
 fn collect_rollout_files(dir: &Path, session_id: &str, found: &mut Vec<PathBuf>) {
@@ -1302,6 +1363,97 @@ enum SendMode {
     Queue,
 }
 
+const IMAGE_DIR_NAME: &str = "codey-remote-images";
+const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "webp", "gif"];
+
+/// 上传的图片按会话落在系统临时目录里：既不写进用户工作区，也能在提交时校验来源。
+fn images_dir(thread_id: &str) -> PathBuf {
+    let segment: String = thread_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect();
+    std::env::temp_dir().join(IMAGE_DIR_NAME).join(segment)
+}
+
+/// 只接受这几种内联图片，返回解码后的字节与落盘用的扩展名；文件名由网关自己生成，
+/// 网页传来的名字不参与落盘，避免目录穿越与相互覆盖。
+fn decode_image_data_url(data_url: &str) -> Result<(Vec<u8>, &'static str), (u16, Value)> {
+    let (header, encoded) = data_url
+        .split_once(',')
+        .ok_or_else(|| bad("图片数据格式不正确"))?;
+    let extension = match header.trim().to_ascii_lowercase().as_str() {
+        "data:image/png;base64" => "png",
+        "data:image/jpeg;base64" => "jpg",
+        "data:image/webp;base64" => "webp",
+        "data:image/gif;base64" => "gif",
+        _ => return Err(bad("只支持 PNG、JPEG、WebP 与 GIF 图片")),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| bad("图片数据不是有效的 Base64"))?;
+    if bytes.is_empty() {
+        return Err(bad("图片内容为空"));
+    }
+    Ok((bytes, extension))
+}
+
+/// 提交图片时只认网关自己落盘的文件：网页不能借这条输入让 app-server 去读任意本机文件。
+fn is_gateway_image(path: &str, thread_id: &str) -> bool {
+    let path = Path::new(path);
+    let dir = images_dir(thread_id);
+    if path.parent() != Some(dir.as_path()) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    stem.len() == 32
+        && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && IMAGE_EXTENSIONS.contains(&extension)
+        && path.is_file()
+}
+
+/// 网页只能给出 data URL，而 app-server 的 `localImage` 输入要本机绝对路径：这里先把图片
+/// 解码落到临时目录，只回路径，由网页随下一条消息一起提交。
+async fn api_upload_image(request: &Request, id: &str) -> ApiResult {
+    let body = request.json().map_err(|error| bad(&error.to_string()))?;
+    let data_url = body
+        .get("dataUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("缺少图片数据"))?;
+    let (bytes, extension) = decode_image_data_url(data_url)?;
+    let dir = images_dir(id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| server_error(format!("创建图片目录失败：{error}")))?;
+    let path = dir.join(format!("{}.{extension}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&path, &bytes).map_err(|error| server_error(format!("保存图片失败：{error}")))?;
+    Ok(json!({ "path": path.display().to_string() }))
+}
+
+/// 网页提交的图片路径必须来自本会话的上传目录，否则整条消息都不发出去。
+fn message_images(body: &Value, thread_id: &str) -> Result<Vec<String>, (u16, Value)> {
+    let Some(images) = body.get("images") else {
+        return Ok(Vec::new());
+    };
+    let images = images.as_array().ok_or_else(|| bad("图片列表格式不正确"))?;
+    let mut paths = Vec::with_capacity(images.len());
+    for image in images {
+        let path = image
+            .as_str()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| bad("图片路径不正确"))?;
+        if !is_gateway_image(path, thread_id) {
+            return Err(bad("图片已失效，请重新上传"));
+        }
+        paths.push(path.to_owned());
+    }
+    Ok(paths)
+}
+
 /// 解析发送方式；引导必须带上正在运行的回合 ID，与上游 `expectedTurnId` 的前置条件一致。
 fn parse_send_mode(body: &Value) -> Result<SendMode, (u16, Value)> {
     match body.get("mode").and_then(Value::as_str).map(str::trim) {
@@ -1326,10 +1478,21 @@ async fn api_message(state: &State, request: &Request, id: &str) -> ApiResult {
         .get("text")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| bad("消息内容为空"))?;
+        .filter(|text| !text.is_empty());
+    let images = message_images(&body, id)?;
+    if text.is_none() && images.is_empty() {
+        return Err(bad("消息内容为空"));
+    }
     let mode = parse_send_mode(&body)?;
-    let input = json!([{ "type": "text", "text": text }]);
+    // 文字与图片合成同一份输入：只发图片、不带文字也是一条合法消息。
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if let Some(text) = text {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    for path in &images {
+        parts.push(json!({ "type": "localImage", "path": path }));
+    }
+    let input = Value::Array(parts);
     // 引导与排队都只作用于正在运行的回合：上游此刻已持有该会话，再 resume 只会撞上写入者冲突，
     // 因此直接在当前连接上投递。新回合需要先接入会话，失败也继续，由 turn/start 决定最终结果。
     let (method, params, resume_error) = match &mode {
@@ -1799,5 +1962,114 @@ mod tests {
         assert!(parse_web_command(&json!({})).is_err());
         let long = "长".repeat(COMMAND_NAME_MAX_CHARS + 1);
         assert!(parse_web_command(&json!({ "command": "rename", "name": long })).is_err());
+    }
+
+    #[test]
+    fn context_usage_needs_both_numbers() {
+        assert_eq!(
+            context_value(Some(209335), Some(256000)),
+            json!({ "used": 209335, "window": 256000 })
+        );
+        // 缺任一项或数值不合法都返回 null：宁可隐藏圆圈，也不显示一个错的百分比。
+        assert_eq!(context_value(Some(209335), None), Value::Null);
+        assert_eq!(context_value(None, Some(256000)), Value::Null);
+        assert_eq!(context_value(Some(0), Some(256000)), Value::Null);
+        assert_eq!(context_value(Some(209335), Some(0)), Value::Null);
+    }
+
+    #[test]
+    fn image_data_urls_are_validated() {
+        // 1x1 透明 PNG。
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let (bytes, extension) = decode_image_data_url(png).expect("png");
+        assert_eq!(extension, "png");
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert_eq!(
+            decode_image_data_url("data:image/jpeg;base64,/9j/4AAQ").map(|(_, ext)| ext),
+            Ok("jpg")
+        );
+        // 非图片类型、非 Base64、空内容、缺逗号都拒绝。
+        assert!(decode_image_data_url("data:text/plain;base64,QQ==").is_err());
+        assert!(decode_image_data_url("data:image/png;base64,!!!!").is_err());
+        assert!(decode_image_data_url("data:image/png;base64,").is_err());
+        assert!(decode_image_data_url("没有逗号").is_err());
+    }
+
+    #[test]
+    fn message_images_only_accept_gateway_uploads() {
+        let thread_id = "01a10721-2cf5-7271-b22f-544b877b192e";
+        let dir = images_dir(thread_id);
+        std::fs::create_dir_all(&dir).expect("图片目录");
+        let path = dir.join(format!("{:032x}.png", std::process::id()));
+        std::fs::write(&path, b"png").expect("写入图片");
+        let uploaded = path.display().to_string();
+        let missing = dir.join(format!("{:032x}.png", std::process::id() + 1)).display().to_string();
+
+        let body = json!({ "images": [uploaded.clone()] });
+        assert_eq!(message_images(&body, thread_id), Ok(vec![uploaded]));
+        // 没有图片字段就是一条纯文本消息。
+        assert_eq!(message_images(&json!({}), thread_id), Ok(Vec::new()));
+        // 别的会话目录、任意本机文件、伪造的文件名与不存在的文件都不接受。
+        assert!(message_images(&body, "另一个会话").is_err());
+        assert!(message_images(&json!({ "images": ["C:\\Windows\\win.ini"] }), thread_id).is_err());
+        assert!(
+            message_images(
+                &json!({ "images": [dir.join("not-a-uuid.png").display().to_string()] }),
+                thread_id
+            )
+            .is_err()
+        );
+        assert!(
+            message_images(
+                &json!({ "images": [missing] }),
+                thread_id
+            )
+            .is_err()
+        );
+        assert!(message_images(&json!({ "images": ["  "] }), thread_id).is_err());
+        assert!(message_images(&json!({ "images": "x" }), thread_id).is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rollout_usage_collects_context_of_latest_request() {
+        let root = std::env::temp_dir().join(format!("codey-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = "01a10721-2cf5-7271-b22f-544b877b192e";
+        let day = root.join("2026").join("10").join("05");
+        std::fs::create_dir_all(&day).expect("会话目录");
+        let file = day.join(format!("rollout-2026-10-05T09-27-08-{session}.jsonl"));
+        let lines = [
+            json!({ "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1", "model_context_window": 128000 } }),
+            json!({ "type": "token_usage_record", "payload": {
+                "turn_id": "t1",
+                "usage": { "input_tokens": 100, "output_tokens": 20, "total_tokens": 120 },
+                "turn_token_usage": { "total_tokens": 120 },
+                "thread_token_usage": { "total_tokens": 120 } } }),
+            json!({ "type": "event_msg", "payload": { "type": "token_count", "info": {
+                "model_context_window": 256000, "last_token_usage": { "total_tokens": 120 } } } }),
+            json!({ "type": "token_usage_record", "payload": {
+                "turn_id": "t2",
+                "usage": { "input_tokens": 200, "output_tokens": 40, "total_tokens": 240 },
+                "turn_token_usage": { "total_tokens": 240 },
+                "thread_token_usage": { "total_tokens": 360 } } }),
+        ];
+        let text = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        std::fs::write(&file, text).expect("写入会话");
+
+        let usage = collect_token_usage_in(&root, session);
+        // 圆圈取的是最近一次请求的占用与最新的窗口大小，不是会话累计值。
+        assert_eq!(usage["context"], json!({ "used": 240, "window": 256000 }));
+        assert_eq!(usage["total"]["total_tokens"], json!(360));
+        assert_eq!(usage["turns"]["t1"]["total_tokens"], json!(120));
+        assert_eq!(usage["turns"]["t2"]["total_tokens"], json!(240));
+
+        // 认不出的会话不该编出用量：圆圈会自动隐藏。
+        let unknown = collect_token_usage_in(&root, "不存在的会话");
+        assert_eq!(unknown["context"], Value::Null);
+        assert_eq!(unknown["total"], Value::Null);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
