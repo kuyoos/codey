@@ -970,6 +970,7 @@ async fn api(state: &Arc<State>, request: &Request) -> (u16, Value) {
         ("GET", ["api", "threads", id]) => api_thread(state, id).await,
         ("GET", ["api", "threads", id, "turns"]) => api_turns(state, request, id).await,
         ("GET", ["api", "threads", id, "usage"]) => api_usage(state, id).await,
+        ("GET", ["api", "threads", id, "files"]) => api_files(state, id).await,
         ("GET", ["api", "threads", id, "queue"]) => api_queue(state, id).await,
         ("POST", ["api", "threads", id, "messages"]) => api_message(state, request, id).await,
         ("POST", ["api", "threads", id, "images"]) => api_upload_image(request, id).await,
@@ -1091,6 +1092,85 @@ async fn api_thread(state: &State, id: &str) -> ApiResult {
         "reasoningEffort": effort,
         "cwd": cwd,
     }))
+}
+
+/// 网页只想大致看清这个会话在哪个目录、目录里有什么：只列会话自己 `cwd` 的一层，不接受
+/// 网页传来的路径，因此拿不到令牌也翻不出别的目录。
+async fn api_files(state: &State, id: &str) -> ApiResult {
+    let value = state
+        .upstream
+        .request("thread/read", json!({ "threadId": id }))
+        .await
+        .map_err(upstream_error)?;
+    let cwd = value
+        .get("thread")
+        .and_then(|thread| thread.get("cwd"))
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned);
+    let Some(cwd) = cwd else {
+        return Ok(json!({
+            "cwd": Value::Null,
+            "entries": [],
+            "truncated": false,
+            "error": "这个会话没有工作目录",
+        }));
+    };
+    // 目录读取是同步 I/O，放到阻塞线程，别把事件循环卡住。
+    let listed = tokio::task::spawn_blocking({
+        let cwd = cwd.clone();
+        move || list_directory(&cwd)
+    })
+    .await
+    .unwrap_or_else(|_| json!({ "entries": [], "truncated": false, "error": "读取目录失败" }));
+    let mut body = listed;
+    body["cwd"] = json!(cwd);
+    Ok(body)
+}
+
+/// 一个目录最多列这么多项，够看清大致结构；目录排在文件前面，名字不区分大小写排序。
+const DIRECTORY_MAX_ENTRIES: usize = 200;
+
+fn list_directory(cwd: &str) -> Value {
+    let read = match std::fs::read_dir(cwd) {
+        Ok(read) => read,
+        Err(error) => {
+            return json!({
+                "entries": [],
+                "truncated": false,
+                "error": format!("无法读取目录：{error}"),
+            });
+        }
+    };
+    let mut items = Vec::new();
+    let mut truncated = false;
+    for entry in read.flatten() {
+        if items.len() >= DIRECTORY_MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => "dir",
+            Ok(kind) if kind.is_file() => "file",
+            _ => "other",
+        };
+        let size = if kind == "file" {
+            entry.metadata().ok().map(|meta| meta.len())
+        } else {
+            None
+        };
+        items.push((kind, entry.file_name().to_string_lossy().into_owned(), size));
+    }
+    items.sort_by(|left, right| {
+        (right.0 == "dir")
+            .cmp(&(left.0 == "dir"))
+            .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
+    });
+    let entries = items
+        .into_iter()
+        .map(|(kind, name, size)| json!({ "name": name, "kind": kind, "size": size }))
+        .collect::<Vec<_>>();
+    json!({ "entries": entries, "truncated": truncated, "error": Value::Null })
 }
 
 async fn api_turns(state: &State, request: &Request, id: &str) -> ApiResult {
@@ -2265,5 +2345,55 @@ mod tests {
         assert!(read_conversation_image(&url).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_listing_puts_dirs_first_and_reads_files() {
+        let root = std::env::temp_dir().join(format!("codey-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("目录");
+        std::fs::create_dir_all(root.join("Node_Modules")).expect("目录");
+        std::fs::write(root.join("README.md"), b"hello").expect("写入");
+        std::fs::write(root.join("a.txt"), b"abc").expect("写入");
+
+        let listed = list_directory(&root.display().to_string());
+        assert_eq!(listed["error"], Value::Null);
+        assert_eq!(listed["truncated"], json!(false));
+        let entries = listed["entries"].as_array().expect("entries");
+        // 目录排在文件前面，同类按名字、不区分大小写排序。
+        let order = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec!["Node_Modules", "src", "a.txt", "README.md"]);
+        assert_eq!(entries[0]["kind"], json!("dir"));
+        assert_eq!(entries[0]["size"], Value::Null);
+        assert_eq!(entries[3]["kind"], json!("file"));
+        assert_eq!(entries[3]["size"], json!(5));
+
+        // 目录读不到时给出原因与空列表，而不是让整个接口失败。
+        let missing = list_directory(&root.join("nowhere").display().to_string());
+        assert_eq!(missing["entries"], json!([]));
+        let error = missing["error"].as_str().unwrap_or_default();
+        assert!(!error.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_listing_stops_at_the_cap() {
+        let root = std::env::temp_dir().join(format!("codey-dir-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("目录");
+        for index in 0..DIRECTORY_MAX_ENTRIES + 5 {
+            std::fs::write(root.join(format!("f{index:04}.txt")), b"x").expect("写入");
+        }
+
+        let listed = list_directory(&root.display().to_string());
+        let entries = listed["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), DIRECTORY_MAX_ENTRIES);
+        assert_eq!(listed["truncated"], json!(true));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

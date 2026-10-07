@@ -173,7 +173,23 @@
     }
     .chat-titles { min-width: 0; flex: 1; }
     .chat-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .chat-meta { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* 这一行是「工作目录胶囊 + 模型 / 状态 / 用量」：做成 flex 才能让胶囊按剩余宽度自己截断。 */
+    .chat-meta { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--faint); font-size: 12px; }
+    .chat-meta > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .meta-sep { flex: none; }
+    .meta-path {
+      display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; min-width: 0; max-width: 320px;
+      padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12px;
+    }
+    .meta-path:hover { color: var(--text); }
+    .meta-path svg {
+      width: 13px; height: 13px; flex: none; fill: none; stroke: currentColor;
+      stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+    }
+    .meta-path .p {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
     .transcript {
       flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch;
       padding: 14px 14px 8px;
@@ -434,6 +450,21 @@
     .status-row:last-child { border-bottom: 0; }
     .status-row .k { flex: none; width: 76px; color: var(--muted); }
     .status-row .v { min-width: 0; flex: 1; word-break: break-all; }
+    /* 工作目录：完整路径加目录里的一层子项，只读展示。 */
+    .files-path {
+      margin: 2px 0 8px; padding: 7px 9px; border-radius: 9px; background: var(--surface-2);
+      color: var(--muted); font-size: 12px; word-break: break-all;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+    .files-summary { color: var(--faint); font-size: 11.5px; margin-bottom: 4px; }
+    .files-list { max-height: min(46vh, 360px); overflow-y: auto; margin: 0 0 10px; }
+    .file-row { display: flex; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .file-row:last-child { border-bottom: 0; }
+    .file-kind { flex: none; width: 14px; color: var(--faint); text-align: center; }
+    .file-row.dir .file-kind { color: var(--accent); }
+    .file-row.dir .file-name { font-weight: 550; }
+    .file-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-size { flex: none; color: var(--faint); font-size: 11.5px; }
     .status-row .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     .to-bottom {
       position: absolute; right: 16px; bottom: 84px; width: 38px; height: 38px; border-radius: 50%;
@@ -685,6 +716,19 @@
   </div>
 </div>
 
+<div class="overlay" id="filesOverlay" hidden></div>
+<div class="sheet" id="filesSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="工作目录">
+    <div class="grabber"></div>
+    <div class="sheet-title">工作目录</div>
+    <div class="files-path" id="filesPath"></div>
+    <div class="files-summary" id="filesSummary"></div>
+    <div class="files-list" id="filesList"></div>
+    <div class="sheet-note">只列出这一层，仅供查看。</div>
+    <button class="sheet-close" id="filesClose" type="button">关闭</button>
+  </div>
+</div>
+
 <div class="overlay" id="sendModeOverlay" hidden></div>
 <div class="sheet" id="sendModeSheet" hidden>
   <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="发送方式">
@@ -787,6 +831,18 @@ function el(tag, className, text) {
 
 function mono(text) {
   return el("span", "mono", text);
+}
+
+// 静态图标都写在标记里，只有运行时才生成的节点需要自己拼一个；沿用同一套描边风格。
+function svgIcon(d) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", d);
+  svg.appendChild(path);
+  return svg;
 }
 
 /* 手机上软键盘收起会把整个输入区往下挪：合成器在 touchend 时按新位置重新命中元素，
@@ -909,6 +965,15 @@ function formatDuration(ms) {
   const minutes = Math.floor(total / 60);
   if (minutes < 60) return minutes + " 分 " + (total % 60) + " 秒";
   return Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分";
+}
+
+// 工作目录里的文件大小，只给个量级，不需要精确到字节。
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(bytes < 10240 ? 1 : 0) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
 }
 
 // 回合收尾统计：耗时、token 与思考次数都放在回合末尾；运行中的那份由输入框上方的状态条显示。
@@ -1799,17 +1864,43 @@ function renderThreads() {
 function renderChatHead() {
   const thread = (state.detail && state.detail.thread) || null;
   $("chatTitle").textContent = thread ? (thread.name || preview(thread.preview) || state.threadId || "对话") : "选择一个对话";
-  const meta = [];
+  // 工作目录单独做成可点的小胶囊：点开就能看清完整路径和目录里有什么，长路径也不会把这一行挤满。
+  const nodes = [];
   if (thread) {
-    if (thread.cwd) meta.push(thread.cwd);
-    if (state.detail.model) meta.push(modelLabel(state.detail.model));
-    if (state.command) meta.push(state.command.title + "中");
-    else if (state.activeTurnId) meta.push("运行中");
-    const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
-    if (total) meta.push("累计 " + total + " tokens");
+    if (thread.cwd) nodes.push(cwdChip(thread.cwd));
+    // 窄屏这一行只剩几十像素（右上角还有模型胶囊、用量圆圈和会话导航），只留给工作目录：
+    // 模型在右上角、累计用量在会话状态面板、运行状态在输入框上方的状态条，都不必在这里重复。
+    if (!isMobile()) {
+      if (state.detail.model) nodes.push(el("span", null, modelLabel(state.detail.model)));
+      if (state.command) nodes.push(el("span", null, state.command.title + "中"));
+      else if (state.activeTurnId) nodes.push(el("span", null, "运行中"));
+      const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
+      if (total) nodes.push(el("span", null, "累计 " + total + " tokens"));
+    }
   }
-  $("chatMeta").textContent = meta.join(" · ");
+  const meta = $("chatMeta");
+  meta.textContent = "";
+  nodes.forEach((node, index) => {
+    if (index) meta.appendChild(el("span", "meta-sep", " · "));
+    meta.appendChild(node);
+  });
   renderContextRing();
+}
+
+function cwdChip(cwd) {
+  const chip = el("button", "meta-path");
+  chip.type = "button";
+  chip.title = cwd;
+  chip.setAttribute("aria-label", "查看工作目录与其中的文件");
+  chip.appendChild(svgIcon("M3 6a2 2 0 0 1 2-2h3.6l1.8 2H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"));
+  // 窄屏放不下整条路径：只留最后一段目录名，完整路径在提示（浮层）与面板里。
+  chip.appendChild(el("span", "p", isMobile() ? pathTail(cwd) : cwd));
+  return chip;
+}
+
+function pathTail(cwd) {
+  const parts = String(cwd).split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : cwd;
 }
 
 // 上下文用量：分子是最近一次请求的真实占用，分母是模型窗口，都来自落盘用量；
@@ -2071,6 +2162,8 @@ async function openThread(id) {
   clearCommand();
   closeSlash();
   cancelSendMode();
+  // 上一个会话的目录面板要一起收掉，免得切过去还挂着旧目录。
+  closeFiles();
   state.slashIndex = 0;
   renderApprovals();
   renderQueue();
@@ -2367,6 +2460,50 @@ function openStatus() {
 function closeStatus() {
   $("statusOverlay").hidden = true;
   $("statusSheet").hidden = true;
+}
+
+/* ---------- 工作目录 ---------- */
+
+// 目录里只做展示：目录用实心三角，文件用点，其它类型不猜，统一问号。
+const FILE_KIND_MARK = { dir: "▸", file: "·", other: "?" };
+
+async function openFiles() {
+  // 与回合、用量一样先记下会话：响应回来时用户可能已经切走，晚到的那份不能再写进面板。
+  const id = state.threadId;
+  const thread = (state.detail && state.detail.thread) || null;
+  $("filesPath").textContent = (thread && thread.cwd) || "—";
+  $("filesSummary").textContent = "载入中…";
+  $("filesList").textContent = "";
+  $("filesOverlay").hidden = false;
+  $("filesSheet").hidden = false;
+  let body;
+  try {
+    body = await api("/api/threads/" + encodeURIComponent(id) + "/files");
+  } catch (error) {
+    if (state.threadId !== id) return;
+    $("filesSummary").textContent = error && error.message ? error.message : "读取目录失败";
+    return;
+  }
+  if (state.threadId !== id) return;
+  if (body && body.cwd) $("filesPath").textContent = body.cwd;
+  const entries = (body && body.entries) || [];
+  const summary = body && body.error ? [body.error] : [entries.length ? "共 " + entries.length + " 项" : "空目录"];
+  if (body && body.truncated) summary.push("只列出其中一部分");
+  $("filesSummary").textContent = summary.join(" · ");
+  const list = $("filesList");
+  list.textContent = "";
+  for (const entry of entries) {
+    const row = el("div", "file-row" + (entry.kind === "dir" ? " dir" : ""));
+    row.appendChild(el("span", "file-kind", FILE_KIND_MARK[entry.kind] || "?"));
+    row.appendChild(el("span", "file-name", entry.name));
+    row.appendChild(el("span", "file-size", entry.kind === "file" ? formatBytes(entry.size) : ""));
+    list.appendChild(row);
+  }
+}
+
+function closeFiles() {
+  $("filesOverlay").hidden = true;
+  $("filesSheet").hidden = true;
 }
 
 /* ---------- 运行中发送方式 ---------- */
@@ -2784,6 +2921,9 @@ function readToken() {
  * 部分浏览器还会滚动可视视口（offsetTop 不为 0）来露出输入框；只改高度会
  * 让输入栏被顶到屏幕上方并盖住正文，所以这里同时同步 top 与 height。
  */
+// 顶栏那条在窄屏与宽屏上取舍不同，宽度跨过断点时要重画一次，不然会留着上一档的内容。
+let lastMobile = null;
+
 function syncViewport() {
   const viewport = window.visualViewport;
   const height = Math.round((viewport && viewport.height) || window.innerHeight || 0);
@@ -2791,6 +2931,10 @@ function syncViewport() {
   const top = Math.max(0, Math.round((viewport && viewport.offsetTop) || 0));
   $("app").style.top = top + "px";
   if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+  if (isMobile() !== lastMobile) {
+    lastMobile = isMobile();
+    renderChatHead();
+  }
 }
 
 function bind() {
@@ -2852,6 +2996,10 @@ function bind() {
   window.addEventListener("pointercancel", () => { slashHold = false; });
   $("statusClose").addEventListener("click", closeStatus);
   $("statusOverlay").addEventListener("click", closeStatus);
+  // 顶栏的工作目录胶囊也走统一点按分发：手机上点它不必先让输入框失焦。
+  onTap(".meta-path", openFiles);
+  $("filesClose").addEventListener("click", closeFiles);
+  $("filesOverlay").addEventListener("click", closeFiles);
   $("sendModeClose").addEventListener("click", cancelSendMode);
   $("sendModeOverlay").addEventListener("click", cancelSendMode);
   $("steerChoice").addEventListener("click", () => chooseSendMode("steer"));
@@ -2901,6 +3049,7 @@ function bind() {
       closeSheet();
       closeNav();
       closeStatus();
+      closeFiles();
       cancelSendMode();
     }
   });
