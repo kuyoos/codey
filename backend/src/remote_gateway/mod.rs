@@ -32,7 +32,9 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
-use http::{EventStream, Request, read_request, write_json, write_response};
+use http::{
+    EventStream, Request, read_request, write_json, write_response, write_response_with_cache,
+};
 use upstream::{Event, Upstream};
 
 const CONFIG_FILE_NAME: &str = ".codey-remote-gateway.json";
@@ -809,6 +811,17 @@ async fn route(mut stream: TcpStream, state: &Arc<State>, request: Request) -> R
     if request.method == "GET" && request.path == "/api/events" {
         return stream_events(stream, Arc::clone(state)).await;
     }
+    if request.method == "GET" {
+        let segments = request
+            .path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        // 会话图片不走 JSON：网页按路径取字节，能懒加载也能交给浏览器缓存。
+        if let ["api", "threads", thread_id, "image"] = segments.as_slice() {
+            return serve_image(stream, &request, thread_id).await;
+        }
+    }
     let (status, body) = api(state, &request).await;
     write_json(&mut stream, status, &body).await
 }
@@ -1104,7 +1117,7 @@ async fn api_turns(state: &State, request: &Request, id: &str) -> ApiResult {
         .await
         .map_err(upstream_error)?;
     let mut turns = value.get("data").cloned().unwrap_or(json!([]));
-    slim_turns(&mut turns);
+    slim_turns(&mut turns, id);
     Ok(json!({
         "turns": turns,
         "nextCursor": value.get("nextCursor").cloned().unwrap_or(Value::Null),
@@ -1113,7 +1126,8 @@ async fn api_turns(state: &State, request: &Request, id: &str) -> ApiResult {
 
 /// 网页只需要“做了什么”的概要：推理正文、工具参数与结果、命令输出正文、文件改动清单与图片结果
 /// 在真实会话里能占响应九成以上，在网关侧统一裁剪后，网页加载更快、流量更低。
-fn slim_turns(turns: &mut Value) {
+/// 用户消息里的图片是唯一的例外：它要显示，但只下发路径，内容由网页按需回读。
+fn slim_turns(turns: &mut Value, thread_id: &str) {
     let Some(list) = turns.as_array_mut() else {
         return;
     };
@@ -1168,19 +1182,38 @@ fn slim_turns(turns: &mut Value) {
                         .unwrap_or(0);
                     object.insert("changeCount".to_owned(), json!(count));
                 }
-                // 用户消息里的图片只留类型：网页只用它数张数，本机路径不必下发。
+                // 用户消息里的图片统一成「本会话临时目录里的文件 + 路径」：桌面粘贴的截图原本是
+                // 内联 data URL，在这里落一次盘，网页按路径懒加载，几百 KB 的 Base64 不再随每次加载下发。
                 Some("userMessage") => {
                     if let Some(parts) = object.get_mut("content").and_then(Value::as_array_mut) {
-                        for part in parts.iter_mut().filter(|part| {
-                            matches!(
-                                part.get("type").and_then(Value::as_str),
-                                Some("image" | "localImage")
-                            )
-                        }) {
-                            if let Some(part) = part.as_object_mut() {
-                                for key in ["url", "path", "detail", "fileId"] {
-                                    let _ = part.remove(key);
+                        for part in parts.iter_mut() {
+                            let Some(part) = part.as_object_mut() else {
+                                continue;
+                            };
+                            let kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
+                            if !matches!(kind, "image" | "localImage") {
+                                continue;
+                            }
+                            let path = match kind {
+                                "localImage" => {
+                                    part.get("path").and_then(Value::as_str).map(str::to_owned)
                                 }
+                                _ => part
+                                    .get("image_url")
+                                    .or_else(|| part.get("url"))
+                                    .and_then(Value::as_str)
+                                    .and_then(|data| cache_inline_image(data, thread_id))
+                                    // 内联地址转成路径后再裁一次也要留着，裁剪因此是幂等的。
+                                    .or_else(|| {
+                                        part.get("path").and_then(Value::as_str).map(str::to_owned)
+                                    }),
+                            };
+                            for key in ["path", "image_url", "url", "detail", "fileId"] {
+                                let _ = part.remove(key);
+                            }
+                            // 认不出的地址只留类型，网页仍然能按张数兜底。
+                            if let Some(path) = path {
+                                part.insert("path".to_owned(), json!(path));
                             }
                         }
                     }
@@ -1365,7 +1398,23 @@ enum SendMode {
 }
 
 const IMAGE_DIR_NAME: &str = "codey-remote-images";
-const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "webp", "gif"];
+/// 网页回读会话图片的上限：再大就只提示，不把整个文件读进内存。
+const IMAGE_MAX_BYTES: u64 = 12 * 1024 * 1024;
+
+/// 上传、回读与重发共用同一张扩展名表，顺带给出回读时的 MIME 类型。
+fn image_content_type(extension: &str) -> Option<&'static str> {
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+fn not_found(message: &str) -> (u16, Value) {
+    (404, json!({ "error": { "message": message } }))
+}
 
 /// 上传的图片按会话落在系统临时目录里：既不写进用户工作区，也能在提交时校验来源。
 fn images_dir(thread_id: &str) -> PathBuf {
@@ -1413,8 +1462,88 @@ fn is_gateway_image(path: &str, thread_id: &str) -> bool {
     };
     stem.len() == 32
         && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && IMAGE_EXTENSIONS.contains(&extension)
+        && image_content_type(extension).is_some()
         && path.is_file()
+}
+
+/// 会话里的路径可能是裸路径或 `file://` URL，统一成本机路径后再校验。
+fn local_image_path(raw: &str) -> PathBuf {
+    let text = raw.trim();
+    let text = text.strip_prefix("file://").unwrap_or(text);
+    // Windows 上 `file:///C:/x.png` 会多出一个前导斜杠。
+    match text.as_bytes() {
+        [b'/', _, b':', ..] => PathBuf::from(&text[1..]),
+        _ => PathBuf::from(text),
+    }
+}
+
+/// 会话图片按路径回读：只认真实存在、扩展名在白名单里且不超过上限的文件，只读图片不读别的。
+fn read_conversation_image(raw: &str) -> Result<(PathBuf, &'static str, Vec<u8>), (u16, Value)> {
+    let path = local_image_path(raw);
+    let content_type = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(image_content_type)
+        .ok_or_else(|| not_found("图片不存在"))?;
+    let metadata = std::fs::metadata(&path).map_err(|_| not_found("图片不存在"))?;
+    if !metadata.is_file() {
+        return Err(not_found("图片不存在"));
+    }
+    if metadata.len() > IMAGE_MAX_BYTES {
+        return Err((
+            413,
+            json!({ "error": { "message": "图片过大，网页不展示" } }),
+        ));
+    }
+    let bytes =
+        std::fs::read(&path).map_err(|error| server_error(format!("读取图片失败：{error}")))?;
+    Ok((path, content_type, bytes))
+}
+
+/// 桌面粘贴的截图在会话里是内联 data URL，先落到本会话的临时目录再下发路径：文件名由内容
+/// 决定，重复读取不会反复写盘，网页也能把它当成普通上传图片重新发出去。
+fn cache_inline_image(data_url: &str, thread_id: &str) -> Option<String> {
+    let (bytes, extension) = decode_image_data_url(data_url).ok()?;
+    if bytes.len() as u64 > IMAGE_MAX_BYTES {
+        return None;
+    }
+    let dir = images_dir(thread_id);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.{extension}", content_hash(&bytes)));
+    if !path.is_file() && std::fs::write(&path, &bytes).is_err() {
+        return None;
+    }
+    Some(path.display().to_string())
+}
+
+/// 内容寻址的文件名：两轮 64 位哈希拼成 32 位十六进制，与上传落盘的命名规则一致。
+fn content_hash(bytes: &[u8]) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut name = String::with_capacity(32);
+    for salt in [0u8, 1] {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut hasher);
+        bytes.hash(&mut hasher);
+        name.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    name
+}
+
+/// 网页用 `<img>` 取图，带不了请求头，所以令牌走查询串，和事件流一致。
+async fn serve_image(mut stream: TcpStream, request: &Request, thread_id: &str) -> Result<()> {
+    let raw = request.query_value("path").unwrap_or_default();
+    match read_conversation_image(raw) {
+        Ok((path, content_type, bytes)) => {
+            // 网关自己落盘的文件按内容命名、内容不会变，可以交给浏览器缓存；其余保持不缓存。
+            let cache = if path.starts_with(images_dir(thread_id)) {
+                "private, max-age=86400"
+            } else {
+                "no-store"
+            };
+            write_response_with_cache(&mut stream, 200, content_type, &bytes, cache).await
+        }
+        Err((status, body)) => write_json(&mut stream, status, &body).await,
+    }
 }
 
 /// 网页只能给出 data URL，而 app-server 的 `localImage` 输入要本机绝对路径：这里先把图片
@@ -1826,7 +1955,7 @@ mod tests {
             },
             { "id": "t2" }
         ]);
-        slim_turns(&mut turns);
+        slim_turns(&mut turns, "thread-1");
         let items = turns[0]["items"].as_array().expect("items");
         assert_eq!(items.len(), 9);
         assert_eq!(items[0]["type"], json!("reasoning"));
@@ -2074,5 +2203,67 @@ mod tests {
         assert_eq!(unknown["total"], Value::Null);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_message_images_become_local_paths() {
+        let thread_id = "01a10721-2cf5-7271-b22f-544b877b192e";
+        let dir = images_dir(thread_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("图片目录");
+        let uploaded = dir.join(format!("{:032x}.png", std::process::id()));
+        std::fs::write(&uploaded, b"png").expect("写入图片");
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+        let mut turns = json!([{ "id": "t1", "items": [{ "type": "userMessage", "id": "u1", "content": [
+            { "type": "text", "text": "看看这张图" },
+            { "type": "localImage", "path": uploaded.display().to_string(), "detail": "high" },
+            { "type": "image", "image_url": png, "detail": "auto" },
+            { "type": "image", "image_url": "https://example.com/x.png" }
+        ] }] }]);
+        slim_turns(&mut turns, thread_id);
+        let parts = turns[0]["items"][0]["content"].as_array().expect("content");
+        assert_eq!(parts.len(), 4);
+        // 已经在会话目录里的路径原样保留，其余字段不再下发。
+        assert_eq!(parts[1]["path"], json!(uploaded.display().to_string()));
+        assert!(parts[1].get("detail").is_none());
+        // 内联图片落进同一个目录，网页按路径回读，Base64 不再随响应下发。
+        let cached = parts[2]["path"].as_str().expect("缓存路径").to_owned();
+        assert!(local_image_path(&cached).starts_with(&dir));
+        assert!(!turns[0].to_string().contains("base64"));
+        let bytes = std::fs::read(&cached).expect("缓存文件");
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        // 再读一次复用同一个文件，不会重复写盘。
+        let mut again = turns.clone();
+        slim_turns(&mut again, thread_id);
+        assert_eq!(again[0]["items"][0]["content"][2]["path"], json!(cached));
+        // 认不出的地址只留类型，网页按张数兜底。
+        assert!(parts[3].get("image_url").is_none());
+        assert_eq!(parts[3]["type"], json!("image"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conversation_images_are_read_by_extension_only() {
+        let dir = std::env::temp_dir().join(format!("codey-image-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("目录");
+        let png = dir.join("a.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).expect("写入图片");
+        let notes = dir.join("a.txt");
+        std::fs::write(&notes, b"secret").expect("写入文本");
+
+        let read = |path: &std::path::Path| read_conversation_image(&path.display().to_string());
+        assert_eq!(read(&png).map(|(_, kind, _)| kind), Ok("image/png"));
+        // 非图片、缺失文件与目录都不回读。
+        assert!(read(&notes).is_err());
+        assert!(read(&dir.join("missing.png")).is_err());
+        assert!(read(&dir).is_err());
+        // `file://` 前缀与 Windows 的 `/C:/` 形式都要能还原成本机路径。
+        let url = format!("file:///{}", png.display().to_string().replace('\\', "/"));
+        assert!(read_conversation_image(&url).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

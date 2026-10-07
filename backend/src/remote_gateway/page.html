@@ -203,8 +203,14 @@
       border-radius: 16px 16px 4px 16px; padding: 9px 12px;
     }
     .msg.agent { max-width: 100%; }
-    /* 用户消息里的图片只报张数，不在这里展开，避免正文被大图挤开。 */
-    .msg.user .msg-images { margin-top: 4px; color: var(--faint); font-size: 12px; }
+    /* 用户消息里的图片按缩略图展示，点开看大图；取不到路径的退回张数提示。 */
+    .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .msg-image {
+      flex: none; width: 108px; height: 108px; padding: 0; overflow: hidden; border-radius: 10px;
+      border: 1px solid var(--line-2); background: var(--surface-2); display: block;
+    }
+    .msg-image img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .msg-images-note { color: var(--faint); font-size: 12px; align-self: center; }
     /* 编辑与复制默认隐藏，悬停或聚焦时出现，触屏设备上常驻，避免正文被按钮挤占。 */
     .msg-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; opacity: 0; transition: opacity .15s ease; }
     .msg.user:hover .msg-actions, .msg.user:focus-within .msg-actions { opacity: 1; }
@@ -439,6 +445,18 @@
     /* ---------- 弹层、提示 ---------- */
     .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 40; animation: fade .16s ease; }
     @keyframes fade { from { opacity: 0; } }
+    /* 全屏看图：铺满视口，点任意处或右上角关闭。 */
+    .img-viewer {
+      position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; animation: fade .16s ease;
+      background: rgba(8, 10, 14, .95);
+      padding: calc(env(safe-area-inset-top, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+    }
+    .img-viewer img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+    .img-viewer-close {
+      position: absolute; top: calc(env(safe-area-inset-top, 0px) + 10px); right: 12px;
+      width: 34px; height: 34px; border-radius: 50%; background: rgba(255, 255, 255, .16);
+      color: var(--text); font-size: 18px; line-height: 1; display: grid; place-items: center;
+    }
     /* 整张 sheet 铺满全屏，但不吃指针事件：面板以外的点击落到遮罩上直接关闭。 */
     .sheet { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-end; justify-content: center; pointer-events: none; }
     .sheet-panel {
@@ -688,6 +706,11 @@
 </div>
 
 <div class="toast-host" id="toastHost"></div>
+
+<div class="img-viewer" id="imgViewer" hidden>
+  <img id="imgViewerImg" alt="图片预览">
+  <button class="img-viewer-close" id="imgViewerClose" type="button" aria-label="关闭图片">×</button>
+</div>
 
 <div class="gate" id="gate" hidden>
   <div class="gate-card">
@@ -1221,41 +1244,114 @@ function messageText(item) {
   return parts.join("\n");
 }
 
-// 用户消息里的图片输入在网页上只用张数表示。
+// 用户消息里的图片输入：网关只下发本机路径，网页按路径回读；取不到路径的只报张数。
 const IMAGE_INPUT_TYPES = new Set(["image", "localImage"]);
 
-function messageImageCount(item) {
-  return ((item && item.content) || []).filter((part) => part && IMAGE_INPUT_TYPES.has(part.type)).length;
+function messageImages(item) {
+  return ((item && item.content) || [])
+    .filter((part) => part && IMAGE_INPUT_TYPES.has(part.type))
+    .map((part) => ({ path: typeof part.path === "string" ? part.path : "" }));
+}
+
+// <img> 带不了请求头，令牌随查询串走，和事件流一致。
+function imageUrl(path) {
+  return "/api/threads/" + encodeURIComponent(state.threadId) + "/image?path=" + encodeURIComponent(path) + "&token=" + encodeURIComponent(state.token);
 }
 
 function userMessage(item) {
   const text = messageText(item);
   const node = el("div", "msg user");
   if (text) node.appendChild(el("div", "msg-text", text));
-  const images = messageImageCount(item);
-  if (images) node.appendChild(el("div", "msg-images", "图片 " + images + " 张"));
-  if (!text) return node;
+  const images = messageImages(item);
+  if (images.length) {
+    const box = el("div", "msg-images");
+    for (const image of images) {
+      if (!image.path) continue;
+      const button = el("button", "msg-image");
+      button.type = "button";
+      button.dataset.src = imageUrl(image.path);
+      button.setAttribute("aria-label", "查看图片");
+      const picture = el("img");
+      picture.src = button.dataset.src;
+      picture.alt = "消息图片";
+      picture.loading = "lazy";
+      picture.decoding = "async";
+      // 回读失败（文件已删或过大）时退回一条提示，不留空白。
+      picture.addEventListener("error", () => button.replaceWith(el("span", "msg-images-note", "图片无法预览")));
+      button.appendChild(picture);
+      box.appendChild(button);
+    }
+    const missing = images.filter((image) => !image.path).length;
+    if (missing) box.appendChild(el("span", "msg-images-note", "另有 " + missing + " 张图片"));
+    node.appendChild(box);
+  }
+  if (!text && !images.length) return node;
   const actions = el("div", "msg-actions");
-  const copy = el("button", null, "复制");
-  copy.type = "button";
-  copy.addEventListener("click", () => copyText(text, "已复制消息"));
+  // 只有图片的消息没有正文可复制，只留「编辑」把图片放回输入框。
+  if (text) {
+    const copy = el("button", null, "复制");
+    copy.type = "button";
+    copy.addEventListener("click", () => copyText(text, "已复制消息"));
+    actions.appendChild(copy);
+  }
   const edit = el("button", null, "编辑");
   edit.type = "button";
-  edit.addEventListener("click", () => editMessage(text));
-  actions.appendChild(copy);
+  edit.addEventListener("click", () => { editMessage(text, images).catch(reportError); });
   actions.appendChild(edit);
   node.appendChild(actions);
   return node;
 }
 
-// 编辑把消息回填到输入框：历史仍保留，改完直接发送即可重新提问。
-function editMessage(text) {
+// 缩略图点开看大图：铺满视口，点任意处或右上角关闭。
+function openImageViewer(src) {
+  if (!src) return;
+  $("imgViewerImg").src = src;
+  $("imgViewer").hidden = false;
+}
+
+function closeImageViewer() {
+  $("imgViewer").hidden = true;
+  $("imgViewerImg").removeAttribute("src");
+}
+
+// 编辑把消息回填到输入框：历史仍保留，改完直接发送即可重新提问。带图片的消息把图片一并放回
+// 附件栏，而附件栏只认网关本会话目录里的文件，所以这里重新回读并走一次上传接口换成新路径。
+async function editMessage(text, images) {
   const input = $("input");
-  input.value = text;
+  input.value = text || "";
   autoGrow();
   input.focus();
-  try { input.setSelectionRange(text.length, text.length); } catch { /* 忽略 */ }
-  toast("已填入输入框，修改后发送");
+  try { input.setSelectionRange(input.value.length, input.value.length); } catch { /* 忽略 */ }
+  const threadId = state.threadId;
+  const paths = (images || []).map((image) => image.path).filter(Boolean);
+  const room = Math.max(0, ATTACH_MAX_COUNT - state.attachments.length);
+  let added = 0;
+  for (const path of paths.slice(0, room)) {
+    try {
+      const response = await fetch(imageUrl(path));
+      if (!response.ok) continue;
+      const blob = await response.blob();
+      if (blob.size > ATTACH_MAX_BYTES) continue;
+      const dataUrl = await readImage(blob);
+      const body = await api("/api/threads/" + encodeURIComponent(threadId) + "/images", {
+        method: "POST",
+        body: JSON.stringify({ name: "会话图片", dataUrl }),
+      });
+      if (state.threadId !== threadId) return;
+      if (!body || !body.path) continue;
+      state.attachments.push({ id: String(++state.attachSeq), name: "会话图片", dataUrl, path: body.path });
+      added += 1;
+    } catch { /* 单张失败不影响其余图片 */ }
+  }
+  if (added) {
+    renderAttachBar();
+    renderComposerState();
+    toast("已填入输入框，附上 " + added + " 张图片");
+  } else if (paths.length) {
+    toast("已填入输入框，图片未能重新加入", "warn");
+  } else {
+    toast("已填入输入框，修改后发送");
+  }
 }
 
 // 工具、命令、文件改动与图片都只留一行计数，和思考一样轻；正文与路径在网关侧已裁掉。
@@ -2738,6 +2834,9 @@ function bind() {
     if (cmd) runCommand(cmd, "");
   });
   onTap(".attach-remove", (node) => removeAttachment(node.dataset.id));
+  // 会话图片与全屏查看器都走统一点按分发，触屏上也稳。
+  onTap(".msg-image", (node) => openImageViewer(node.dataset.src));
+  onTap("#imgViewer", closeImageViewer);
   $("fileInput").addEventListener("change", () => {
     addImages($("fileInput").files).catch(reportError);
   });

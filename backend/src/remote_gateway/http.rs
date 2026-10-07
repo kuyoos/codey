@@ -171,8 +171,19 @@ pub(crate) async fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
+    write_response_with_cache(stream, status, content_type, body, "no-store").await
+}
+
+/// 图片这类按内容寻址、可以放心缓存的资源单独给出 `Cache-Control`，避免每次重渲染都重新下载。
+pub(crate) async fn write_response_with_cache(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    cache_control: &str,
+) -> Result<()> {
     let head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache_control}\r\nConnection: close\r\n\r\n",
         reason(status),
         body.len()
     );
