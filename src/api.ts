@@ -6,6 +6,7 @@ export const CODEY_API_COMMANDS = [
   "reorder_route_models",
   "delete_route",
   "fetch_route_models",
+  "test_route_model",
   "save_selected_models",
   "save_default_model",
   "save_official_route_models",

@@ -1017,45 +1017,130 @@ async fn api_models(state: &State) -> ApiResult {
 }
 
 async fn api_threads(state: &State, request: &Request) -> ApiResult {
-    let mut params = json!({ "limit": 60, "archived": false });
-    if let Some(search) = request
+    let search = request
         .query_value("search")
         .map(str::trim)
         .filter(|search| !search.is_empty())
-    {
-        params["searchTerm"] = json!(search);
-    }
-    if let Some(cursor) = request
+        .map(str::to_owned);
+    // 搜索要能找到很久以前的会话，因此只有不带搜索词时才按时间收窄首页。
+    let cutoff = if search.is_none() {
+        Some(thread_window_cutoff())
+    } else {
+        None
+    };
+    let mut cursor = request
         .query_value("cursor")
         .filter(|cursor| !cursor.is_empty())
-    {
-        params["cursor"] = json!(cursor);
-    }
-    let value = state
-        .upstream
-        .request("thread/list", params)
-        .await
-        .map_err(upstream_error)?;
-    let data = value
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(str::to_owned);
+    // 上游按最近使用倒序返回，这里按同一顺序拼多页并去重；搜索仍只取一页，避免结果过大。
+    let max_pages = if search.is_some() { 1 } else { THREAD_MAX_PAGES };
+    let mut collected = Vec::new();
     let mut seen = HashSet::new();
-    let threads = data
+    for _ in 0..max_pages {
+        let mut params = json!({ "limit": THREAD_PAGE_LIMIT, "archived": false });
+        if let Some(search) = search.as_deref() {
+            params["searchTerm"] = json!(search);
+        }
+        if let Some(page_cursor) = cursor.as_deref() {
+            params["cursor"] = json!(page_cursor);
+        }
+        let value = state
+            .upstream
+            .request("thread/list", params)
+            .await
+            .map_err(upstream_error)?;
+        let page = value
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut fresh = 0usize;
+        let mut oldest = i64::MAX;
+        for thread in &page {
+            let id = thread.get("id").and_then(Value::as_str);
+            if id.is_some_and(|id| seen.insert(id.to_owned())) {
+                fresh += 1;
+                collected.push(thread.clone());
+            }
+            if let Some(updated_at) = thread_updated_at(thread) {
+                oldest = oldest.min(updated_at);
+            }
+        }
+        cursor = value
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_owned);
+        // fresh 为 0 说明上游没按游标往后走（或整页都重复），再翻还是同一页，必须停。
+        if page.is_empty() || fresh == 0 || cursor.is_none() {
+            break;
+        }
+        // 这一页已经翻到窗口之外，后面只会更旧，没必要继续。
+        if cutoff.is_some_and(|cutoff| oldest < cutoff) {
+            break;
+        }
+    }
+    let mut threads = collected
         .iter()
-        .filter(|thread| {
-            thread
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| seen.insert(id.to_owned()))
-        })
+        .filter(|thread| thread_in_window(thread, cutoff))
         .map(compact_thread)
         .collect::<Vec<_>>();
+    // 窗口里一条都没有时至少留最近几条，首页不至于整片空白。
+    let used_floor = threads.is_empty() && cutoff.is_some();
+    if used_floor {
+        threads = collected
+            .iter()
+            .take(THREAD_RECENT_FLOOR)
+            .map(compact_thread)
+            .collect();
+    }
+    let window_days = match (cutoff, used_floor) {
+        (Some(_), false) => json!(THREAD_WINDOW_DAYS),
+        _ => Value::Null,
+    };
     Ok(json!({
         "threads": threads,
-        "nextCursor": value.get("nextCursor").cloned().unwrap_or(Value::Null),
+        // 窗口内的会话已经全部取回，网页不需要也没有办法继续往后翻。
+        "nextCursor": Value::Null,
+        "windowDays": window_days,
     }))
+}
+
+/// 首页一次向上游取多少条；上游 `thread/list` 的页大小也就是这个量级。
+const THREAD_PAGE_LIMIT: u32 = 60;
+/// 最多翻这么多页：正常情况翻到窗口之外就停，页数上限只是防上游游标异常时一直翻。
+const THREAD_MAX_PAGES: usize = 8;
+/// 首页只列最近这么多天有过活动的会话，更早的用搜索找。
+const THREAD_WINDOW_DAYS: i64 = 3;
+/// 窗口内一条都没有时（例如很久没用过 Codex）至少留最近这么多条。
+const THREAD_RECENT_FLOOR: usize = 20;
+
+/// 会话的最近活动时间，单位是秒；上游缺字段时按「时间未知」处理，不当成新会话。
+fn thread_updated_at(thread: &Value) -> Option<i64> {
+    thread
+        .get("updatedAt")
+        .or_else(|| thread.get("createdAt"))
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+}
+
+/// 会话是否落在首页时间窗口内；`cutoff` 为 `None` 表示不按时间裁剪（搜索场景）。
+fn thread_in_window(thread: &Value, cutoff: Option<i64>) -> bool {
+    match (cutoff, thread_updated_at(thread)) {
+        (Some(cutoff), Some(updated_at)) => updated_at >= cutoff,
+        // 时间未知的会话不能算「最近活跃」，否则陈旧会话会被当成新会话塞进首页。
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+/// 首页时间窗口的左边界（秒）。取不到系统时间时返回 0，等于不裁剪。
+fn thread_window_cutoff() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    now - THREAD_WINDOW_DAYS * 24 * 60 * 60
 }
 
 fn compact_thread(thread: &Value) -> Value {
@@ -2395,5 +2480,44 @@ mod tests {
         assert_eq!(listed["truncated"], json!(true));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn home_list_keeps_only_threads_active_in_the_window() {
+        let cutoff = 1_000;
+        // 窗口内（含边界）的会话留下。
+        assert!(thread_in_window(&json!({ "updatedAt": cutoff }), Some(cutoff)));
+        assert!(thread_in_window(
+            &json!({ "updatedAt": cutoff + 60 }),
+            Some(cutoff)
+        ));
+        // 更早的会话只能靠搜索找到。
+        assert!(!thread_in_window(
+            &json!({ "updatedAt": cutoff - 1 }),
+            Some(cutoff)
+        ));
+        // 缺 updatedAt 时退回 createdAt；两个时间都没有的会话不算「最近活跃」。
+        assert!(thread_in_window(
+            &json!({ "createdAt": cutoff + 5 }),
+            Some(cutoff)
+        ));
+        assert!(!thread_in_window(&json!({ "name": "旧会话" }), Some(cutoff)));
+        assert!(!thread_in_window(&json!({ "updatedAt": 0 }), Some(cutoff)));
+        // 不带窗口（搜索）时一律保留。
+        assert!(thread_in_window(&json!({ "name": "旧会话" }), None));
+    }
+
+    #[test]
+    fn home_list_window_is_three_days() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间")
+            .as_secs() as i64;
+        let span = THREAD_WINDOW_DAYS * 24 * 60 * 60;
+        assert_eq!(THREAD_WINDOW_DAYS, 3);
+        let cutoff = thread_window_cutoff();
+        assert!(cutoff <= now - span);
+        // 取时间与断言之间允许几秒漂移。
+        assert!(cutoff > now - span - 5);
     }
 }

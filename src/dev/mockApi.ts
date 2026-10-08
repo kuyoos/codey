@@ -1217,6 +1217,25 @@ if (import.meta.env.DEV) {
           modelHotReloaded: true,
         };
       }
+      if (command === "test_route_model") {
+        const routeId = String(args.routeId || "");
+        const model = String(args.model || "");
+        const route = previewConfig.profiles.find((profile) => profile.id === routeId);
+        if (!route) return { status: "failed", message: "找不到要测试的线路" };
+        if (!model.trim()) return { status: "failed", message: "模型 ID 不能为空" };
+        const models = route.officialAccount
+          ? previewOfficialModels.map((entry) => entry.slug)
+          : uniqueModelIds([
+            ...previewUpstreamModels,
+            ...(routeProviderId(route) === "backup" ? ["claude-sonnet-4-5"] : []),
+          ]);
+        return {
+          routeId,
+          model,
+          modelCount: models.length,
+          found: models.some((candidate) => modelIdsEqual(candidate, model)),
+        };
+      }
       if (command === "clear_diagnostic_storage") {
         if (args.target !== "trace" && args.target !== "crashpad") {
           throw new Error("无效的诊断清理目标");

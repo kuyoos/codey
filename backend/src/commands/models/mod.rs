@@ -73,6 +73,7 @@ mod routes;
 mod selection;
 mod state;
 mod sync;
+mod test_connection;
 #[cfg(test)]
 mod tests;
 
@@ -84,6 +85,7 @@ pub use routes::*;
 pub use selection::*;
 pub(crate) use state::*;
 pub use sync::*;
+pub use test_connection::*;
 
 pub(super) async fn invoke(
     state: &Arc<AppState>,
@@ -128,6 +130,13 @@ pub(super) async fn invoke(
             (Ok(route_id), Ok(expected_revision)) => {
                 fetch_route_models(state, route_id, expected_revision).await
             }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "test_route_model" => match (
+            string_argument(args, "routeId"),
+            string_argument(args, "model"),
+        ) {
+            (Ok(route_id), Ok(model)) => test_route_model(state, route_id, model).await,
             (Err(error), _) | (_, Err(error)) => Err(error),
         },
         "save_selected_models" => match (

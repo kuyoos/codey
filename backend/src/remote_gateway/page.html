@@ -791,6 +791,7 @@ const SLASH_COMMANDS = [
 const state = {
   token: "",
   threads: [],
+  threadWindowDays: 0,
   models: [],
   threadId: null,
   detail: null,
@@ -1742,7 +1743,7 @@ function renderTranscript(forceScroll) {
   if (!state.threadId) {
     const empty = el("div", "empty");
     empty.appendChild(el("div", "big", "选择一个对话"));
-    empty.appendChild(el("div", null, isMobile() ? "点左上角返回列表，选择一个会话开始。" : "左侧列出本机全部对话，包含桌面端没有打开的会话。"));
+    empty.appendChild(el("div", null, isMobile() ? "点左上角返回列表，选择一个会话开始。" : "左侧列出最近的对话（更早的用搜索找），包含桌面端没有打开的会话。"));
     root.appendChild(empty);
     updateAtBottom();
     return;
@@ -1811,7 +1812,9 @@ function renderTranscript(forceScroll) {
 function renderThreads() {
   const root = $("threads");
   root.textContent = "";
-  $("threadCount").textContent = state.threads.length ? state.threads.length + " 个会话" : "";
+  // 首页按时间收窄过就说明一声，免得用户以为老对话丢了；搜索不带窗口，只报条数。
+  const windowLabel = state.threadWindowDays ? "最近 " + state.threadWindowDays + " 天 · " : "";
+  $("threadCount").textContent = state.threads.length ? windowLabel + state.threads.length + " 个会话" : "";
   if (!state.loaded) {
     for (let index = 0; index < 6; index += 1) root.appendChild(el("div", "skeleton"));
     return;
@@ -2093,6 +2096,8 @@ async function loadThreads() {
   const query = search ? "?search=" + encodeURIComponent(search) : "";
   const body = await api("/api/threads" + query);
   state.threads = body.threads || [];
+  // 首页只取最近几天有过活动的会话；搜索时后端不带窗口，这里也就没有天数。
+  state.threadWindowDays = Number(body.windowDays) || 0;
   state.loaded = true;
   renderThreads();
 }

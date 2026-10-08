@@ -1090,6 +1090,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "reorder_route_models"
         | "delete_route"
         | "fetch_route_models"
+        | "test_route_model"
         | "save_selected_models"
         | "save_default_model"
         | "save_official_route_models" => models::invoke(state, command, &args).await,
