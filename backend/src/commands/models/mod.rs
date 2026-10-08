@@ -85,7 +85,7 @@ pub use routes::*;
 pub use selection::*;
 pub(crate) use state::*;
 pub use sync::*;
-pub use test_connection::*;
+pub(crate) use test_connection::*;
 
 pub(super) async fn invoke(
     state: &Arc<AppState>,

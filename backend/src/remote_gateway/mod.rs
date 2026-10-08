@@ -1033,7 +1033,11 @@ async fn api_threads(state: &State, request: &Request) -> ApiResult {
         .filter(|cursor| !cursor.is_empty())
         .map(str::to_owned);
     // 上游按最近使用倒序返回，这里按同一顺序拼多页并去重；搜索仍只取一页，避免结果过大。
-    let max_pages = if search.is_some() { 1 } else { THREAD_MAX_PAGES };
+    let max_pages = if search.is_some() {
+        1
+    } else {
+        THREAD_MAX_PAGES
+    };
     let mut collected = Vec::new();
     let mut seen = HashSet::new();
     for _ in 0..max_pages {
@@ -2485,26 +2489,21 @@ mod tests {
     #[test]
     fn home_list_keeps_only_threads_active_in_the_window() {
         let cutoff = 1_000;
-        // 窗口内（含边界）的会话留下。
-        assert!(thread_in_window(&json!({ "updatedAt": cutoff }), Some(cutoff)));
-        assert!(thread_in_window(
-            &json!({ "updatedAt": cutoff + 60 }),
-            Some(cutoff)
-        ));
-        // 更早的会话只能靠搜索找到。
-        assert!(!thread_in_window(
-            &json!({ "updatedAt": cutoff - 1 }),
-            Some(cutoff)
-        ));
+        let updated = |seconds| json!({ "updatedAt": seconds });
+        let created = |seconds| json!({ "createdAt": seconds });
+        let bare = json!({ "name": "old" });
+        let recent = cutoff + 60;
+        let stale = cutoff - 1;
+        // 窗口内（含边界）的会话留下，更早的只能靠搜索找到。
+        assert!(thread_in_window(&updated(cutoff), Some(cutoff)));
+        assert!(thread_in_window(&updated(recent), Some(cutoff)));
+        assert!(!thread_in_window(&updated(stale), Some(cutoff)));
         // 缺 updatedAt 时退回 createdAt；两个时间都没有的会话不算「最近活跃」。
-        assert!(thread_in_window(
-            &json!({ "createdAt": cutoff + 5 }),
-            Some(cutoff)
-        ));
-        assert!(!thread_in_window(&json!({ "name": "旧会话" }), Some(cutoff)));
-        assert!(!thread_in_window(&json!({ "updatedAt": 0 }), Some(cutoff)));
+        assert!(thread_in_window(&created(recent), Some(cutoff)));
+        assert!(!thread_in_window(&bare, Some(cutoff)));
+        assert!(!thread_in_window(&updated(0), Some(cutoff)));
         // 不带窗口（搜索）时一律保留。
-        assert!(thread_in_window(&json!({ "name": "旧会话" }), None));
+        assert!(thread_in_window(&bare, None));
     }
 
     #[test]
