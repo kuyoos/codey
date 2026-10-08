@@ -1,5 +1,8 @@
 allowBuilds:
   esbuild: true
+# postcss/vite 传递依赖的 source-map-js 低于 1.2.2 会命中 GHSA-68fv-2mgg-jv7q，锁到已修复版本。
+overrides:
+  source-map-js: ^1.2.2
 patchedDependencies:
   '@heroui/styles@3.2.4': patches/@heroui__styles@3.2.4.patch
   react-aria@3.52.1: patches/react-aria@3.52.1.patch

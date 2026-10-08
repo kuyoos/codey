@@ -40,6 +40,8 @@ mod process_cleanup;
 mod process_tree;
 mod prompt_optimization;
 mod provider_models;
+#[cfg(windows)]
+mod remote_gateway;
 mod route_request_log;
 mod session_index_cleanup;
 mod session_metadata;

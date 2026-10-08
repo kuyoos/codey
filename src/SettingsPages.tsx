@@ -9,6 +9,7 @@ import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-e
 import { ModelSection } from "./ModelSection";
 import { OperationsPanel } from "./OperationsPanel";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
+import { RemoteControlCard } from "./RemoteControlCard";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 
 const extensionRequest: ExtensionTransport = (request) =>
@@ -207,6 +208,7 @@ export function buildSettingsSections({
         onSubagentOptimizationChange={onSubagentOptimizationChange}
       />
     ),
+    remote: <RemoteControlCard />,
     plugins: <CodeyPluginsSection container={popupContainer} />,
     mcp: (active: boolean) => (
       <CodexExtensionsPage kind="mcp" active={active} request={extensionRequest} container={popupContainer} />

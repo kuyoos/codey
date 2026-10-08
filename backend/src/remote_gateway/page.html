@@ -1,0 +1,3104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0f1115">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Codey">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Codey 远程控制</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%235b8cff'/%3E%3Ctext x='16' y='22' font-size='17' font-weight='700' text-anchor='middle' fill='%230b1020' font-family='system-ui'%3EC%3C/text%3E%3C/svg%3E">
+  <style>
+    /* ---------- 设计变量：移动端优先的暗色主题 ---------- */
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --surface: #151920;
+      --surface-2: #1c212a;
+      --surface-3: #232a35;
+      --line: #252c37;
+      --line-2: #323b49;
+      --text: #e9ecf2;
+      --muted: #98a3b4;
+      --faint: #6b7686;
+      --accent: #5b8cff;
+      --accent-2: #8b7bff;
+      --accent-dim: rgba(91, 140, 255, .15);
+      --ok: #48d597;
+      --warn: #f5c451;
+      --danger: #f87171;
+      --radius: 14px;
+      --radius-sm: 10px;
+      --tap: 42px;
+      --shadow: 0 14px 40px rgba(0, 0, 0, .5);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    [hidden] { display: none !important; }
+    html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    button, input, select, textarea { font: inherit; color: inherit; }
+    button { background: none; border: 0; cursor: pointer; }
+    a { color: var(--accent); }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: #2b333f; border-radius: 99px; border: 3px solid transparent; background-clip: content-box;
+    }
+
+    /* ---------- 骨架 ---------- */
+    /* 固定在可见视口上：键盘弹出时脚本同步 top/height，输入栏不会被顶出屏幕或盖住正文。 */
+    .app {
+      position: fixed; left: 0; right: 0; top: 0; height: 100vh; height: 100dvh;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .topbar {
+      flex: none; display: flex; align-items: center; gap: 6px;
+      padding: calc(env(safe-area-inset-top, 0px) + 8px) 10px 8px;
+      background: rgba(15, 17, 21, .88);
+      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+      position: relative; z-index: 30;
+    }
+    .logo {
+      width: 26px; height: 26px; border-radius: 8px; flex: none;
+      background: linear-gradient(140deg, var(--accent), var(--accent-2));
+      display: grid; place-items: center; color: #0b1020; font-size: 14px; font-weight: 700;
+    }
+    .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+    .grow { flex: 1; min-width: 0; }
+    .status {
+      display: inline-flex; align-items: center; gap: 6px; flex: none;
+      padding: 3px 9px; border-radius: 999px; background: var(--surface-2);
+      color: var(--muted); font-size: 12px; white-space: nowrap;
+    }
+    .status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+    .status.on .dot { background: var(--ok); animation: pulse 2.4s ease-in-out infinite; }
+    .status.off .dot { background: var(--danger); }
+    .status.warn .dot { background: var(--warn); }
+    @keyframes pulse { 50% { opacity: .35; } }
+    .icon-btn {
+      width: var(--tap); height: var(--tap); border-radius: 12px; flex: none;
+      display: grid; place-items: center; color: var(--muted);
+    }
+    .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+    .icon-btn svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+    .chip-btn {
+      display: inline-flex; align-items: center; gap: 6px; flex: none; max-width: 40vw;
+      padding: 6px 11px; border-radius: 999px; font-size: 12.5px;
+      background: var(--surface-2); border: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    .chip-btn:hover { border-color: var(--line-2); }
+    .chip-btn .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chip-btn .k { color: var(--faint); font-size: 11px; }
+    /* 上下文圆圈：贴在标题栏右侧，只表示最近一次请求占模型窗口的比例。 */
+    .ctx-ring {
+      position: relative; flex: none; width: 28px; height: 28px;
+      display: grid; place-items: center; color: var(--accent);
+    }
+    .ctx-ring svg { width: 28px; height: 28px; transform: rotate(-90deg); }
+    .ctx-ring circle { fill: none; stroke-width: 3.5; }
+    .ctx-ring .ctx-track { stroke: var(--surface-3); }
+    .ctx-ring .ctx-fill {
+      stroke: currentColor; stroke-linecap: round;
+      stroke-dasharray: 97.39; stroke-dashoffset: 97.39;
+      transition: stroke-dashoffset .3s ease;
+    }
+    .ctx-ring.warn { color: var(--warn); }
+    .ctx-ring .ctx-pct {
+      position: absolute; color: var(--muted); font-size: 9px; font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .body { flex: 1; display: flex; min-height: 0; position: relative; }
+
+    /* ---------- 会话列表 ---------- */
+    .sidebar {
+      width: 332px; flex: none; min-height: 0; display: flex; flex-direction: column;
+      background: var(--surface); border-right: 1px solid var(--line);
+    }
+    .sidebar-head { flex: none; padding: 10px 12px; display: flex; align-items: center; gap: 8px; }
+    .search { position: relative; flex: 1; min-width: 0; }
+    .search svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; stroke: var(--faint); fill: none; stroke-width: 2; }
+    .search input {
+      width: 100%; height: 38px; padding: 0 12px 0 32px; border-radius: 11px;
+      background: var(--surface-2); border: 1px solid var(--line); outline: none;
+    }
+    .search input:focus { border-color: var(--accent); }
+    .count { flex: none; color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .thread-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 2px 8px 12px; -webkit-overflow-scrolling: touch; }
+    /* 会话按项目（工作目录）分组，组标题滚动时吸附在列表顶部。 */
+    .group-label {
+      position: sticky; top: -2px; z-index: 1; background: var(--surface);
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 12px 8px 6px; color: var(--muted); font-size: 12px; font-weight: 600;
+    }
+    .group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .group-count { margin-left: auto; flex: none; color: var(--faint); font-size: 11.5px; font-weight: 400; font-variant-numeric: tabular-nums; }
+    .thread {
+      padding: 9px 10px; border-radius: var(--radius-sm); cursor: pointer;
+      border: 1px solid transparent; display: flex; flex-direction: column; gap: 2px;
+    }
+    .thread:hover { background: var(--surface-2); }
+    .thread.active { background: var(--accent-dim); border-color: rgba(91, 140, 255, .35); }
+    .t-top { display: flex; align-items: center; gap: 6px; }
+    .t-name { font-weight: 550; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .t-prev { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .t-meta { color: var(--faint); font-size: 11.5px; display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; }
+    .t-meta .sep { opacity: .5; }
+    .run-badge {
+      display: inline-flex; align-items: center; gap: 4px; flex: none;
+      padding: 1px 7px; border-radius: 999px; font-size: 11px;
+      background: rgba(72, 213, 151, .14); color: var(--ok);
+    }
+    .run-badge i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.4s ease-in-out infinite; }
+    .sidebar-foot {
+      flex: none; padding: 10px 14px calc(env(safe-area-inset-bottom, 0px) + 12px);
+      border-top: 1px solid var(--line); color: var(--faint); font-size: 11.5px; line-height: 1.5;
+    }
+
+    /* ---------- 对话区 ---------- */
+    .chat { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
+    .chat-head {
+      flex: none; padding: 9px 14px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; gap: 10px; min-width: 0;
+    }
+    .chat-titles { min-width: 0; flex: 1; }
+    .chat-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* 这一行是「工作目录胶囊 + 模型 / 状态 / 用量」：做成 flex 才能让胶囊按剩余宽度自己截断。 */
+    .chat-meta { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--faint); font-size: 12px; }
+    .chat-meta > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .meta-sep { flex: none; }
+    .meta-path {
+      display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; min-width: 0; max-width: 320px;
+      padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12px;
+    }
+    .meta-path:hover { color: var(--text); }
+    .meta-path svg {
+      width: 13px; height: 13px; flex: none; fill: none; stroke: currentColor;
+      stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+    }
+    .meta-path .p {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+    .transcript {
+      flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch;
+      padding: 14px 14px 8px;
+    }
+    .turn { display: flex; flex-direction: column; gap: 7px; }
+    .turn + .turn { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+    .turn-head { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 11.5px; }
+    .turn-head .line { flex: 1; height: 1px; background: var(--line); }
+    .turn-head .meta { color: var(--faint); white-space: nowrap; }
+    /* 回合收尾统计：耗时、token 与思考次数放在回合末尾，运行中的那份显示在状态条里。 */
+    .turn-foot { color: var(--faint); font-size: 11.5px; margin-top: 8px; }
+    .turn.flash { animation: flash 1.2s ease; }
+    @keyframes flash { 0%, 100% { background: transparent; } 20% { background: var(--accent-dim); } }
+    .chip {
+      display: inline-flex; align-items: center; gap: 5px; padding: 1.5px 8px; border-radius: 999px;
+      font-size: 11.5px; background: var(--surface-2); color: var(--muted); white-space: nowrap;
+    }
+    .chip.ok { color: var(--ok); background: rgba(72, 213, 151, .12); }
+    .chip.run { color: var(--accent); background: var(--accent-dim); }
+    .chip.warn { color: var(--warn); background: rgba(245, 196, 81, .12); }
+    .chip.bad { color: var(--danger); background: rgba(248, 113, 113, .12); }
+    .chip.run i, .chip.run b { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.4s ease-in-out infinite; }
+    .msg.user {
+      align-self: flex-end; max-width: 88%; white-space: pre-wrap; word-break: break-word;
+      background: linear-gradient(180deg, #26324a, #202a3d);
+      border: 1px solid rgba(91, 140, 255, .28);
+      border-radius: 16px 16px 4px 16px; padding: 9px 12px;
+    }
+    .msg.agent { max-width: 100%; }
+    /* 用户消息里的图片按缩略图展示，点开看大图；取不到路径的退回张数提示。 */
+    .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .msg-image {
+      flex: none; width: 108px; height: 108px; padding: 0; overflow: hidden; border-radius: 10px;
+      border: 1px solid var(--line-2); background: var(--surface-2); display: block;
+    }
+    .msg-image img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .msg-images-note { color: var(--faint); font-size: 12px; align-self: center; }
+    /* 编辑与复制默认隐藏，悬停或聚焦时出现，触屏设备上常驻，避免正文被按钮挤占。 */
+    .msg-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; opacity: 0; transition: opacity .15s ease; }
+    .msg.user:hover .msg-actions, .msg.user:focus-within .msg-actions { opacity: 1; }
+    .msg-actions button {
+      padding: 2px 8px; border-radius: 7px; font-size: 11.5px; color: var(--muted);
+      background: rgba(255, 255, 255, .06); border: 1px solid var(--line-2);
+    }
+    .msg-actions button:hover { color: var(--text); }
+    @media (hover: none) { .msg-actions { opacity: .75; } }
+    .caret::after { content: ""; display: inline-block; width: 7px; height: 15px; margin-left: 2px; vertical-align: -2px; background: var(--accent); animation: pulse 1s steps(2, start) infinite; }
+    .more-btn {
+      align-self: center; margin: 4px 0 10px; padding: 6px 14px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--muted); font-size: 12.5px;
+    }
+    .more-hint { align-self: center; margin: 4px 0 10px; color: var(--faint); font-size: 12px; }
+
+    /* ---------- Markdown ---------- */
+    .md-p { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+    .md-h { margin: 12px 0 4px; font-weight: 650; }
+    .md-h1 { font-size: 18px; } .md-h2 { font-size: 16.5px; } .md-h3 { font-size: 15.5px; } .md-h4 { font-size: 15px; }
+    .md-list { margin: 6px 0; padding-left: 20px; }
+    .md-list li { margin: 2px 0; }
+    .md-quote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 3px solid var(--line-2); color: var(--muted); }
+    .md-code {
+      padding: 1.5px 5px; border-radius: 6px; font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 13px; background: var(--surface-3); overflow-wrap: anywhere;
+    }
+    .md-link { text-decoration: none; border-bottom: 1px solid rgba(91, 140, 255, .4); }
+    .md-del { color: var(--muted); text-decoration: line-through; }
+    .md-img { display: block; max-width: 100%; border-radius: 10px; margin: 8px 0; }
+    .md-hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+    .md-task { display: flex; align-items: flex-start; gap: 7px; }
+    .md-task input { flex: none; margin: 4px 0 0; accent-color: var(--accent); }
+    .md-table { display: block; width: 100%; margin: 9px 0; border-collapse: collapse; overflow-x: auto; font-size: 13px; }
+    .md-table th, .md-table td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; vertical-align: top; }
+    .md-table th { background: var(--surface-2); font-weight: 600; }
+    .md-list .md-list { margin: 2px 0 2px 2px; }
+    .md-h5 { font-size: 14.5px; } .md-h6 { font-size: 14px; color: var(--muted); }
+    .code-block { margin: 9px 0; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; background: #0c0e12; }
+    .code-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 5px 10px; background: var(--surface-2); border-bottom: 1px solid var(--line);
+      color: var(--faint); font-size: 11.5px;
+    }
+    .code-head .copy { color: var(--muted); font-size: 11.5px; padding: 2px 6px; border-radius: 6px; }
+    .code-head .copy:hover { background: var(--surface-3); color: var(--text); }
+    .code-block pre { margin: 0; padding: 10px 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.6; }
+    .code-block code { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; white-space: pre; }
+
+    /* ---------- 工具卡片 ---------- */
+    .card { margin: 8px 0; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); overflow: hidden; }
+    .card-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+    .card-head .icon { color: var(--faint); font-family: ui-monospace, Menlo, Consolas, monospace; flex: none; }
+    .card-head .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+    .card-sub { padding: 0 10px 8px; color: var(--faint); font-size: 11.5px; word-break: break-all; }
+    .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+    .card-pre {
+      margin: 0; padding: 9px 10px; background: #0c0e12; border-top: 1px solid var(--line);
+      font-size: 12.5px; white-space: pre-wrap; word-break: break-word; max-height: 340px; overflow: auto;
+    }
+    details.raw { border-top: 1px solid var(--line); }
+    details.raw > summary {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 10px; cursor: pointer; color: var(--muted); font-size: 12.5px; list-style: none;
+    }
+    details.raw > summary::-webkit-details-marker { display: none; }
+    details.raw > summary::before { content: "▸"; color: var(--faint); flex: none; }
+    details.raw[open] > summary::before { content: "▾"; }
+    .raw-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    summary .copy { flex: none; color: var(--muted); font-size: 11.5px; padding: 2px 7px; border-radius: 6px; }
+    summary .copy:hover { background: var(--surface-3); color: var(--text); }
+    /* 工具、命令、文件改动与图片都只留一行计数，和聊天里的元信息一样轻。 */
+    .tool-note {
+      display: inline-flex; align-items: center; gap: 6px; align-self: flex-start;
+      margin: 4px 0; padding: 3px 10px; border-radius: 999px;
+      background: var(--surface-2); color: var(--faint); font-size: 12px;
+    }
+    .tool-note .icon { color: var(--faint); }
+    details.card {
+      border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface);
+      overflow: hidden; margin: 8px 0;
+    }
+    details.card > summary {
+      display: flex; align-items: center; gap: 8px; padding: 9px 10px;
+      cursor: pointer; color: var(--muted); font-size: 13px; list-style: none;
+    }
+    details.card > summary::-webkit-details-marker { display: none; }
+    details.card > summary::before { content: "▸"; color: var(--faint); flex: none; }
+    details.card[open] > summary::before { content: "▾"; }
+    details.card[open] > summary { border-bottom: 1px solid var(--line); }
+    details.card .icon { color: var(--faint); flex: none; }
+
+    /* ---------- 审批 ---------- */
+    .approval-host { flex: none; padding: 0 14px; }
+    .approval-card {
+      margin: 8px 0; border: 1px solid rgba(245, 196, 81, .45); background: rgba(245, 196, 81, .09);
+      border-radius: var(--radius); padding: 10px 12px;
+    }
+    .approval-card .label { color: var(--warn); font-size: 12.5px; font-weight: 600; }
+    .approval-card .body { margin: 4px 0 8px; font-size: 13px; word-break: break-word; }
+    .approval-card pre { margin: 4px 0 8px; padding: 8px; background: #0c0e12; border-radius: 8px; font-size: 12px; max-height: 180px; overflow: auto; white-space: pre-wrap; }
+    .approval-card .actions { display: flex; gap: 8px; }
+    .approval-card .actions button { flex: 1; height: 38px; border-radius: 10px; border: 1px solid var(--line-2); }
+    .approval-card .actions .allow { background: var(--accent); border-color: var(--accent); color: #08101c; font-weight: 600; }
+
+    /* ---------- 输入区 ---------- */
+    /* 排队待发的消息：贴在输入框上方，可插队立即执行或删除。 */
+    .queue-box {
+      flex: none; border-top: 1px solid var(--line);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+    }
+    .queue-box:not([hidden]) + .runbar { border-top: 0; }
+    .queue-head { padding: 5px 12px 0; color: var(--faint); font-size: 11.5px; }
+    .queue-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; }
+    .queue-text { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .queue-actions { flex: none; display: flex; gap: 4px; }
+    .queue-btn { padding: 3px 9px; border-radius: 8px; background: var(--surface-3); color: var(--text); font-size: 11.5px; }
+    .queue-btn:hover { background: var(--line-2); }
+    .queue-btn.danger { color: var(--danger); }
+    /* 运行状态条：紧贴输入框上方，回合进行中显示用时、token 与思考次数。 */
+    .runbar {
+      flex: none; display: flex; align-items: center; gap: 8px;
+      padding: 7px 12px; border-top: 1px solid var(--line);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      color: var(--muted); font-size: 12.5px;
+    }
+    .runbar .run-dot {
+      width: 7px; height: 7px; flex: none; border-radius: 50%;
+      background: var(--accent); animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse { 50% { opacity: .25; } }
+    .runbar .run-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* 连接状态条：贴在输入框上方，回合运行时让位给运行状态条，避免两行状态叠在一起。 */
+    .connbar {
+      flex: none; display: flex; align-items: center; gap: 8px;
+      padding: 6px 12px; border-top: 1px solid var(--line);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      color: var(--muted); font-size: 12.5px;
+    }
+    /* 这里只留小圆点与文字，不再画成顶部那种胶囊。 */
+    .connbar .status { padding: 0; background: transparent; font-size: 12.5px; }
+    .runbar:not([hidden]) ~ .connbar { display: none; }
+    /* 相邻的状态条与输入框只留一条边线。 */
+    .runbar:not([hidden]) ~ .composer,
+    .runbar:not([hidden]) ~ .attach-bar,
+    .connbar:not([hidden]) ~ .composer,
+    .connbar:not([hidden]) ~ .attach-bar,
+    .attach-bar:not([hidden]) + .composer,
+    .queue-box:not([hidden]) ~ .connbar { border-top: 0; }
+    /* 待发送的图片：和状态条一样贴在输入框上方，横向滚动不换行。 */
+    .attach-bar {
+      flex: none; display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; overflow-x: auto; overscroll-behavior-x: contain;
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      border-top: 1px solid var(--line); -webkit-overflow-scrolling: touch;
+    }
+    .attach-thumb {
+      position: relative; flex: none; width: 54px; height: 54px; overflow: hidden;
+      border-radius: 10px; border: 1px solid var(--line-2); background: var(--surface-2);
+    }
+    .attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .attach-thumb.pending { display: grid; place-items: center; color: var(--faint); font-size: 10.5px; }
+    .attach-remove {
+      position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%;
+      display: grid; place-items: center; background: rgba(15, 17, 21, .82); color: var(--text);
+      font-size: 12px; line-height: 1;
+    }
+    .attach-hint { flex: none; color: var(--faint); font-size: 11.5px; }
+    .composer {
+      flex: none; display: flex; align-items: flex-end; gap: 8px;
+      padding: 9px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
+      background: rgba(15, 17, 21, .92); backdrop-filter: blur(14px);
+      border-top: 1px solid var(--line);
+      position: relative;
+    }
+    .composer textarea {
+      flex: 1; min-width: 0; resize: none; max-height: 40vh; min-height: 42px;
+      padding: 10px 12px; border-radius: 13px; outline: none;
+      background: var(--surface-2); border: 1px solid var(--line); line-height: 1.5;
+    }
+    .composer textarea:focus { border-color: var(--accent); }
+    .composer .cmd-btn {
+      width: var(--tap); height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
+      background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-weight: 600;
+    }
+    .composer .cmd-btn:active { color: var(--accent); border-color: var(--accent); }
+    /* 图片按钮比「/」窄一点，手机上四个按钮加输入框才不会太挤。 */
+    .composer .attach-btn {
+      width: 38px; height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
+      background: var(--surface-2); border: 1px solid var(--line); color: var(--muted);
+    }
+    .composer .attach-btn:active { color: var(--accent); border-color: var(--accent); }
+    .composer .attach-btn[disabled] { opacity: .45; }
+    .composer .send {
+      width: var(--tap); height: var(--tap); flex: none; border-radius: 13px; display: grid; place-items: center;
+      background: var(--accent); color: #08101c;
+    }
+    .composer .send:disabled { opacity: .45; }
+    .composer .stop { background: var(--surface-2); border: 1px solid var(--line-2); color: var(--danger); border-radius: 13px; }
+    .composer svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ---------- 斜杠命令补全 ---------- */
+    .slash {
+      position: absolute; left: 12px; right: 12px; bottom: calc(100% + 8px); z-index: 15;
+      max-height: min(46vh, 320px); overflow-y: auto; overscroll-behavior: contain;
+      background: var(--surface-2); border: 1px solid var(--line-2); border-radius: var(--radius);
+      box-shadow: var(--shadow); animation: rise .14s ease;
+    }
+    .slash-item {
+      display: flex; gap: 10px; width: 100%; text-align: left;
+      padding: 10px 12px; border-bottom: 1px solid var(--line);
+    }
+    .slash-item:last-child { border-bottom: 0; }
+    .slash-item.active, .slash-item:hover { background: var(--surface-3); }
+    .slash-cmd { flex: none; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: var(--accent); }
+    .slash-body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
+    .slash-title { font-size: 13.5px; }
+    .slash-desc { color: var(--faint); font-size: 12px; line-height: 1.45; }
+    .status-list { max-height: min(56vh, 440px); overflow-y: auto; margin: 2px 0 10px; }
+    .status-row { display: flex; gap: 12px; padding: 9px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .status-row:last-child { border-bottom: 0; }
+    .status-row .k { flex: none; width: 76px; color: var(--muted); }
+    .status-row .v { min-width: 0; flex: 1; word-break: break-all; }
+    /* 工作目录：完整路径加目录里的一层子项，只读展示。 */
+    .files-path {
+      margin: 2px 0 8px; padding: 7px 9px; border-radius: 9px; background: var(--surface-2);
+      color: var(--muted); font-size: 12px; word-break: break-all;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+    .files-summary { color: var(--faint); font-size: 11.5px; margin-bottom: 4px; }
+    .files-list { max-height: min(46vh, 360px); overflow-y: auto; margin: 0 0 10px; }
+    .file-row { display: flex; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .file-row:last-child { border-bottom: 0; }
+    .file-kind { flex: none; width: 14px; color: var(--faint); text-align: center; }
+    .file-row.dir .file-kind { color: var(--accent); }
+    .file-row.dir .file-name { font-weight: 550; }
+    .file-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-size { flex: none; color: var(--faint); font-size: 11.5px; }
+    .status-row .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .to-bottom {
+      position: absolute; right: 16px; bottom: 84px; width: 38px; height: 38px; border-radius: 50%;
+      background: var(--surface-3); border: 1px solid var(--line-2); box-shadow: var(--shadow);
+      display: grid; place-items: center; color: var(--muted); z-index: 12;
+    }
+    .to-bottom .new { position: absolute; top: -2px; right: -2px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); }
+
+    /* ---------- 弹层、提示 ---------- */
+    .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 40; animation: fade .16s ease; }
+    @keyframes fade { from { opacity: 0; } }
+    /* 全屏看图：铺满视口，点任意处或右上角关闭。 */
+    .img-viewer {
+      position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; animation: fade .16s ease;
+      background: rgba(8, 10, 14, .95);
+      padding: calc(env(safe-area-inset-top, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+    }
+    .img-viewer img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+    .img-viewer-close {
+      position: absolute; top: calc(env(safe-area-inset-top, 0px) + 10px); right: 12px;
+      width: 34px; height: 34px; border-radius: 50%; background: rgba(255, 255, 255, .16);
+      color: var(--text); font-size: 18px; line-height: 1; display: grid; place-items: center;
+    }
+    /* 整张 sheet 铺满全屏，但不吃指针事件：面板以外的点击落到遮罩上直接关闭。 */
+    .sheet { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-end; justify-content: center; pointer-events: none; }
+    .sheet-panel {
+      width: 100%; max-width: 520px; background: var(--surface); border: 1px solid var(--line);
+      border-radius: 18px 18px 0 0; padding: 10px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+      box-shadow: var(--shadow); animation: rise .2s ease; pointer-events: auto;
+    }
+    @keyframes rise { from { transform: translateY(16px); opacity: .4; } }
+    .grabber { width: 38px; height: 4px; border-radius: 99px; background: var(--line-2); margin: 2px auto 12px; }
+    .sheet-title { font-weight: 600; margin-bottom: 10px; }
+    .field { display: block; margin-bottom: 12px; }
+    .field > span { display: block; color: var(--muted); font-size: 12.5px; margin-bottom: 5px; }
+    .field select, .field input {
+      width: 100%; height: 42px; padding: 0 10px; border-radius: 11px;
+      background: var(--surface-2); border: 1px solid var(--line); outline: none;
+    }
+    .sheet-info { color: var(--faint); font-size: 12px; line-height: 1.7; margin-bottom: 8px; word-break: break-all; }
+    .sheet-note { color: var(--faint); font-size: 11.5px; margin-bottom: 12px; }
+    .sheet-close {
+      width: 100%; height: 44px; border-radius: 12px; background: var(--accent); color: #08101c; font-weight: 600;
+    }
+    /* 运行中再次发送：选择把消息并入当前回合，还是排队等回合结束后发送。 */
+    .sheet-actions { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+    .choice {
+      display: block; width: 100%; text-align: left; padding: 11px 12px; border-radius: 12px;
+      background: var(--surface-2); border: 1px solid var(--line); color: var(--text);
+    }
+    .choice:hover { background: var(--surface-3); }
+    .choice-title { display: block; font-weight: 600; font-size: 13.5px; }
+    .choice-desc { display: block; color: var(--faint); font-size: 12px; line-height: 1.5; margin-top: 2px; }
+    .sheet-close.ghost { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); }
+    /* 会话导航：列出每个回合的用户输入，点击跳到对应位置。 */
+    .nav-list { max-height: min(56vh, 440px); overflow-y: auto; margin: 2px 0 10px; }
+    .nav-item {
+      display: flex; gap: 10px; width: 100%; text-align: left; padding: 9px 6px;
+      border-bottom: 1px solid var(--line); background: transparent; color: var(--text);
+    }
+    .nav-item:hover { background: var(--surface-2); }
+    .nav-item .n {
+      flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--surface-3);
+      color: var(--faint); font-size: 11.5px; display: grid; place-items: center;
+    }
+    .nav-body { min-width: 0; flex: 1; }
+    .nav-text {
+      font-size: 13.5px; line-height: 1.5; overflow: hidden; display: -webkit-box;
+      -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
+    .nav-meta { color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+    .toast-host { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(env(safe-area-inset-bottom, 0px) + 74px); z-index: 60; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
+    .toast {
+      pointer-events: auto; max-width: 88vw; padding: 9px 14px; border-radius: 12px; font-size: 13px;
+      background: #2a3240; border: 1px solid var(--line-2); box-shadow: var(--shadow); animation: rise .18s ease;
+    }
+    .toast.bad { background: #3a2226; border-color: rgba(248, 113, 113, .5); }
+
+    /* ---------- 空状态与骨架 ---------- */
+    .empty { color: var(--muted); text-align: center; padding: 34px 18px; font-size: 13.5px; }
+    .empty .big { font-size: 15px; color: var(--text); margin-bottom: 6px; }
+    .skeleton { border-radius: var(--radius-sm); background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2)); background-size: 200% 100%; animation: slide 1.3s linear infinite; height: 62px; margin: 6px 4px; }
+    @keyframes slide { to { background-position: -200% 0; } }
+
+    /* ---------- 令牌门 ---------- */
+    .gate { position: fixed; inset: 0; display: grid; place-items: center; padding: 20px; background: var(--bg); z-index: 70; }
+    .gate-card { width: 100%; max-width: 420px; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 22px; }
+    .gate-card h2 { margin: 0 0 6px; font-size: 17px; }
+    .gate-card p { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+    .gate-card input { width: 100%; height: 44px; padding: 0 12px; border-radius: 11px; background: var(--surface-2); border: 1px solid var(--line); outline: none; }
+    .gate-card button { width: 100%; height: 44px; margin-top: 12px; border-radius: 11px; background: var(--accent); color: #08101c; font-weight: 600; }
+    .gate-card code { background: var(--surface-3); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+
+    /* 会话页不再单独占一条顶栏：返回按钮并进标题行，标题行自己顶到安全区。 */
+    .app[data-view="chat"] .topbar { display: none; }
+    .app[data-view="chat"] .chat-head { padding-top: calc(env(safe-area-inset-top, 0px) + 9px); }
+    /* 连接状态只显示一处：列表页在顶栏，进入会话后移到输入框上方。 */
+    .app[data-view="list"] .connbar { display: none; }
+
+    /* ---------- 响应式：手机上是「列表 ⇄ 对话」两屏 ---------- */
+    @media (max-width: 860px) {
+      body { font-size: 16px; }
+      .composer textarea, .search input, .field select, .field input, .gate-card input { font-size: 16px; }
+      .sidebar { position: absolute; inset: 0; width: 100%; border-right: 0; z-index: 20; }
+      .back-btn { display: none; }
+      .app[data-view="chat"] .back-btn { display: grid; }
+      .app[data-view="chat"] .sidebar { display: none; }
+      .app[data-view="list"] .chat { display: none; }
+      /* 返回按钮并入标题行后横向空间变紧：收窄间距与模型胶囊，尽量把标题留给用户。 */
+      .chat-head { padding: 8px 10px; gap: 6px; }
+      .chip-btn { max-width: 40vw; }
+      .chip-btn .k { display: none; }
+      .transcript { padding: 12px 12px 4px; }
+      .msg.user { max-width: 92%; }
+      .to-bottom { bottom: 78px; right: 12px; }
+    }
+    @media (min-width: 861px) {
+      .back-btn { display: none; }
+      .sheet { align-items: center; }
+      .sheet-panel { border-radius: 18px; border-bottom: 1px solid var(--line); padding-bottom: 16px; }
+      .grabber { display: none; }
+    }
+    /* 宽屏时把正文收窄居中，和常见聊天网页一样保持行宽可读。 */
+    @media (min-width: 1100px) {
+      .transcript, .composer, .chat-head, .approval-host, .runbar, .connbar, .attach-bar, .queue-head, .queue-item {
+        padding-left: max(14px, calc((100% - 860px) / 2));
+        padding-right: max(14px, calc((100% - 860px) / 2));
+      }
+      .slash {
+        left: max(14px, calc((100% - 860px) / 2));
+        right: max(14px, calc((100% - 860px) / 2));
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::after, *::before { animation: none !important; scroll-behavior: auto !important; }
+    }
+  </style>
+</head>
+
+<body>
+<div class="app" id="app" data-view="list">
+  <header class="topbar">
+    <span class="logo" aria-hidden="true">C</span>
+    <span class="brand">Codey</span>
+    <span class="status status-top" id="statusPillTop"><span class="dot"></span><span id="statusTextTop">连接中…</span></span>
+    <span class="grow"></span>
+  </header>
+
+  <div class="body">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <label class="search">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          <input id="search" type="search" placeholder="搜索对话标题" enterkeyhint="search" aria-label="搜索对话">
+        </label>
+        <span class="count" id="threadCount"></span>
+      </div>
+      <div class="thread-list" id="threads"></div>
+      <div class="sidebar-foot">令牌等同本机 Codex 的文件、命令与配置权限，请只在可信网络中使用并当作密码保管。</div>
+    </aside>
+
+    <section class="chat" id="chatPane">
+      <div class="chat-head">
+        <button class="icon-btn back-btn" id="backBtn" type="button" aria-label="返回会话列表">
+          <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+        <div class="chat-titles">
+          <div class="chat-title" id="chatTitle">选择一个对话</div>
+          <div class="chat-meta" id="chatMeta"></div>
+        </div>
+        <span class="ctx-ring" id="ctxRing" hidden aria-label="上下文用量">
+          <svg viewBox="0 0 36 36" aria-hidden="true">
+            <circle class="ctx-track" cx="18" cy="18" r="15.5"/>
+            <circle class="ctx-fill" cx="18" cy="18" r="15.5"/>
+          </svg>
+          <span class="ctx-pct" id="ctxPct"></span>
+        </span>
+        <button class="icon-btn" id="navBtn" type="button" aria-label="会话导航">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
+        </button>
+        <button class="chip-btn" id="modelChip" type="button" aria-label="模型与推理强度">
+          <span class="k">模型</span><span class="t" id="modelChipText">跟随会话</span>
+        </button>
+      </div>
+      <div class="approval-host" id="approvalHost"></div>
+      <div class="transcript" id="transcript"></div>
+      <button class="to-bottom" id="toBottom" type="button" hidden aria-label="回到最新">
+        <svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 5v14"/><path d="M6 13l6 6 6-6"/></svg>
+        <span class="new" hidden></span>
+      </button>
+      <div class="queue-box" id="queueBox" hidden></div>
+      <div class="runbar" id="runbar" hidden></div>
+      <div class="connbar" id="connBar">
+        <span class="status" id="statusPill"><span class="dot"></span><span id="statusText">连接中…</span></span>
+      </div>
+      <div class="attach-bar" id="attachBar" hidden></div>
+      <form class="composer" id="composer">
+        <button class="attach-btn" id="imgBtn" type="button" aria-label="添加图片">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="M4 18l5-5 4 4 3-3 4 4"/></svg>
+        </button>
+        <button class="cmd-btn" id="cmdBtn" type="button" aria-label="命令">/</button>
+        <textarea id="input" rows="1" placeholder="输入消息…" enterkeyhint="send" aria-label="消息内容"></textarea>
+        <button class="icon-btn stop" id="stopBtn" type="button" hidden aria-label="停止生成">
+          <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" style="fill:currentColor;stroke:none"/></svg>
+        </button>
+        <button class="send" id="sendBtn" type="submit" aria-label="发送">
+          <svg viewBox="0 0 24 24"><path d="M5 12h13"/><path d="M12 5l7 7-7 7"/></svg>
+        </button>
+        <div class="slash" id="slashPanel" hidden>
+          <div id="slashList" role="listbox" aria-label="可用命令"></div>
+        </div>
+        <input id="fileInput" type="file" accept="image/*" multiple hidden>
+      </form>
+    </section>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" hidden></div>
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="会话设置">
+    <div class="grabber"></div>
+    <div class="sheet-title">模型与推理强度</div>
+    <label class="field"><span>模型</span><select id="model"></select></label>
+    <label class="field"><span>推理强度</span><select id="effort"></select></label>
+    <div class="sheet-info" id="sheetInfo"></div>
+    <div class="sheet-note">设置随下一条消息生效，并沿用到该会话的后续回合。</div>
+    <button class="sheet-close" id="sheetClose" type="button">完成</button>
+  </div>
+</div>
+
+<div class="overlay" id="navOverlay" hidden></div>
+<div class="sheet" id="navSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="会话导航">
+    <div class="grabber"></div>
+    <div class="sheet-title">会话导航</div>
+    <div class="nav-list" id="navList"></div>
+    <button class="sheet-close" id="navClose" type="button">关闭</button>
+  </div>
+</div>
+
+<div class="overlay" id="statusOverlay" hidden></div>
+<div class="sheet" id="statusSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="会话状态">
+    <div class="grabber"></div>
+    <div class="sheet-title">会话状态</div>
+    <div class="status-list" id="statusList"></div>
+    <div class="sheet-note">用量来自本机落盘的会话记录，随回合完成更新。</div>
+    <button class="sheet-close" id="statusClose" type="button">关闭</button>
+  </div>
+</div>
+
+<div class="overlay" id="filesOverlay" hidden></div>
+<div class="sheet" id="filesSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="工作目录">
+    <div class="grabber"></div>
+    <div class="sheet-title">工作目录</div>
+    <div class="files-path" id="filesPath"></div>
+    <div class="files-summary" id="filesSummary"></div>
+    <div class="files-list" id="filesList"></div>
+    <div class="sheet-note">只列出这一层，仅供查看。</div>
+    <button class="sheet-close" id="filesClose" type="button">关闭</button>
+  </div>
+</div>
+
+<div class="overlay" id="sendModeOverlay" hidden></div>
+<div class="sheet" id="sendModeSheet" hidden>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="发送方式">
+    <div class="grabber"></div>
+    <div class="sheet-title">当前回合运行中</div>
+    <div class="sheet-note">这条消息要如何发送？</div>
+    <div class="sheet-actions">
+      <button class="choice" id="steerChoice" type="button">
+        <span class="choice-title">引导当前回合</span>
+        <span class="choice-desc">并入正在运行的回合，让模型立刻调整方向</span>
+      </button>
+      <button class="choice" id="queueChoice" type="button">
+        <span class="choice-title">排队等待</span>
+        <span class="choice-desc">先收下，等当前回合结束后自动发送</span>
+      </button>
+    </div>
+    <button class="sheet-close ghost" id="sendModeClose" type="button">取消</button>
+  </div>
+</div>
+
+<div class="toast-host" id="toastHost"></div>
+
+<div class="img-viewer" id="imgViewer" hidden>
+  <img id="imgViewerImg" alt="图片预览">
+  <button class="img-viewer-close" id="imgViewerClose" type="button" aria-label="关闭图片">×</button>
+</div>
+
+<div class="gate" id="gate" hidden>
+  <div class="gate-card">
+    <h2>需要访问令牌</h2>
+    <p>请打开 Codey 控制台生成的远程控制链接，或在此粘贴 <code>.codey-remote-gateway.url</code> 中的令牌。</p>
+    <input id="gateToken" type="password" placeholder="访问令牌" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="访问令牌">
+    <button id="gateSave" type="button">进入</button>
+  </div>
+</div>
+
+<noscript><div class="empty">此页面需要启用 JavaScript。</div></noscript>
+
+<script>
+"use strict";
+
+// 只有网页能给出合法决策的审批才展示；其余反向请求由桌面端应答。
+const APPROVAL_METHODS = new Set([
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+]);
+const TOKEN_KEY = "codey_gateway_token";
+const LAST_THREAD_KEY = "codey_gateway_last_thread";
+// 网页只保留最近几个回合，翻到上限就不再往回取，避免长会话把正文堆满页面。
+const TURNS_PAGE = 5;
+const MAX_TURNS = 15;
+// 网页可触发的斜杠命令，一一对应网关的命令白名单，不会把输入原样透传给上游。
+const SLASH_COMMANDS = [
+  { name: "compact", usage: "/compact", title: "压缩上下文", desc: "把较早的对话压成摘要，腾出上下文空间" },
+  { name: "review", usage: "/review", title: "代码评审", desc: "评审工作区里还没有提交的改动" },
+  { name: "rename", usage: "/rename", title: "重命名会话", desc: "修改当前会话的标题", arg: "新标题" },
+  { name: "status", usage: "/status", title: "会话状态", desc: "查看模型、目录与累计用量" },
+];
+
+const state = {
+  token: "",
+  threads: [],
+  threadWindowDays: 0,
+  models: [],
+  threadId: null,
+  detail: null,
+  turns: [],
+  nextCursor: null,
+  activeTurnId: null,
+  activeTurn: null,
+  runTimer: null,
+  runTicks: 0,
+  autoScroll: true,
+  live: new Map(),
+  usage: { total: null, turns: {} },
+  attachments: [],
+  uploads: 0,
+  attachSeq: 0,
+  queue: [],
+  approvals: [],
+  reloadTimer: null,
+  searchTimer: null,
+  slashIndex: 0,
+  slashMatches: [],
+  command: null,
+  commandTimer: null,
+  loaded: false,
+};
+
+const $ = (id) => document.getElementById(id);
+const isMobile = () => window.matchMedia("(max-width: 860px)").matches;
+
+/* ================= 基础工具 ================= */
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function mono(text) {
+  return el("span", "mono", text);
+}
+
+// 静态图标都写在标记里，只有运行时才生成的节点需要自己拼一个；沿用同一套描边风格。
+function svgIcon(d) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", d);
+  svg.appendChild(path);
+  return svg;
+}
+
+/* 手机上软键盘收起会把整个输入区往下挪：合成器在 touchend 时按新位置重新命中元素，
+   click 就落到正文上而不是按钮上，「/」和命令项因此点了没反应。这里自己判定点按：
+   pointerdown 记下按下位置，pointerup 仍在原处抬起才算数，与按钮有没有被挪走无关。
+   键盘触发（detail 为 0 的 click）仍走原生路径，保证读屏与键盘可用。 */
+const TAP_HANDLERS = new Map();
+
+function onTap(selector, handler) {
+  TAP_HANDLERS.set(selector, handler);
+}
+
+function tapTarget(node) {
+  if (!node || typeof node.closest !== "function") return null;
+  for (const selector of TAP_HANDLERS.keys()) {
+    const target = node.closest(selector);
+    if (target) return { selector, target };
+  }
+  return null;
+}
+
+let tapStart = null;
+
+function bindTap() {
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || (event.pointerType === "mouse" && event.button !== 0)) return;
+    const hit = tapTarget(event.target);
+    if (!hit) return;
+    // 不把焦点交给按钮：输入框保持聚焦，软键盘就不会收起把按钮挪走。
+    event.preventDefault();
+    tapStart = {
+      selector: hit.selector,
+      node: hit.target,
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      at: Date.now(),
+    };
+  });
+  window.addEventListener("pointerup", (event) => {
+    const start = tapStart;
+    tapStart = null;
+    if (!start || event.pointerId !== start.id) return;
+    if (Date.now() - start.at > 800) return;
+    if (Math.abs(event.clientX - start.x) > 12 || Math.abs(event.clientY - start.y) > 12) return;
+    const handler = TAP_HANDLERS.get(start.selector);
+    if (handler) handler(start.node, event);
+  });
+  window.addEventListener("pointercancel", () => {
+    tapStart = null;
+  });
+  document.addEventListener("click", (event) => {
+    if (event.detail !== 0) return;
+    const hit = tapTarget(event.target);
+    if (!hit) return;
+    const handler = TAP_HANDLERS.get(hit.selector);
+    if (handler) handler(hit.target, event);
+  });
+}
+
+function preview(text, limit) {
+  const flat = String(text || "").replace(/\s+/g, " ").trim();
+  const max = limit || 90;
+  return flat.length > max ? flat.slice(0, max) + "…" : flat;
+}
+
+function json(value) {
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
+
+function pad(value) {
+  return value < 10 ? "0" + value : String(value);
+}
+
+function clock(date) {
+  return pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
+function sameDay(left, right) {
+  return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
+}
+
+// 会话列表里的相对时间，和手机聊天应用的习惯一致。
+function relTime(seconds) {
+  if (!seconds) return "";
+  const date = new Date(seconds * 1000);
+  const now = new Date();
+  const diff = (Date.now() - date.getTime()) / 1000;
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+  if (sameDay(date, now)) return "今天 " + clock(date);
+  const yesterday = new Date(now.getTime() - 86400000);
+  if (sameDay(date, yesterday)) return "昨天 " + clock(date);
+  if (diff < 604800) return Math.floor(diff / 86400) + " 天前";
+  return (date.getMonth() + 1) + "月" + date.getDate() + "日";
+}
+
+// 会话按工作目录归属到项目，网页和桌面端一样以项目分组；没有目录的归到「其他」。
+function projectOf(thread) {
+  const cwd = thread && thread.cwd ? String(thread.cwd).replace(/[\\/]+$/, "") : "";
+  if (!cwd) return { key: "", name: "其他", path: "" };
+  const name = cwd.split(/[\\/]/).pop() || cwd;
+  return { key: cwd.toLowerCase(), name, path: cwd };
+}
+
+/* token 与耗时都来自 app-server 的回合数据与落盘用量，这里只做紧凑展示。 */
+function formatTokens(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return "";
+  if (count < 1000) return String(count);
+  if (count < 1000000) return (count / 1000).toFixed(count < 10000 ? 1 : 0) + "k";
+  return (count / 1000000).toFixed(2) + "M";
+}
+
+function formatDuration(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const total = Math.round(value / 1000);
+  if (total < 60) return total + " 秒";
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return minutes + " 分 " + (total % 60) + " 秒";
+  return Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分";
+}
+
+// 工作目录里的文件大小，只给个量级，不需要精确到字节。
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(bytes < 10240 ? 1 : 0) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
+}
+
+// 回合收尾统计：耗时、token 与思考次数都放在回合末尾；运行中的那份由输入框上方的状态条显示。
+function turnStats(turn) {
+  const parts = [];
+  const duration = formatDuration(turn && turn.durationMs);
+  if (duration) parts.push("耗时 " + duration);
+  const usage = state.usage.turns[(turn && turn.id) || ""];
+  const tokens = usage && formatTokens(usage.total_tokens);
+  if (tokens) parts.push(tokens + " tokens");
+  const thoughts = ((turn && turn.items) || []).filter((item) => item && item.type === "reasoning").length;
+  if (thoughts) parts.push("思考 " + thoughts + " 次");
+  return parts.join(" · ");
+}
+
+async function copyText(text, label) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.top = "-1000px";
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    toast((label || "已复制") + "到剪贴板");
+  } catch {
+    toast("复制失败，请长按手动复制", "bad");
+  }
+}
+
+function toast(message, kind) {
+  const node = el("div", "toast" + (kind ? " " + kind : ""), message);
+  node.addEventListener("click", () => node.remove());
+  $("toastHost").appendChild(node);
+  setTimeout(() => node.remove(), 4200);
+}
+
+function setStatus(text, kind) {
+  $("statusText").textContent = text;
+  $("statusPill").className = "status" + (kind ? " " + kind : "");
+  // 列表页顶栏里的同一状态，两处一起更新；显示哪一处由当前视图的样式决定。
+  $("statusTextTop").textContent = text;
+  $("statusPillTop").className = "status status-top" + (kind ? " " + kind : "");
+}
+
+/* ================= 接口 ================= */
+
+async function api(path, options) {
+  const response = await fetch(path, {
+    ...(options || {}),
+    headers: {
+      Authorization: "Bearer " + state.token,
+      "Content-Type": "application/json",
+      ...((options && options.headers) || {}),
+    },
+  });
+  const text = await response.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = { error: { message: text } }; }
+  if (response.status === 401) {
+    sessionStorage.removeItem(TOKEN_KEY);
+    showGate("访问令牌无效或不匹配，请粘贴控制台里的完整链接。");
+    throw new Error("访问令牌无效");
+  }
+  if (!response.ok) {
+    const error = body && body.error;
+    throw new Error((error && (error.message || JSON.stringify(error))) || ("HTTP " + response.status));
+  }
+  return body;
+}
+
+/* ================= Markdown 渲染（只生成 DOM，不注入 HTML） ================= */
+
+// 行内标记：粗斜体 / 粗体 / 斜体 / 删除线 / 行内代码 / 图片 / 链接 / 裸链接。
+// 刻意不解析 _强调_，避免把 foo_bar 这类标识符拆成斜体。
+const INLINE = /(\*\*\*[^*\n]+\*\*\*|\*\*[^*\n]+\*\*|~~[^~\n]+~~|`[^`\n]+`|!\[[^\]\n]*\]\([^)\s]+\)|\[[^\]\n]*\]\([^)\s]+\)|https?:\/\/[^\s<>()]+|\*[^*\n]+\*)/g;
+
+/** 只放行常规协议，避免 javascript: 之类的链接。 */
+function safeHref(url) {
+  return /^(https?:|mailto:)/i.test(url) ? url : null;
+}
+
+function externalLink(label, url) {
+  const href = safeHref(url);
+  if (!href) return document.createTextNode(label || url);
+  const link = el("a", "md-link", label || href);
+  link.href = href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function renderInline(parent, text) {
+  const value = String(text === undefined || text === null ? "" : text);
+  let last = 0;
+  let match;
+  INLINE.lastIndex = 0;
+  while ((match = INLINE.exec(value)) !== null) {
+    if (match.index > last) parent.appendChild(document.createTextNode(value.slice(last, match.index)));
+    const token = match[0];
+    if (token.startsWith("***")) {
+      const strong = el("strong");
+      strong.appendChild(el("em", null, token.slice(3, -3)));
+      parent.appendChild(strong);
+    } else if (token.startsWith("**")) {
+      parent.appendChild(el("strong", null, token.slice(2, -2)));
+    } else if (token.startsWith("~~")) {
+      parent.appendChild(el("span", "md-del", token.slice(2, -2)));
+    } else if (token.startsWith("`")) {
+      parent.appendChild(el("code", "md-code", token.slice(1, -1)));
+    } else if (token.startsWith("![")) {
+      const parts = /^!\[([^\]]*)\]\(([^)\s]+)\)$/.exec(token);
+      const href = parts && safeHref(parts[2]);
+      if (href) {
+        const image = el("img", "md-img");
+        image.src = href;
+        image.alt = parts[1] || "";
+        image.loading = "lazy";
+        parent.appendChild(image);
+      } else {
+        parent.appendChild(document.createTextNode(token));
+      }
+    } else if (token.startsWith("[")) {
+      const parts = /^\[([^\]]*)\]\(([^)\s]+)\)$/.exec(token);
+      parent.appendChild(parts ? externalLink(parts[1], parts[2]) : document.createTextNode(token));
+    } else if (token.startsWith("http")) {
+      parent.appendChild(externalLink(token, token));
+    } else {
+      parent.appendChild(el("em", null, token.slice(1, -1)));
+    }
+    last = match.index + token.length;
+  }
+  if (last < value.length) parent.appendChild(document.createTextNode(value.slice(last)));
+}
+
+function codeBlock(language, code) {
+  const wrap = el("div", "code-block");
+  const head = el("div", "code-head");
+  head.appendChild(el("span", null, language || "代码"));
+  const copy = el("button", "copy", "复制");
+  copy.type = "button";
+  copy.addEventListener("click", () => copyText(code));
+  head.appendChild(copy);
+  wrap.appendChild(head);
+  const pre = el("pre");
+  pre.appendChild(el("code", null, code));
+  wrap.appendChild(pre);
+  return wrap;
+}
+
+const FENCE = /^\s*(```|~~~)\s*([A-Za-z0-9_+#.-]*)\s*$/;
+const HEADING = /^(#{1,6})\s+(.*)$/;
+const HR = /^\s*([-*_])\s*(?:\1\s*){2,}$/;
+const BULLET = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+const QUOTE = /^\s*>\s?/;
+const TABLE_SEP = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+const TASK = /^\[([ xX])\]\s+(.*)$/;
+
+function splitRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+/** 解析一层列表；缩进更深的子项递归挂到当前条目下，返回 [节点, 下一行号]。 */
+function parseList(lines, start) {
+  const first = BULLET.exec(lines[start]);
+  const root = el(/\d/.test(first[2]) ? "ol" : "ul", "md-list");
+  const base = first[1].length;
+  let index = start;
+  let current = null;
+  while (index < lines.length) {
+    const hit = BULLET.exec(lines[index]);
+    if (!hit) break;
+    const indent = hit[1].length;
+    if (indent < base) break;
+    if (indent > base && current) {
+      const nested = parseList(lines, index);
+      current.appendChild(nested[0]);
+      index = nested[1];
+      continue;
+    }
+    current = el("li");
+    const task = TASK.exec(hit[3]);
+    if (task) {
+      const label = el("label", "md-task");
+      const box = el("input");
+      box.type = "checkbox";
+      box.disabled = true;
+      box.checked = task[1].toLowerCase() === "x";
+      label.appendChild(box);
+      const span = el("span");
+      renderInline(span, task[2]);
+      label.appendChild(span);
+      current.appendChild(label);
+    } else {
+      renderInline(current, hit[3]);
+    }
+    root.appendChild(current);
+    index += 1;
+  }
+  return [root, index];
+}
+
+function renderMarkdown(parent, text) {
+  const lines = String(text === undefined || text === null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
+  const paragraph = [];
+  const flush = () => {
+    if (!paragraph.length) return;
+    const node = el("p", "md-p");
+    renderInline(node, paragraph.join("\n"));
+    parent.appendChild(node);
+    paragraph.length = 0;
+  };
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    const fence = FENCE.exec(line);
+    if (fence) {
+      flush();
+      const close = new RegExp("^\\s*" + fence[1] + "\\s*$");
+      const body = [];
+      index += 1;
+      while (index < lines.length && !close.test(lines[index])) {
+        body.push(lines[index]);
+        index += 1;
+      }
+      index += 1;
+      parent.appendChild(codeBlock(fence[2], body.join("\n")));
+      continue;
+    }
+    if (HR.test(line)) {
+      flush();
+      parent.appendChild(el("hr", "md-hr"));
+      index += 1;
+      continue;
+    }
+    const heading = HEADING.exec(line);
+    if (heading) {
+      flush();
+      const node = el("div", "md-h md-h" + heading[1].length);
+      renderInline(node, heading[2]);
+      parent.appendChild(node);
+      index += 1;
+      continue;
+    }
+    if (line.indexOf("|") >= 0 && index + 1 < lines.length && TABLE_SEP.test(lines[index + 1])) {
+      flush();
+      const table = el("table", "md-table");
+      const thead = el("thead");
+      const headRow = el("tr");
+      for (const cell of splitRow(line)) {
+        const th = el("th");
+        renderInline(th, cell);
+        headRow.appendChild(th);
+      }
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+      const tbody = el("tbody");
+      index += 2;
+      while (index < lines.length && lines[index].trim() && lines[index].indexOf("|") >= 0) {
+        const row = el("tr");
+        for (const cell of splitRow(lines[index])) {
+          const td = el("td");
+          renderInline(td, cell);
+          row.appendChild(td);
+        }
+        tbody.appendChild(row);
+        index += 1;
+      }
+      table.appendChild(tbody);
+      parent.appendChild(table);
+      continue;
+    }
+    if (BULLET.test(line)) {
+      flush();
+      const parsed = parseList(lines, index);
+      parent.appendChild(parsed[0]);
+      index = parsed[1];
+      continue;
+    }
+    if (QUOTE.test(line)) {
+      flush();
+      const quote = el("blockquote", "md-quote");
+      while (index < lines.length && QUOTE.test(lines[index])) {
+        const node = el("div");
+        renderInline(node, lines[index].replace(QUOTE, ""));
+        quote.appendChild(node);
+        index += 1;
+      }
+      parent.appendChild(quote);
+      continue;
+    }
+    if (!line.trim()) {
+      flush();
+      index += 1;
+      continue;
+    }
+    paragraph.push(line);
+    index += 1;
+  }
+  flush();
+}
+
+/** 流式输出：按帧节流重渲染整段 Markdown，避免逐字追加时用户看到未格式化的原文。 */
+function renderLive(live) {
+  if (live.frame) return;
+  live.frame = requestAnimationFrame(() => {
+    live.frame = 0;
+    live.node.textContent = "";
+    renderMarkdown(live.node, live.text);
+  });
+}
+
+/* ================= 消息与工具卡片 ================= */
+
+function agentMessage(text) {
+  const node = el("div", "msg agent");
+  renderMarkdown(node, text || "");
+  return node;
+}
+
+function messageText(item) {
+  const parts = [];
+  for (const part of (item && item.content) || []) {
+    if (part && part.type === "text" && part.text) parts.push(part.text);
+    else if (part && part.type && !IMAGE_INPUT_TYPES.has(part.type)) parts.push("[" + part.type + "]");
+  }
+  return parts.join("\n");
+}
+
+// 用户消息里的图片输入：网关只下发本机路径，网页按路径回读；取不到路径的只报张数。
+const IMAGE_INPUT_TYPES = new Set(["image", "localImage"]);
+
+function messageImages(item) {
+  return ((item && item.content) || [])
+    .filter((part) => part && IMAGE_INPUT_TYPES.has(part.type))
+    .map((part) => ({ path: typeof part.path === "string" ? part.path : "" }));
+}
+
+// <img> 带不了请求头，令牌随查询串走，和事件流一致。
+function imageUrl(path) {
+  return "/api/threads/" + encodeURIComponent(state.threadId) + "/image?path=" + encodeURIComponent(path) + "&token=" + encodeURIComponent(state.token);
+}
+
+function userMessage(item) {
+  const text = messageText(item);
+  const node = el("div", "msg user");
+  if (text) node.appendChild(el("div", "msg-text", text));
+  const images = messageImages(item);
+  if (images.length) {
+    const box = el("div", "msg-images");
+    for (const image of images) {
+      if (!image.path) continue;
+      const button = el("button", "msg-image");
+      button.type = "button";
+      button.dataset.src = imageUrl(image.path);
+      button.setAttribute("aria-label", "查看图片");
+      const picture = el("img");
+      picture.src = button.dataset.src;
+      picture.alt = "消息图片";
+      picture.loading = "lazy";
+      picture.decoding = "async";
+      // 回读失败（文件已删或过大）时退回一条提示，不留空白。
+      picture.addEventListener("error", () => button.replaceWith(el("span", "msg-images-note", "图片无法预览")));
+      button.appendChild(picture);
+      box.appendChild(button);
+    }
+    const missing = images.filter((image) => !image.path).length;
+    if (missing) box.appendChild(el("span", "msg-images-note", "另有 " + missing + " 张图片"));
+    node.appendChild(box);
+  }
+  if (!text && !images.length) return node;
+  const actions = el("div", "msg-actions");
+  // 只有图片的消息没有正文可复制，只留「编辑」把图片放回输入框。
+  if (text) {
+    const copy = el("button", null, "复制");
+    copy.type = "button";
+    copy.addEventListener("click", () => copyText(text, "已复制消息"));
+    actions.appendChild(copy);
+  }
+  const edit = el("button", null, "编辑");
+  edit.type = "button";
+  edit.addEventListener("click", () => { editMessage(text, images).catch(reportError); });
+  actions.appendChild(edit);
+  node.appendChild(actions);
+  return node;
+}
+
+// 缩略图点开看大图：铺满视口，点任意处或右上角关闭。
+function openImageViewer(src) {
+  if (!src) return;
+  $("imgViewerImg").src = src;
+  $("imgViewer").hidden = false;
+}
+
+function closeImageViewer() {
+  $("imgViewer").hidden = true;
+  $("imgViewerImg").removeAttribute("src");
+}
+
+// 编辑把消息回填到输入框：历史仍保留，改完直接发送即可重新提问。带图片的消息把图片一并放回
+// 附件栏，而附件栏只认网关本会话目录里的文件，所以这里重新回读并走一次上传接口换成新路径。
+async function editMessage(text, images) {
+  const input = $("input");
+  input.value = text || "";
+  autoGrow();
+  input.focus();
+  try { input.setSelectionRange(input.value.length, input.value.length); } catch { /* 忽略 */ }
+  const threadId = state.threadId;
+  const paths = (images || []).map((image) => image.path).filter(Boolean);
+  const room = Math.max(0, ATTACH_MAX_COUNT - state.attachments.length);
+  let added = 0;
+  for (const path of paths.slice(0, room)) {
+    try {
+      const response = await fetch(imageUrl(path));
+      if (!response.ok) continue;
+      const blob = await response.blob();
+      if (blob.size > ATTACH_MAX_BYTES) continue;
+      const dataUrl = await readImage(blob);
+      const body = await api("/api/threads/" + encodeURIComponent(threadId) + "/images", {
+        method: "POST",
+        body: JSON.stringify({ name: "会话图片", dataUrl }),
+      });
+      if (state.threadId !== threadId) return;
+      if (!body || !body.path) continue;
+      state.attachments.push({ id: String(++state.attachSeq), name: "会话图片", dataUrl, path: body.path });
+      added += 1;
+    } catch { /* 单张失败不影响其余图片 */ }
+  }
+  if (added) {
+    renderAttachBar();
+    renderComposerState();
+    toast("已填入输入框，附上 " + added + " 张图片");
+  } else if (paths.length) {
+    toast("已填入输入框，图片未能重新加入", "warn");
+  } else {
+    toast("已填入输入框，修改后发送");
+  }
+}
+
+// 工具、命令、文件改动与图片都只留一行计数，和思考一样轻；正文与路径在网关侧已裁掉。
+const TOOL_TYPES = new Set([
+  "commandExecution", "mcpToolCall", "dynamicToolCall",
+  "functionCallOutput", "webSearch", "collabAgentToolCall",
+]);
+
+function countNote(icon, text) {
+  const node = el("div", "tool-note");
+  node.appendChild(el("span", "icon", icon));
+  node.appendChild(el("span", null, text));
+  return node;
+}
+
+function toolGroup(items) {
+  return countNote("⛭", "工具与命令 " + items.length + " 项");
+}
+
+// 文件改动只报数量：改了哪些文件、怎么改的都不再下发，也不再展示。
+function fileBlock(items) {
+  const count = items.reduce((sum, item) => sum + (Number(item.changeCount) || 0), 0);
+  return countNote("±", "修改 " + count + " 个文件");
+}
+
+function imageGroup(items) {
+  return countNote("▤", "图片 " + items.length + " 项");
+}
+
+function card(kind, title, chip) {
+  const node = el("div", "card");
+  const head = el("div", "card-head");
+  head.appendChild(el("span", "icon", kind));
+  head.appendChild(el("span", "title", title));
+  if (chip) head.appendChild(chip);
+  node.appendChild(head);
+  return node;
+}
+
+function copyButton(text) {
+  const copy = el("button", "copy", "复制");
+  copy.type = "button";
+  copy.addEventListener("click", (event) => {
+    // 复制按钮在 summary 里，点它不要顺带折叠卡片。
+    event.preventDefault();
+    event.stopPropagation();
+    copyText(text, "已复制");
+  });
+  return copy;
+}
+
+function rawBlock(label, text, open) {
+  const details = el("details", "raw");
+  if (open) details.open = true;
+  const summary = el("summary");
+  summary.appendChild(el("span", "raw-label", label));
+  summary.appendChild(copyButton(text));
+  details.appendChild(summary);
+  details.appendChild(el("pre", "card-pre", text));
+  return details;
+}
+
+function statusChip(status, exitCode) {
+  const value = String(status || "").toLowerCase();
+  const table = {
+    completed: ["已完成", "ok"], success: ["已完成", "ok"],
+    inprogress: ["运行中", "run"], running: ["运行中", "run"], active: ["运行中", "run"], pending: ["排队中", "run"],
+    failed: ["失败", "bad"], error: ["失败", "bad"],
+    interrupted: ["已中断", "warn"], cancelled: ["已中断", "warn"], canceled: ["已中断", "warn"], declined: ["已拒绝", "warn"],
+  };
+  const hit = table[value];
+  if (!hit) {
+    if (exitCode === null || exitCode === undefined) return null;
+    return el("span", "chip " + (exitCode === 0 ? "ok" : "bad"), "exit " + exitCode);
+  }
+  const node = el("span", "chip " + hit[1]);
+  if (hit[1] === "run") node.appendChild(el("i"));
+  node.appendChild(el("span", null, hit[0]));
+  return node;
+}
+
+function renderItem(item) {
+  const type = item && item.type;
+  if (type === "userMessage") return userMessage(item);
+  if (type === "agentMessage") return agentMessage(item.text || "");
+  if (type === "reasoning") return null;
+  if (type === "commandExecution") {
+    // 标题本来就会被 CSS 截成一行，先截好文案可以省掉超长命令的排版开销。
+    const node = card("$", preview(item.command || "", 160), statusChip(item.status, item.exitCode));
+    if (item.cwd) node.appendChild(el("div", "card-sub mono", item.cwd));
+    // 输出正文在网关侧已截断成预览，这里只展示这一小段。
+    const output = item.aggregatedOutput || "";
+    if (output) node.appendChild(rawBlock("输出预览", output, String(item.status || "").toLowerCase().indexOf("fail") >= 0));
+    return node;
+  }
+  // fileChange 由 fileBlock 合并展示，不在这里单独渲染。
+  if (type === "mcpToolCall" || type === "dynamicToolCall") {
+    // 参数与结果在网关侧已去掉，卡片只保留“调用了哪个工具”。
+    const node = card("⚙", "MCP " + (item.server || "") + "." + (item.tool || ""), statusChip(item.status));
+    if (item.error) node.appendChild(rawBlock("错误", typeof item.error === "string" ? item.error : json(item.error), false));
+    return node;
+  }
+  if (type === "functionCallOutput") {
+    const node = card("↳", "工具输出 · " + (item.name || ""));
+    node.appendChild(rawBlock("输出预览", typeof item.output === "string" ? item.output : json(item.output), false));
+    return node;
+  }
+  if (type === "plan") {
+    const node = card("☰", "计划");
+    const body = el("div", "card-pre");
+    renderMarkdown(body, item.text || "");
+    node.appendChild(body);
+    return node;
+  }
+  if (type === "webSearch") {
+    const node = card("⌕", "联网搜索 · " + (item.query || ""));
+    return node;
+  }
+  if (type === "collabAgentToolCall") {
+    const node = card("⧉", "子代理调用 · " + (item.tool || ""));
+    if (item.prompt) node.appendChild(rawBlock("提示词", typeof item.prompt === "string" ? item.prompt : json(item.prompt), false));
+    return node;
+  }
+  if (type === "subAgentActivity") {
+    return card("⧉", "子代理活动 · " + (item.kind || ""), null);
+  }
+  if (type === "contextCompaction") return card("⤵", "上下文压缩", null);
+  if (type === "enteredReviewMode" || type === "exitedReviewMode") {
+    return card("◇", type === "enteredReviewMode" ? "进入评审模式" : "退出评审模式", null);
+  }
+  const node = card("•", type || "未知项");
+  node.appendChild(rawBlock("原始数据", json(item), false));
+  return node;
+}
+
+/* ================= 对话渲染 ================= */
+
+function isPinned(root) {
+  return root.scrollHeight - root.scrollTop - root.clientHeight < 70;
+}
+
+/**
+ * 贴到底部。移动端浏览器有时会延迟结算滚动高度，赋值一次可能停在半路，
+ * 因此重复到高度稳定为止。
+ */
+function pinToBottom(root) {
+  let previous = -1;
+  for (let i = 0; i < 6 && previous !== root.scrollHeight; i += 1) {
+    previous = root.scrollHeight;
+    root.scrollTop = root.scrollHeight;
+    void root.scrollHeight;
+  }
+}
+
+function scrollToBottom() {
+  pinToBottom($("transcript"));
+  $("toBottom").hidden = true;
+  $("toBottom").querySelector(".new").hidden = true;
+  state.autoScroll = true;
+}
+
+function updateToBottom() {
+  const root = $("transcript");
+  const show = root.scrollHeight - root.scrollTop - root.clientHeight > 120;
+  $("toBottom").hidden = !show;
+}
+
+// 只有停在底部时才跟随新消息：滚上去看历史时不再被拽回底部，改由「回到最新」提示有新内容。
+function updateAutoScroll() {
+  state.autoScroll = isPinned($("transcript"));
+  if (state.autoScroll) $("toBottom").querySelector(".new").hidden = true;
+}
+
+function updateAtBottom() {
+  updateToBottom();
+  updateAutoScroll();
+}
+
+/* ================= 运行状态条 ================= */
+
+// 回合进行中把已用时、token 与思考次数贴在输入框上方；结束时这些数字落到回合末尾。
+function startRun(turn) {
+  const id = (turn && turn.id) || state.activeTurnId || null;
+  const started = Number(turn && turn.startedAt);
+  if (!state.activeTurn || (id && state.activeTurn.id !== id)) {
+    state.activeTurn = {
+      id,
+      startedAt: Number.isFinite(started) && started > 0 ? started : Math.floor(Date.now() / 1000),
+      reasonings: 0,
+    };
+  }
+  state.activeTurnId = id;
+  if (!state.runTimer) {
+    state.runTicks = 0;
+    state.runTimer = setInterval(runTick, 1000);
+  }
+  renderRunbar();
+}
+
+function runTick() {
+  renderRunbar();
+  state.runTicks += 1;
+  // token 在回合进行中持续增长，隔几秒补一次；落盘聚合有成本，不要太频繁。
+  if (state.runTicks % 8 === 0 && state.threadId) loadUsage(state.threadId, true).catch(() => {});
+}
+
+function endRun() {
+  clearInterval(state.runTimer);
+  state.runTimer = null;
+  state.runTicks = 0;
+  state.activeTurn = null;
+  state.activeTurnId = null;
+  renderRunbar();
+}
+
+function renderRunbar() {
+  const bar = $("runbar");
+  const turn = state.activeTurn;
+  $("stopBtn").hidden = !state.activeTurnId;
+  if (!turn && !state.command) {
+    bar.hidden = true;
+    bar.textContent = "";
+    return;
+  }
+  bar.textContent = "";
+  bar.appendChild(el("span", "run-dot"));
+  const parts = [state.command ? state.command.title + "中" : "运行中"];
+  if (turn) {
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - turn.startedAt);
+    parts.push(formatDuration(elapsed * 1000) || elapsed + " 秒");
+    const tokens = state.usage.turns[turn.id] && formatTokens(state.usage.turns[turn.id].total_tokens);
+    if (tokens) parts.push(tokens + " tokens");
+    if (turn.reasonings) parts.push("思考 " + turn.reasonings + " 次");
+  }
+  bar.appendChild(el("span", "run-text", parts.join(" · ")));
+  bar.hidden = false;
+}
+
+// 网页可能在回合开始后才打开：从已载入的回合里认领运行中的那条，状态条才有数据。
+function adoptRunningTurn() {
+  const running = state.turns.find((turn) => turn && turn.status === "inProgress");
+  if (running) {
+    const thoughts = (running.items || []).filter((item) => item && item.type === "reasoning").length;
+    if (state.activeTurn && state.activeTurn.id === running.id) {
+      state.activeTurn.reasonings = Math.max(state.activeTurn.reasonings, thoughts);
+      state.activeTurnId = running.id;
+    } else {
+      startRun(running);
+      state.activeTurn.reasonings = thoughts;
+    }
+    renderRunbar();
+    return;
+  }
+  // 认领过的回合已经出现在列表里且已结束，说明完成事件没收到，兜底收起状态条。
+  const mine = state.turns.find((turn) => turn && turn.id === state.activeTurnId);
+  if (mine && mine.status && mine.status !== "inProgress") {
+    endRun();
+    renderChatHead();
+  }
+}
+
+/* ================= 排队消息 ================= */
+
+// 排队由上游维护（桌面端也在用同一份队列），网页只读列表并触发「插队立即执行 / 删除」。
+function renderQueue() {
+  const box = $("queueBox");
+  const items = state.queue || [];
+  box.textContent = "";
+  if (!items.length) {
+    box.hidden = true;
+    return;
+  }
+  box.appendChild(el("div", "queue-head", "排队中 " + items.length + " 条"));
+  items.forEach((item, index) => {
+    const row = el("div", "queue-item");
+    row.appendChild(el("span", "queue-text", index + 1 + ". " + (item.text || "（非文本消息）")));
+    const actions = el("div", "queue-actions");
+    const start = el("button", "queue-btn", "立即执行");
+    start.type = "button";
+    start.addEventListener("click", () => queueAction("start", item.id));
+    const remove = el("button", "queue-btn danger", "删除");
+    remove.type = "button";
+    remove.addEventListener("click", () => queueAction("delete", item.id));
+    actions.appendChild(start);
+    actions.appendChild(remove);
+    row.appendChild(actions);
+    box.appendChild(row);
+  });
+  box.hidden = false;
+}
+
+async function loadQueue(id) {
+  if (!id) return;
+  const body = await api("/api/threads/" + encodeURIComponent(id) + "/queue");
+  if (state.threadId !== id) return;
+  state.queue = (body && body.items) || [];
+  renderQueue();
+}
+
+async function queueAction(action, queuedSubmissionId) {
+  if (!state.threadId || !queuedSubmissionId) return;
+  try {
+    const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/queue", {
+      method: "POST",
+      body: JSON.stringify({ action, queuedSubmissionId }),
+    });
+    toast(action === "start" ? "已请求插队执行" : (body && body.deleted === false ? "这条排队消息已经不在了" : "已删除排队消息"));
+    // 立即执行会另起回合，等上游的 turn/started 事件点亮状态条即可，这里只对齐队列列表。
+    loadQueue(state.threadId).catch(() => {});
+    scheduleReload(400);
+  } catch (error) {
+    reportError(error);
+    loadQueue(state.threadId).catch(() => {});
+  }
+}
+
+function renderTranscript(forceScroll) {
+  const root = $("transcript");
+  const pinned = forceScroll || isPinned(root);
+  const keep = root.scrollTop;
+  root.textContent = "";
+  state.live.clear();
+  if (!state.threadId) {
+    const empty = el("div", "empty");
+    empty.appendChild(el("div", "big", "选择一个对话"));
+    empty.appendChild(el("div", null, isMobile() ? "点左上角返回列表，选择一个会话开始。" : "左侧列出最近的对话（更早的用搜索找），包含桌面端没有打开的会话。"));
+    root.appendChild(empty);
+    updateAtBottom();
+    return;
+  }
+  if (!state.turns.length) {
+    root.appendChild(el("div", "empty", "这个会话还没有消息。"));
+  }
+  if (state.nextCursor) {
+    const more = el("button", "more-btn", "加载更早的消息");
+    more.type = "button";
+    more.addEventListener("click", () => loadTurns(state.nextCursor).catch(reportError));
+    root.appendChild(more);
+  } else if (state.turns.length >= MAX_TURNS) {
+    root.appendChild(el("div", "more-hint", "仅显示最近 " + MAX_TURNS + " 个回合"));
+  }
+  const ordered = state.turns.slice().reverse();
+  for (const turn of ordered) {
+    const node = el("div", "turn");
+    node.id = "turn-" + turn.id;
+    const head = el("div", "turn-head");
+    const stamp = turn.createdAt || turn.startedAt || turn.completedAt;
+    head.appendChild(el("span", null, stamp ? relTime(stamp) : "回合"));
+    head.appendChild(el("span", "line"));
+    const chip = statusChip(turn.status, null);
+    if (chip) head.appendChild(chip);
+    node.appendChild(head);
+    // 连续的同类条目合并成一行计数：工具与命令、文件改动、图片各自只留一条。
+    let run = [];
+    let runKind = null;
+    const flushRun = () => {
+      if (!run.length) return;
+      const render = runKind === "files" ? fileBlock : runKind === "images" ? imageGroup : toolGroup;
+      node.appendChild(render(run));
+      run = [];
+      runKind = null;
+    };
+    const pushRun = (item, kind) => {
+      if (runKind !== kind) flushRun();
+      runKind = kind;
+      run.push(item);
+    };
+    for (const item of turn.items || []) {
+      if (!item) continue;
+      // 思考正文与步数都不在这里展开，次数统一放在回合末尾的统计里。
+      if (item.type === "reasoning") continue;
+      if (TOOL_TYPES.has(item.type)) { pushRun(item, "tools"); continue; }
+      if (item.type === "fileChange") { pushRun(item, "files"); continue; }
+      if (item.type === "imageView" || item.type === "imageGeneration") { pushRun(item, "images"); continue; }
+      flushRun();
+      const rendered = renderItem(item);
+      if (rendered) node.appendChild(rendered);
+    }
+    flushRun();
+    // 回合结束后才在末尾补统计；运行中的那份由输入框上方的状态条实时显示。
+    if (turn.status !== "inProgress") {
+      const stats = turnStats(turn);
+      if (stats) node.appendChild(el("div", "turn-foot", stats));
+    }
+    root.appendChild(node);
+  }
+  if (pinned) pinToBottom(root);
+  else root.scrollTop = keep;
+  updateAtBottom();
+}
+
+function renderThreads() {
+  const root = $("threads");
+  root.textContent = "";
+  // 首页按时间收窄过就说明一声，免得用户以为老对话丢了；搜索不带窗口，只报条数。
+  const windowLabel = state.threadWindowDays ? "最近 " + state.threadWindowDays + " 天 · " : "";
+  $("threadCount").textContent = state.threads.length ? windowLabel + state.threads.length + " 个会话" : "";
+  if (!state.loaded) {
+    for (let index = 0; index < 6; index += 1) root.appendChild(el("div", "skeleton"));
+    return;
+  }
+  if (!state.threads.length) {
+    root.appendChild(el("div", "empty", "没有匹配的对话"));
+    return;
+  }
+  // 上游按最近使用返回，因此项目组的先后就是各项目最近一次会话的先后，组内也已经是最近在前。
+  const groups = new Map();
+  for (const thread of state.threads) {
+    const project = projectOf(thread);
+    const entry = groups.get(project.key) || { name: project.name, path: project.path, threads: [] };
+    entry.threads.push(thread);
+    groups.set(project.key, entry);
+  }
+  for (const entry of groups.values()) {
+    const label = el("div", "group-label");
+    label.appendChild(el("span", "group-name", entry.name));
+    label.appendChild(el("span", "group-count", entry.threads.length + " 个会话"));
+    if (entry.path) label.title = entry.path;
+    root.appendChild(label);
+    for (const thread of entry.threads) {
+      const running = !!(thread.status && thread.status.type === "active");
+      const node = el("div", "thread" + (thread.id === state.threadId ? " active" : ""));
+      const top = el("div", "t-top");
+      top.appendChild(el("span", "t-name", thread.name || preview(thread.preview) || "(未命名)"));
+      if (running) {
+        const badge = el("span", "run-badge");
+        badge.appendChild(el("i"));
+        badge.appendChild(el("span", null, "运行中"));
+        top.appendChild(badge);
+      }
+      node.appendChild(top);
+      const line = preview(thread.preview);
+      if (line && line !== thread.name) node.appendChild(el("div", "t-prev", line));
+      const meta = el("div", "t-meta");
+      if (thread.model) {
+        meta.appendChild(el("span", null, thread.model));
+        meta.appendChild(el("span", "sep", "·"));
+      }
+      meta.appendChild(el("span", null, relTime(thread.updatedAt)));
+      node.appendChild(meta);
+      node.addEventListener("click", () => openThread(thread.id).catch(reportError));
+      root.appendChild(node);
+    }
+  }
+}
+
+function renderChatHead() {
+  const thread = (state.detail && state.detail.thread) || null;
+  $("chatTitle").textContent = thread ? (thread.name || preview(thread.preview) || state.threadId || "对话") : "选择一个对话";
+  // 工作目录单独做成可点的小胶囊：点开就能看清完整路径和目录里有什么，长路径也不会把这一行挤满。
+  const nodes = [];
+  if (thread) {
+    if (thread.cwd) nodes.push(cwdChip(thread.cwd));
+    // 窄屏这一行只剩几十像素（右上角还有模型胶囊、用量圆圈和会话导航），只留给工作目录：
+    // 模型在右上角、累计用量在会话状态面板、运行状态在输入框上方的状态条，都不必在这里重复。
+    if (!isMobile()) {
+      if (state.detail.model) nodes.push(el("span", null, modelLabel(state.detail.model)));
+      if (state.command) nodes.push(el("span", null, state.command.title + "中"));
+      else if (state.activeTurnId) nodes.push(el("span", null, "运行中"));
+      const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
+      if (total) nodes.push(el("span", null, "累计 " + total + " tokens"));
+    }
+  }
+  const meta = $("chatMeta");
+  meta.textContent = "";
+  nodes.forEach((node, index) => {
+    if (index) meta.appendChild(el("span", "meta-sep", " · "));
+    meta.appendChild(node);
+  });
+  renderContextRing();
+}
+
+function cwdChip(cwd) {
+  const chip = el("button", "meta-path");
+  chip.type = "button";
+  chip.title = cwd;
+  chip.setAttribute("aria-label", "查看工作目录与其中的文件");
+  chip.appendChild(svgIcon("M3 6a2 2 0 0 1 2-2h3.6l1.8 2H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"));
+  // 窄屏放不下整条路径：只留最后一段目录名，完整路径在提示（浮层）与面板里。
+  chip.appendChild(el("span", "p", isMobile() ? pathTail(cwd) : cwd));
+  return chip;
+}
+
+function pathTail(cwd) {
+  const parts = String(cwd).split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : cwd;
+}
+
+// 上下文用量：分子是最近一次请求的真实占用，分母是模型窗口，都来自落盘用量；
+// 缺任一项就整块隐藏，不显示一个没有依据的百分比。
+const CTX_CIRCUMFERENCE = 2 * Math.PI * 15.5;
+
+function contextInfo() {
+  const context = state.usage.context;
+  const used = Number(context && context.used);
+  const window = Number(context && context.window);
+  if (!Number.isFinite(used) || !Number.isFinite(window) || used <= 0 || window <= 0) return null;
+  const ratio = Math.max(0, Math.min(1, used / window));
+  const percent = Math.round(ratio * 100);
+  return {
+    used,
+    window,
+    ratio,
+    percent,
+    label: "上下文已用 " + formatTokens(used) + " / " + formatTokens(window) + "（" + percent + "%）",
+  };
+}
+
+function renderContextRing() {
+  const ring = $("ctxRing");
+  const info = contextInfo();
+  if (!info) {
+    ring.hidden = true;
+    ring.removeAttribute("title");
+    ring.removeAttribute("aria-label");
+    return;
+  }
+  ring.hidden = false;
+  ring.classList.toggle("warn", info.ratio >= 0.85);
+  ring.querySelector(".ctx-fill").style.strokeDashoffset = String(CTX_CIRCUMFERENCE * (1 - info.ratio));
+  $("ctxPct").textContent = info.percent + "%";
+  ring.title = info.label;
+  ring.setAttribute("aria-label", info.label);
+}
+
+function updateModelChip() {
+  const model = currentModel();
+  const raw = (state.detail && state.detail.model) || (model && (model.displayName || model.id)) || "";
+  const name = modelLabel(raw) || "跟随会话";
+  const effort = $("effort").value;
+  $("modelChipText").textContent = effort ? name + " · " + effort : name;
+}
+
+// 模型 id 可能带线路前缀（`route-xxxx/model-name`），界面只显示模型名称本身。
+function modelLabel(value) {
+  const text = String(value == null ? "" : value).trim();
+  const cut = text.lastIndexOf("/");
+  if (cut === -1) return text;
+  return text.slice(cut + 1).trim() || text;
+}
+
+/* ================= 模型与强度 ================= */
+
+function renderModels() {
+  const select = $("model");
+  select.textContent = "";
+  const blank = el("option", null, "（跟随会话）");
+  blank.value = "";
+  select.appendChild(blank);
+  for (const model of state.models) {
+    const option = el("option", null, String(model.displayName || model.id || model.model || ""));
+    option.value = model.id || model.model || "";
+    select.appendChild(option);
+  }
+  select.value = (state.detail && state.detail.model) || "";
+  renderEfforts();
+}
+
+function currentModel() {
+  const id = $("model").value;
+  return state.models.find((model) => (model.id || model.model) === id) || null;
+}
+
+function renderEfforts() {
+  const select = $("effort");
+  select.textContent = "";
+  const blank = el("option", null, "（默认强度）");
+  blank.value = "";
+  select.appendChild(blank);
+  const model = currentModel();
+  for (const option of (model && model.supportedReasoningEfforts) || []) {
+    const value = option.reasoningEffort || option;
+    const node = el("option", null, String(value));
+    node.value = value;
+    if (option.description) node.title = option.description;
+    select.appendChild(node);
+  }
+  select.value = (state.detail && state.detail.reasoningEffort) || "";
+  updateModelChip();
+}
+
+function openSheet() {
+  const info = $("sheetInfo");
+  info.textContent = "";
+  if (state.threadId) {
+    info.appendChild(el("div", null, "会话：" + (state.threadId || "")));
+    if (state.detail && state.detail.cwd) info.appendChild(el("div", null, "工作目录：" + state.detail.cwd));
+  } else {
+    info.appendChild(el("div", null, "先打开一个会话，再选择模型与推理强度。"));
+  }
+  $("model").disabled = !state.threadId;
+  $("effort").disabled = !state.threadId;
+  $("overlay").hidden = false;
+  $("sheet").hidden = false;
+}
+
+function closeSheet() {
+  $("overlay").hidden = true;
+  $("sheet").hidden = true;
+}
+
+/* ================= 会话导航 ================= */
+
+// 取回合里第一条有正文的用户消息，用于导航项的标题。
+function turnUserText(turn) {
+  for (const item of (turn && turn.items) || []) {
+    if (!item || item.type !== "userMessage") continue;
+    const parts = [];
+    for (const part of item.content || []) {
+      if (part && part.type === "text" && part.text) parts.push(part.text);
+    }
+    const text = parts.join(" ").replace(/\s+/g, " ").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function openNav() {
+  const list = $("navList");
+  list.textContent = "";
+  // 从最早到最新排列，序号即回合顺序；只列有用户输入的回合。
+  const entries = state.turns
+    .slice()
+    .reverse()
+    .map((turn) => ({ turn, text: turnUserText(turn) }))
+    .filter((entry) => entry.text);
+  if (!entries.length) {
+    list.appendChild(el("div", "empty", "还没有可跳转的回合。"));
+  }
+  entries.forEach((entry, index) => {
+    const turn = entry.turn;
+    const item = el("button", "nav-item");
+    item.type = "button";
+    item.appendChild(el("span", "n", String(index + 1)));
+    const body = el("div", "nav-body");
+    body.appendChild(el("div", "nav-text", preview(entry.text, 140)));
+    const meta = [];
+    const stamp = turn.completedAt || turn.startedAt || turn.createdAt;
+    if (stamp) meta.push(relTime(stamp));
+    const duration = formatDuration(turn.durationMs);
+    if (duration) meta.push(duration);
+    if (meta.length) body.appendChild(el("div", "nav-meta", meta.join(" · ")));
+    item.appendChild(body);
+    item.addEventListener("click", () => {
+      closeNav();
+      scrollToTurn(turn.id);
+    });
+    list.appendChild(item);
+  });
+  $("navOverlay").hidden = false;
+  $("navSheet").hidden = false;
+}
+
+function closeNav() {
+  $("navOverlay").hidden = true;
+  $("navSheet").hidden = true;
+}
+
+function scrollToTurn(id) {
+  const node = document.getElementById("turn-" + id);
+  if (!node) return;
+  node.scrollIntoView({ block: "start", behavior: "smooth" });
+  node.classList.add("flash");
+  setTimeout(() => node.classList.remove("flash"), 1200);
+}
+
+/* ================= 数据加载 ================= */
+
+function reportError(error) {
+  const message = error && error.message ? error.message : String(error);
+  toast(message, "bad");
+}
+
+async function loadThreads() {
+  const search = $("search").value.trim();
+  const query = search ? "?search=" + encodeURIComponent(search) : "";
+  const body = await api("/api/threads" + query);
+  state.threads = body.threads || [];
+  // 首页只取最近几天有过活动的会话；搜索时后端不带窗口，这里也就没有天数。
+  state.threadWindowDays = Number(body.windowDays) || 0;
+  state.loaded = true;
+  renderThreads();
+}
+
+async function loadModels() {
+  const body = await api("/api/models");
+  state.models = body.models || [];
+  renderModels();
+}
+
+async function loadTurns(cursor) {
+  // 记下请求发出时的会话：响应回来时用户可能已经切走，那份数据不能再写进当前视图，
+  // 否则上一个会话里运行中的回合会被当场认领，状态条就挂到别的会话上了。
+  const id = state.threadId;
+  const query = "?limit=" + TURNS_PAGE + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+  const body = await api("/api/threads/" + encodeURIComponent(id) + "/turns" + query);
+  if (state.threadId !== id) return;
+  const turns = body.turns || [];
+  if (cursor) {
+    const room = Math.max(0, MAX_TURNS - state.turns.length);
+    state.turns = state.turns.concat(turns.slice(0, room));
+  } else {
+    state.turns = turns.slice(0, MAX_TURNS);
+  }
+  state.nextCursor = state.turns.length >= MAX_TURNS ? null : (body.nextCursor || null);
+  // 不强制回到底部：只有用户本来就停在底部时才跟随，翻历史时不会被拽下去。
+  renderTranscript(false);
+  adoptRunningTurn();
+}
+
+// 用量单独懒加载：网关要扫盘聚合，先渲染正文再补 token，不拖慢会话打开。
+// keepScroll 为真时只更新状态条与回合统计，不重排正文，避免定时刷新把页面滚到底部。
+async function loadUsage(id, keepScroll) {
+  const usage = await api("/api/threads/" + encodeURIComponent(id) + "/usage");
+  if (state.threadId !== id || !usage || typeof usage !== "object") return;
+  state.usage = { total: usage.total || null, turns: usage.turns || {}, context: usage.context || null };
+  renderChatHead();
+  renderRunbar();
+  // 运行中的回合靠事件流增量渲染，重排会打断它，等回合结束再补上用量。
+  if (!keepScroll && !state.live.size) renderTranscript(false);
+}
+
+function showListView() {
+  $("app").dataset.view = "list";
+  // 顶栏的刷新按钮已经去掉，回到列表时顺手取一次，保证新会话能出现。
+  loadThreads().catch(() => {});
+}
+
+function showChatView() {
+  $("app").dataset.view = "chat";
+}
+
+async function openThread(id) {
+  if (state.threadId && state.threadId !== id) closeThread(state.threadId);
+  endRun();
+  state.threadId = id;
+  state.detail = null;
+  state.turns = [];
+  state.nextCursor = null;
+  state.activeTurnId = null;
+  state.autoScroll = true;
+  state.live.clear();
+  state.usage = { total: null, turns: {}, context: null };
+  state.attachments = [];
+  state.queue = [];
+  state.approvals = [];
+  clearCommand();
+  closeSlash();
+  cancelSendMode();
+  // 上一个会话的目录面板要一起收掉，免得切过去还挂着旧目录。
+  closeFiles();
+  state.slashIndex = 0;
+  renderApprovals();
+  renderQueue();
+  renderAttachBar();
+  try { localStorage.setItem(LAST_THREAD_KEY, id); } catch { /* 隐私模式下忽略 */ }
+  $("chatTitle").textContent = "载入中…";
+  $("chatMeta").textContent = "";
+  $("transcript").textContent = "";
+  renderThreads();
+  renderTranscript(true);
+  // 打开会话后顶栏只留返回与刷新；手机上这个状态还负责「列表 ⇄ 对话」两屏切换。
+  showChatView();
+  if (isMobile()) {
+    try { history.pushState({ view: "chat", id }, ""); } catch { /* 忽略 */ }
+  }
+  const detail = await api("/api/threads/" + encodeURIComponent(id));
+  // 切会话时上一个请求可能才返回：晚到的响应一律丢弃，否则会把旧会话的内容写进当前视图。
+  if (state.threadId !== id) return;
+  state.detail = detail;
+  renderChatHead();
+  renderModels();
+  updateModelChip();
+  await loadTurns(null);
+  if (state.threadId !== id) return;
+  updateAtBottom();
+  loadUsage(id).catch(() => {});
+  loadQueue(id).catch(() => {});
+}
+
+function closeThread(id) {
+  try {
+    navigator.sendBeacon("/api/threads/" + encodeURIComponent(id) + "/close?token=" + encodeURIComponent(state.token));
+  } catch { /* 关闭失败不影响切换 */ }
+}
+
+/* ================= 动作 ================= */
+
+/* ---------- 斜杠命令 ---------- */
+
+// 只有「/」开头且还没输入空格的片段才算命令名补全；`/rename 标题` 这类整串交给提交处理。
+function slashMatches(text) {
+  const match = /^\/([a-zA-Z]*)$/.exec(text);
+  if (!match) return [];
+  const keyword = match[1].toLowerCase();
+  return SLASH_COMMANDS.filter((cmd) => !keyword || cmd.name.indexOf(keyword) === 0);
+}
+
+function slashVisible() {
+  return !$("slashPanel").hidden;
+}
+
+function closeSlash() {
+  if (!slashVisible()) return;
+  $("slashPanel").hidden = true;
+  // 「/」按钮补出来的空命令在收起面板时一起清掉，免得误发一条只有斜杠的消息。
+  if ($("input").value.trim() === "/") {
+    $("input").value = "";
+    autoGrow();
+  }
+}
+
+function renderSlash(matches) {
+  const panel = $("slashPanel");
+  const list = $("slashList");
+  state.slashMatches = matches;
+  list.textContent = "";
+  if (!matches.length) {
+    panel.hidden = true;
+    return;
+  }
+  state.slashIndex = Math.max(0, Math.min(state.slashIndex, matches.length - 1));
+  matches.forEach((cmd, index) => {
+    const item = el("button", "slash-item" + (index === state.slashIndex ? " active" : ""));
+    item.type = "button";
+    item.setAttribute("role", "option");
+    item.appendChild(el("span", "slash-cmd", cmd.usage));
+    const body = el("span", "slash-body");
+    body.appendChild(el("span", "slash-title", cmd.title));
+    body.appendChild(el("span", "slash-desc", cmd.desc));
+    item.appendChild(body);
+    // 命令由统一的点按分发执行，不在这里挂 click：手机上那一次 click 常常落不到按钮上。
+    item.dataset.index = String(index);
+    list.appendChild(item);
+  });
+  panel.hidden = false;
+}
+
+// 命令面板只由「/」按钮打开：输入框里敲出 / 不再自动弹出，面板已打开时才按输入过滤。
+function updateSlash() {
+  if (!slashVisible()) return;
+  if (!state.threadId) {
+    closeSlash();
+    return;
+  }
+  const matches = slashMatches($("input").value.trim());
+  if (!matches.length) {
+    closeSlash();
+    return;
+  }
+  renderSlash(matches);
+}
+
+// 输入框右侧的「/」按钮是命令面板的唯一入口，和输入框里已有内容无关：
+// 空输入时补一个斜杠方便接着过滤，已有草稿时原样保留并列出全部命令。
+function toggleSlash() {
+  const input = $("input");
+  if (slashVisible()) {
+    closeSlash();
+    return;
+  }
+  if (!state.threadId) return;
+  const text = input.value.trim();
+  if (!text) {
+    input.value = "/";
+    autoGrow();
+  }
+  input.focus();
+  state.slashIndex = 0;
+  const matches = slashMatches(input.value.trim());
+  renderSlash(matches.length ? matches : SLASH_COMMANDS);
+}
+
+function parseSlashCommand(text) {
+  const match = /^\/([a-zA-Z]+)(?:\s+([\s\S]*))?$/.exec(text);
+  if (!match) return null;
+  return {
+    cmd: SLASH_COMMANDS.find((item) => item.name === match[1].toLowerCase()) || null,
+    arg: (match[2] || "").trim(),
+  };
+}
+
+// 已知命令（含 `/rename 标题` 这种带参数写法）直接执行；命令名只输入了一半时回车
+// 执行面板里高亮的那条；其余一律按普通消息发送，不把以 `/` 开头的正文挡下来。
+function submitInput() {
+  const input = $("input");
+  const text = input.value.trim();
+  // 只发图片、不带文字也是一条合法消息。
+  if ((!text && !attachmentPaths().length) || !state.threadId) return;
+  if (attachmentsPending()) {
+    toast("图片还在上传，请稍候", "warn");
+    return;
+  }
+  if (text.charAt(0) === "/") {
+    const parsed = parseSlashCommand(text);
+    if (parsed && parsed.cmd) {
+      runCommand(parsed.cmd, parsed.arg);
+      return;
+    }
+    if (slashVisible()) {
+      const matches = slashMatches(text);
+      const cmd = matches[state.slashIndex] || matches[0];
+      if (cmd) {
+        runCommand(cmd, "");
+        return;
+      }
+    }
+  }
+  // 走到这里就是普通消息，命令面板不再需要，先收起来避免挡着新内容。
+  closeSlash();
+  if (state.command) {
+    toast("正在" + state.command.title + "，请稍候", "warn");
+    return;
+  }
+  // 回合运行中：先让用户选引导还是排队，选完再投递。
+  if (state.activeTurnId) {
+    openSendMode(text);
+    return;
+  }
+  send(text, "start");
+}
+
+async function runCommand(cmd, arg) {
+  if (!state.threadId) return;
+  const input = $("input");
+  // 输入框里已有普通草稿时不清空它：立即执行的命令跑完草稿还在，需要参数的命令
+  // 只提示用法，等用户自己空出输入框再选一次，避免误触丢掉正在写的内容。
+  const draft = input.value.trim();
+  const onlyCommand = !draft || draft.charAt(0) === "/";
+  // 需要参数的命令先补全用法，等用户填完再回车执行。
+  if (cmd.arg && !arg) {
+    if (!onlyCommand) {
+      closeSlash();
+      input.focus();
+      toast("用法：" + cmd.usage + " " + cmd.arg);
+      return;
+    }
+    input.value = cmd.usage + " ";
+    autoGrow();
+    closeSlash();
+    input.focus();
+    toast("用法：" + cmd.usage + " " + cmd.arg);
+    return;
+  }
+  // 状态只在网页本地汇总，不受正在运行的命令影响。
+  if (cmd.name === "status") {
+    if (onlyCommand) {
+      input.value = "";
+      autoGrow();
+    }
+    closeSlash();
+    openStatus();
+    return;
+  }
+  if (state.command) {
+    toast("正在" + state.command.title + "，请稍候", "warn");
+    return;
+  }
+  if (onlyCommand) {
+    input.value = "";
+    autoGrow();
+  }
+  closeSlash();
+  const payload = { command: cmd.name };
+  if (cmd.arg) payload.name = arg;
+  try {
+    const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/command", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (cmd.name === "rename") {
+      const name = body.name || arg;
+      if (state.detail && state.detail.thread) state.detail.thread.name = name;
+      const hit = state.threads.find((thread) => thread.id === state.threadId);
+      if (hit) hit.name = name;
+      renderChatHead();
+      renderThreads();
+      toast("已重命名为「" + name + "」");
+      return;
+    }
+    // 压缩与评审都会另起一个不可打断的回合，期间只提示状态，避免继续发送被上游拒绝。
+    setCommand(cmd);
+    startRun(body.turn);
+    toast(cmd.name === "compact" ? "已开始压缩上下文" : "已开始代码评审");
+    scheduleReload(600);
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function setCommand(cmd) {
+  clearTimeout(state.commandTimer);
+  state.command = cmd;
+  state.commandTimer = setTimeout(clearCommand, 180000);
+  renderComposerState();
+}
+
+function clearCommand() {
+  if (!state.command) return;
+  clearTimeout(state.commandTimer);
+  state.commandTimer = null;
+  state.command = null;
+  renderComposerState();
+}
+
+function renderComposerState() {
+  const busy = !!state.command;
+  $("sendBtn").disabled = busy || attachmentsPending();
+  $("input").placeholder = busy ? state.command.title + "中…" : "输入消息…";
+  renderChatHead();
+}
+
+/* ---------- 会话状态 ---------- */
+
+function statusRows() {
+  const thread = (state.detail && state.detail.thread) || {};
+  const total = formatTokens(state.usage.total && state.usage.total.total_tokens);
+  const context = contextInfo();
+  return [
+    ["标题", thread.name || preview(thread.preview) || "（未命名）"],
+    ["会话 ID", state.threadId || "—", true],
+    ["模型", (state.detail && state.detail.model) || "跟随会话"],
+    ["推理强度", $("effort").value || "默认"],
+    ["工作目录", thread.cwd || "—", true],
+    ["累计用量", total ? total + " tokens" : "—"],
+    ["上下文用量", context ? formatTokens(context.used) + " / " + formatTokens(context.window) + "（" + context.percent + "%）" : "—"],
+    ["已载入回合", state.turns.length + " 个"],
+    ["运行状态", state.command ? state.command.title + "中" : (state.activeTurnId ? "运行中" : "空闲")],
+  ];
+}
+
+function openStatus() {
+  const root = $("statusList");
+  root.textContent = "";
+  for (const [key, value, mono] of statusRows()) {
+    const row = el("div", "status-row");
+    row.appendChild(el("span", "k", key));
+    row.appendChild(el("span", "v" + (mono ? " mono" : ""), String(value)));
+    root.appendChild(row);
+  }
+  $("statusOverlay").hidden = false;
+  $("statusSheet").hidden = false;
+}
+
+function closeStatus() {
+  $("statusOverlay").hidden = true;
+  $("statusSheet").hidden = true;
+}
+
+/* ---------- 工作目录 ---------- */
+
+// 目录里只做展示：目录用实心三角，文件用点，其它类型不猜，统一问号。
+const FILE_KIND_MARK = { dir: "▸", file: "·", other: "?" };
+
+async function openFiles() {
+  // 与回合、用量一样先记下会话：响应回来时用户可能已经切走，晚到的那份不能再写进面板。
+  const id = state.threadId;
+  const thread = (state.detail && state.detail.thread) || null;
+  $("filesPath").textContent = (thread && thread.cwd) || "—";
+  $("filesSummary").textContent = "载入中…";
+  $("filesList").textContent = "";
+  $("filesOverlay").hidden = false;
+  $("filesSheet").hidden = false;
+  let body;
+  try {
+    body = await api("/api/threads/" + encodeURIComponent(id) + "/files");
+  } catch (error) {
+    if (state.threadId !== id) return;
+    $("filesSummary").textContent = error && error.message ? error.message : "读取目录失败";
+    return;
+  }
+  if (state.threadId !== id) return;
+  if (body && body.cwd) $("filesPath").textContent = body.cwd;
+  const entries = (body && body.entries) || [];
+  const summary = body && body.error ? [body.error] : [entries.length ? "共 " + entries.length + " 项" : "空目录"];
+  if (body && body.truncated) summary.push("只列出其中一部分");
+  $("filesSummary").textContent = summary.join(" · ");
+  const list = $("filesList");
+  list.textContent = "";
+  for (const entry of entries) {
+    const row = el("div", "file-row" + (entry.kind === "dir" ? " dir" : ""));
+    row.appendChild(el("span", "file-kind", FILE_KIND_MARK[entry.kind] || "?"));
+    row.appendChild(el("span", "file-name", entry.name));
+    row.appendChild(el("span", "file-size", entry.kind === "file" ? formatBytes(entry.size) : ""));
+    list.appendChild(row);
+  }
+}
+
+function closeFiles() {
+  $("filesOverlay").hidden = true;
+  $("filesSheet").hidden = true;
+}
+
+/* ---------- 运行中发送方式 ---------- */
+
+// 回合正在运行时，先把消息存下来，让用户选择引导还是排队，选完再真正投递。
+let pendingSend = null;
+
+function openSendMode(text) {
+  pendingSend = text;
+  closeSlash();
+  // 收起软键盘，避免移动端面板被输入法挡住；消息留在输入框里，取消后还能接着编辑。
+  $("input").blur();
+  $("sendModeOverlay").hidden = false;
+  $("sendModeSheet").hidden = false;
+}
+
+function hideSendMode() {
+  $("sendModeOverlay").hidden = true;
+  $("sendModeSheet").hidden = true;
+}
+
+// 取消时把消息留在输入框里，用户能继续编辑后再发。
+function cancelSendMode() {
+  pendingSend = null;
+  hideSendMode();
+}
+
+function chooseSendMode(mode) {
+  const text = pendingSend;
+  pendingSend = null;
+  hideSendMode();
+  // 空文本也可能是合法的「只发图片」消息，所以只按 null 判断取消。
+  if (text !== null) send(text, mode);
+}
+
+async function send(text, mode) {
+  const images = attachmentPaths();
+  if ((!text && !images.length) || !state.threadId) return;
+  if (state.command) {
+    toast("正在" + state.command.title + "，请稍候", "warn");
+    return;
+  }
+  if (attachmentsPending()) {
+    toast("图片还在上传，请稍候", "warn");
+    return;
+  }
+  const input = $("input");
+  // 发送失败时把草稿与图片一起还回来，用户不用重新选一遍。
+  const draft = state.attachments.slice();
+  input.value = "";
+  autoGrow();
+  closeSlash();
+  clearAttachments();
+  try {
+    const payload = { text, model: $("model").value || null, effort: $("effort").value || null };
+    if (images.length) payload.images = images;
+    // 运行中的回合：引导并入当前回合，排队交给上游在本回合结束后执行，都不新起回合。
+    if (mode === "steer" || mode === "queue") {
+      payload.mode = mode;
+      if (mode === "steer") payload.turnId = state.activeTurnId;
+    }
+    const body = await api("/api/threads/" + encodeURIComponent(state.threadId) + "/messages", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    // 自己发出的消息一定跟到底部。
+    state.autoScroll = true;
+    if (mode === "steer") {
+      toast("已引导当前回合");
+      scheduleReload(500);
+      return;
+    }
+    if (mode === "queue") {
+      toast("已排队，等当前回合结束后发送");
+      loadQueue(state.threadId).catch(() => {});
+      scheduleReload(600);
+      return;
+    }
+    // 新回合开启状态条统计。
+    startRun(body.turn);
+    scheduleReload(500);
+  } catch (error) {
+    input.value = text;
+    state.attachments = draft;
+    renderAttachBar();
+    renderComposerState();
+    autoGrow();
+    reportError(error);
+  }
+}
+
+async function stop() {
+  if (!state.threadId || !state.activeTurnId) return;
+  try {
+    await api("/api/threads/" + encodeURIComponent(state.threadId) + "/interrupt", {
+      method: "POST",
+      body: JSON.stringify({ turnId: state.activeTurnId }),
+    });
+    toast("已请求停止");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function scheduleReload(delay) {
+  clearTimeout(state.reloadTimer);
+  state.reloadTimer = setTimeout(() => {
+    if (state.threadId) loadTurns(null).catch(() => {});
+  }, delay);
+}
+
+function autoGrow() {
+  const input = $("input");
+  input.style.height = "auto";
+  const viewport = window.visualViewport;
+  const limit = Math.round(((viewport && viewport.height) || window.innerHeight) * 0.4);
+  input.style.height = Math.min(input.scrollHeight, limit) + "px";
+}
+
+/* ================= 图片输入 ================= */
+
+// 网关的请求体上限是 2 MiB，Base64 会再放大三分之一，所以单张限制在 1.4 MiB 以内。
+const ATTACH_MAX_BYTES = 1.4 * 1024 * 1024;
+const ATTACH_MAX_COUNT = 4;
+
+// 图片先在网页侧预览，再由网关落盘换成路径；上传完成前不允许发送，避免漏图。
+function renderAttachBar() {
+  const bar = $("attachBar");
+  bar.textContent = "";
+  if (!state.attachments.length) {
+    bar.hidden = true;
+    return;
+  }
+  for (const item of state.attachments) {
+    const thumb = el("div", "attach-thumb" + (item.path ? "" : " pending"));
+    if (item.path) {
+      const image = el("img");
+      image.src = item.dataUrl;
+      image.alt = item.name || "待发送的图片";
+      thumb.appendChild(image);
+    } else {
+      thumb.appendChild(el("span", null, "上传中"));
+    }
+    const remove = el("button", "attach-remove", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "移除这张图片");
+    remove.dataset.id = item.id;
+    thumb.appendChild(remove);
+    bar.appendChild(thumb);
+  }
+  bar.hidden = false;
+}
+
+function removeAttachment(id) {
+  state.attachments = state.attachments.filter((item) => item.id !== id);
+  renderAttachBar();
+  renderComposerState();
+}
+
+function clearAttachments() {
+  state.attachments = [];
+  renderAttachBar();
+}
+
+function attachmentsPending() {
+  return state.uploads > 0 || state.attachments.some((item) => !item.path);
+}
+
+function attachmentPaths() {
+  return state.attachments.filter((item) => item.path).map((item) => item.path);
+}
+
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取图片失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addImages(files) {
+  const list = Array.from(files || []);
+  $("fileInput").value = "";
+  const threadId = state.threadId;
+  if (!list.length || !threadId) return;
+  for (const file of list) {
+    if (state.attachments.length + state.uploads >= ATTACH_MAX_COUNT) {
+      toast("一条消息最多 " + ATTACH_MAX_COUNT + " 张图片", "warn");
+      return;
+    }
+    if (!/^image\//.test(file.type || "")) {
+      toast("只能发送图片文件", "warn");
+      continue;
+    }
+    if (file.size > ATTACH_MAX_BYTES) {
+      toast((file.name || "这张图片") + " 超过 1.4 MB，请先压缩", "bad");
+      continue;
+    }
+    const id = String(++state.attachSeq);
+    state.uploads += 1;
+    state.attachments.push({ id, name: file.name, dataUrl: "", path: "" });
+    renderAttachBar();
+    renderComposerState();
+    try {
+      const dataUrl = await readImage(file);
+      const body = await api("/api/threads/" + encodeURIComponent(threadId) + "/images", {
+        method: "POST",
+        body: JSON.stringify({ name: file.name, dataUrl }),
+      });
+      // 上传期间可能已经切走，这时结果直接丢弃，不再挂到新会话上。
+      if (state.threadId !== threadId) return;
+      if (!body || !body.path) throw new Error("图片上传失败");
+      const item = state.attachments.find((entry) => entry.id === id);
+      if (item) {
+        item.dataUrl = dataUrl;
+        item.path = body.path;
+      }
+    } catch (error) {
+      if (state.threadId === threadId) {
+        state.attachments = state.attachments.filter((entry) => entry.id !== id);
+        reportError(error);
+      }
+    } finally {
+      state.uploads -= 1;
+      renderAttachBar();
+      renderComposerState();
+    }
+  }
+}
+
+/* ================= 审批 ================= */
+
+function renderApprovals() {
+  const host = $("approvalHost");
+  host.textContent = "";
+  const head = state.approvals[0];
+  if (!head) return;
+  const label = head.method === "item/fileChange/requestApproval" ? "请求修改文件" : "请求执行命令";
+  const node = el("div", "approval-card");
+  node.appendChild(el("div", "label", label));
+  const params = head.params || {};
+  const summary = preview(params.reason || params.command || params.cwd || "", 200);
+  if (summary) node.appendChild(el("div", "body", summary));
+  if (params.command && summary !== params.command) node.appendChild(el("pre", null, params.command));
+  const actions = el("div", "actions");
+  const allow = el("button", "allow", "允许");
+  allow.type = "button";
+  const decline = el("button", null, "拒绝");
+  decline.type = "button";
+  allow.addEventListener("click", () => answer(head.key, { decision: "accept" }));
+  decline.addEventListener("click", () => answer(head.key, { decision: "decline" }));
+  actions.appendChild(allow);
+  actions.appendChild(decline);
+  node.appendChild(actions);
+  host.appendChild(node);
+}
+
+async function answer(key, result) {
+  state.approvals = state.approvals.filter((item) => item.key !== key);
+  renderApprovals();
+  try {
+    await api("/api/approvals/" + encodeURIComponent(key), {
+      method: "POST",
+      body: JSON.stringify({ result }),
+    });
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/* ================= 事件流 ================= */
+
+function handleEvent(event) {
+  if (!event) return;
+  if (event.kind === "status") {
+    setStatus(event.connected ? "已连接" : "上游离线", event.connected ? "on" : "off");
+    if (!event.connected && event.detail) toast(event.detail, "bad");
+    return;
+  }
+  if (event.kind === "lagged") {
+    scheduleReload(200);
+    return;
+  }
+  if (event.kind === "request") {
+    if (APPROVAL_METHODS.has(event.method)) {
+      const key = event.idKey || String(event.id);
+      if (!state.approvals.some((item) => item.key === key)) {
+        state.approvals.push({ key, method: event.method, params: event.params || {} });
+        renderApprovals();
+      }
+    }
+    return;
+  }
+  if (event.kind !== "notification") return;
+  const params = event.params || {};
+  if (state.threadId && params.threadId && params.threadId !== state.threadId) return;
+  if (event.method === "item/agentMessage/delta") {
+    const live = state.live.get(params.itemId);
+    if (live) {
+      live.text += params.delta || "";
+      live.node.classList.add("caret");
+      renderLive(live);
+      // 只在自己停在底部时跟随流式输出，翻历史时不打断。
+      if (state.autoScroll) scrollToBottom();
+      else $("toBottom").querySelector(".new").hidden = false;
+    } else {
+      scheduleReload(300);
+    }
+    return;
+  }
+  if (event.method === "turn/started") {
+    startRun(params.turn);
+    if (state.threadId) loadQueue(state.threadId).catch(() => {});
+    scheduleReload(200);
+    return;
+  }
+  // 上游在队列增删或推进时只发一条通知，列表内容要重新取。
+  if (event.method === "thread/queue/changed") {
+    if (state.threadId) loadQueue(state.threadId).catch(() => {});
+    return;
+  }
+  if (event.method === "item/started") {
+    const item = params.item || {};
+    if (item.type === "agentMessage" && item.id) {
+      const node = agentMessage("");
+      node.classList.add("caret");
+      state.live.set(item.id, { node, text: typeof item.text === "string" ? item.text : "", frame: 0 });
+      $("transcript").appendChild(node);
+      if (state.autoScroll) scrollToBottom();
+      else $("toBottom").querySelector(".new").hidden = false;
+      return;
+    }
+    // 思考条目只累计次数，状态条上即时可见，不必为它们重载整段正文。
+    if (item.type === "reasoning") {
+      if (state.activeTurn) {
+        state.activeTurn.reasonings += 1;
+        renderRunbar();
+      }
+      return;
+    }
+    scheduleReload(400);
+    return;
+  }
+  if (event.method === "turn/completed") {
+    endRun();
+    clearCommand();
+    renderChatHead();
+    scheduleReload(250);
+    // 回合结束的用量要等 rollout 落盘，稍后再补一次，回合末尾的 token 才是最终值。
+    const id = state.threadId;
+    if (id) setTimeout(() => { if (state.threadId === id) loadUsage(id).catch(() => {}); }, 1500);
+    return;
+  }
+  if (event.method === "item/completed") {
+    const item = params.item || {};
+    const live = item.id ? state.live.get(item.id) : null;
+    if (live && item.type === "agentMessage") {
+      // 用完成事件里的最终文本重渲染，避免整段重载时服务器尚未返回这条消息。
+      if (typeof item.text === "string" && item.text) live.text = item.text;
+      live.node.textContent = "";
+      renderMarkdown(live.node, live.text);
+      live.node.classList.remove("caret");
+      state.live.delete(item.id);
+      return;
+    }
+    scheduleReload(350);
+  }
+}
+
+function connectEvents() {
+  const source = new EventSource("/api/events?token=" + encodeURIComponent(state.token));
+  // 断线期间可能错过回合结束事件，重连后补一次对齐，避免状态条一直停在运行中。
+  let dropped = false;
+  source.onopen = () => {
+    setStatus("已连接", "on");
+    if (dropped) {
+      dropped = false;
+      scheduleReload(200);
+    }
+  };
+  source.onmessage = (message) => {
+    try { handleEvent(JSON.parse(message.data)); } catch { /* 忽略单条坏事件 */ }
+  };
+  source.onerror = () => {
+    dropped = true;
+    setStatus("重连中…", "warn");
+  };
+}
+
+/* ================= 令牌门 ================= */
+
+function showGate(hint) {
+  $("gate").hidden = false;
+  $("app").hidden = true;
+  if (hint) $("gate").querySelector("p").textContent = hint;
+  $("gateToken").focus();
+}
+
+function readToken() {
+  const url = new URL(location.href);
+  const fromUrl = url.searchParams.get("token");
+  if (fromUrl) {
+    sessionStorage.setItem(TOKEN_KEY, fromUrl);
+    url.searchParams.delete("token");
+    history.replaceState({ view: "list" }, "", url.toString());
+  }
+  return sessionStorage.getItem(TOKEN_KEY) || "";
+}
+
+/* ================= 启动 ================= */
+
+/**
+ * 把 app 对齐到当前可见视口。地址栏收放与软键盘弹出会改变可见高度，
+ * 部分浏览器还会滚动可视视口（offsetTop 不为 0）来露出输入框；只改高度会
+ * 让输入栏被顶到屏幕上方并盖住正文，所以这里同时同步 top 与 height。
+ */
+// 顶栏那条在窄屏与宽屏上取舍不同，宽度跨过断点时要重画一次，不然会留着上一档的内容。
+let lastMobile = null;
+
+function syncViewport() {
+  const viewport = window.visualViewport;
+  const height = Math.round((viewport && viewport.height) || window.innerHeight || 0);
+  if (height > 0) $("app").style.height = height + "px";
+  const top = Math.max(0, Math.round((viewport && viewport.offsetTop) || 0));
+  $("app").style.top = top + "px";
+  if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+  if (isMobile() !== lastMobile) {
+    lastMobile = isMobile();
+    renderChatHead();
+  }
+}
+
+function bind() {
+  syncViewport();
+  window.addEventListener("resize", syncViewport);
+  window.addEventListener("orientationchange", syncViewport);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncViewport);
+    window.visualViewport.addEventListener("scroll", syncViewport);
+  }
+  // 键盘弹出/收起有动画，聚焦前后各同步几次，避免输入栏停在中间位置。
+  const syncSoon = () => {
+    syncViewport();
+    for (const delay of [80, 200, 400]) setTimeout(syncViewport, delay);
+  };
+  $("input").addEventListener("focus", syncSoon);
+  $("input").addEventListener("blur", syncSoon);
+  $("backBtn").addEventListener("click", () => {
+    if (history.state && history.state.view === "chat") history.back();
+    else showListView();
+  });
+  $("modelChip").addEventListener("click", openSheet);
+  $("sheetClose").addEventListener("click", closeSheet);
+  $("overlay").addEventListener("click", closeSheet);
+  $("navBtn").addEventListener("click", openNav);
+  $("navClose").addEventListener("click", closeNav);
+  $("navOverlay").addEventListener("click", closeNav);
+  $("model").addEventListener("change", () => { renderEfforts(); });
+  $("search").addEventListener("input", () => {
+    clearTimeout(state.searchTimer);
+    state.searchTimer = setTimeout(() => loadThreads().catch(reportError), 300);
+  });
+  $("composer").addEventListener("submit", (event) => { event.preventDefault(); submitInput(); });
+  $("stopBtn").addEventListener("click", stop);
+  // 「/」与命令项都走统一点按分发，手机上输入栏被键盘挪走也不会丢掉这一次点按。
+  bindTap();
+  onTap("#cmdBtn", toggleSlash);
+  onTap("#imgBtn", () => $("fileInput").click());
+  onTap(".slash-item", (node) => {
+    const cmd = state.slashMatches[Number(node.dataset.index)];
+    if (cmd) runCommand(cmd, "");
+  });
+  onTap(".attach-remove", (node) => removeAttachment(node.dataset.id));
+  // 会话图片与全屏查看器都走统一点按分发，触屏上也稳。
+  onTap(".msg-image", (node) => openImageViewer(node.dataset.src));
+  onTap("#imgViewer", closeImageViewer);
+  $("fileInput").addEventListener("change", () => {
+    addImages($("fileInput").files).catch(reportError);
+  });
+  // 命令面板：点空白处或输入框失焦都收起；面板内的按下会先让输入框失焦，那一次不算。
+  let slashHold = false;
+  document.addEventListener("pointerdown", (event) => {
+    if (!slashVisible()) return;
+    slashHold = $("slashPanel").contains(event.target);
+    if (slashHold || $("cmdBtn").contains(event.target) || event.target === $("input")) return;
+    closeSlash();
+  });
+  window.addEventListener("pointerup", () => { slashHold = false; });
+  window.addEventListener("pointercancel", () => { slashHold = false; });
+  $("statusClose").addEventListener("click", closeStatus);
+  $("statusOverlay").addEventListener("click", closeStatus);
+  // 顶栏的工作目录胶囊也走统一点按分发：手机上点它不必先让输入框失焦。
+  onTap(".meta-path", openFiles);
+  $("filesClose").addEventListener("click", closeFiles);
+  $("filesOverlay").addEventListener("click", closeFiles);
+  $("sendModeClose").addEventListener("click", cancelSendMode);
+  $("sendModeOverlay").addEventListener("click", cancelSendMode);
+  $("steerChoice").addEventListener("click", () => chooseSendMode("steer"));
+  $("queueChoice").addEventListener("click", () => chooseSendMode("queue"));
+  $("input").addEventListener("blur", (event) => {
+    if (slashHold) return;
+    const next = event.relatedTarget;
+    if (next && $("slashPanel").contains(next)) return;
+    closeSlash();
+  });
+  $("input").addEventListener("input", () => { autoGrow(); updateSlash(); });
+  $("input").addEventListener("keydown", (event) => {
+    if (event.isComposing) return;
+    if (slashVisible()) {
+      const matches = slashMatches($("input").value.trim());
+      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && matches.length) {
+        event.preventDefault();
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        state.slashIndex = (state.slashIndex + step + matches.length) % matches.length;
+        renderSlash(matches);
+        return;
+      }
+      if (event.key === "Tab" && matches.length) {
+        event.preventDefault();
+        const cmd = matches[state.slashIndex] || matches[0];
+        $("input").value = cmd.usage + (cmd.arg ? " " : "");
+        autoGrow();
+        updateSlash();
+        return;
+      }
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submitInput();
+    }
+  });
+  $("toBottom").addEventListener("click", () => {
+    scrollToBottom();
+    updateToBottom();
+  });
+  $("transcript").addEventListener("scroll", updateAtBottom, { passive: true });
+  window.addEventListener("popstate", () => showListView());
+  window.addEventListener("beforeunload", () => { if (state.threadId) closeThread(state.threadId); });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeSlash();
+      closeSheet();
+      closeNav();
+      closeStatus();
+      closeFiles();
+      cancelSendMode();
+    }
+  });
+}
+
+async function boot() {
+  state.token = readToken();
+  if (!state.token) {
+    showGate();
+    $("gateSave").addEventListener("click", () => {
+      const value = $("gateToken").value.trim();
+      if (!value) return;
+      sessionStorage.setItem(TOKEN_KEY, value);
+      location.reload();
+    });
+    return;
+  }
+  bind();
+  setStatus("连接中…", "warn");
+  renderThreads();
+  renderTranscript(true);
+  connectEvents();
+  // 网关与桌面共用同一条上游连接，没有独立连接状态时用轮询兜底补齐桌面端发起的回合。
+  setInterval(() => {
+    if (!state.threadId || state.activeTurnId) return;
+    // 用户翻历史时不再打断，等回到最新再续上。
+    if (!state.autoScroll) return;
+    loadTurns(null).catch(() => {});
+  }, 5000);
+  try {
+    await Promise.all([loadModels(), loadThreads()]);
+  } catch (error) {
+    reportError(error);
+  }
+  let last = "";
+  try { last = localStorage.getItem(LAST_THREAD_KEY) || ""; } catch { /* 忽略 */ }
+  if (last && state.threads.some((thread) => thread.id === last)) {
+    openThread(last).catch(() => {});
+  } else if (!isMobile() && state.threads.length) {
+    openThread(state.threads[0].id).catch(() => {});
+  }
+}
+
+boot();
+</script>
+</body>
+</html>

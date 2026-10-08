@@ -603,6 +603,12 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     // 启动器只接收首次握手；之后 app-server 重启时仍必须能执行 CLI。
     let readiness = (app_server && managed_launch).then(CliWrapperReadiness::begin);
     let mut input_router: Option<std::process::Child> = None;
+    // 共享模式要接管桌面 app-server 的 stdio，管道必须在 spawn 后立刻交给网关；状态与
+    // `input_router` 一样声明在闭包外，闭包内只赋值。
+    #[cfg(windows)]
+    let mut shared_upstream: Option<crate::remote_gateway::SharedUpstream> = None;
+    #[cfg(windows)]
+    let mut shared_source: Option<Box<dyn std::io::Read + Send>> = None;
     let launch = (|| -> Result<std::process::Child> {
         anyhow::ensure!(
             target.is_absolute(),
@@ -636,8 +642,24 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             None => original_args,
         };
         let runtime_overrides = runtime_overrides.unwrap_or_default();
+        // 桌面 app-server 的 stdio 与桌面窗口一一绑定，浏览器无法接入。默认的共享模式在
+        // 同一包装进程内接管这条 stdio：桌面数据流逐行直通，网页请求注入同一会话，因此
+        // 桌面正在运行的会话也能收发；桌面自身的协议流、握手与降级语义都不受影响。
+        #[cfg(windows)]
+        if app_server && managed_launch {
+            shared_upstream = crate::remote_gateway::prepare_upstream(
+                &target,
+                &rewritten_args,
+                &runtime_overrides,
+            );
+        }
         let mut command = std::process::Command::new(&target);
         command.args(rewritten_args);
+        #[cfg(windows)]
+        if shared_upstream.is_some() {
+            command.stdin(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
+        }
         for name in [
             "CODEX_CLI_PATH",
             CLI_WRAPPER_TARGET_ENV,
@@ -685,12 +707,22 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
                 relay.creation_flags(codey_runtime_core::windows_create_no_window());
             }
             let mut relay = relay.spawn().context("启动 Codex 本地路由请求转发失败")?;
-            command.stdin(
-                relay
-                    .stdout
-                    .take()
-                    .context("Codex 本地路由请求管道不可用")?,
-            );
+            let relay_output = relay
+                .stdout
+                .take()
+                .context("Codex 本地路由请求管道不可用")?;
+            #[cfg(windows)]
+            match shared_upstream.as_ref() {
+                // 共享模式由网关把已改写的桌面输入直通给 app-server。
+                Some(_) => {
+                    shared_source = Some(Box::new(relay_output));
+                }
+                None => {
+                    command.stdin(relay_output);
+                }
+            }
+            #[cfg(not(windows))]
+            command.stdin(relay_output);
             input_router = Some(relay);
         }
         #[cfg(target_os = "macos")]
@@ -736,6 +768,12 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     if let Some(readiness) = readiness {
         readiness.executed();
     }
+    // 桌面 app-server 已经启动，把它的 stdio 交给网关：桌面输入逐行直通，网页请求注入
+    // 同一会话，因此共享模式对桌面不可见，改动也不会影响桌面协议流。
+    #[cfg(windows)]
+    if let Some(setup) = shared_upstream {
+        setup.serve(child.stdin.take(), child.stdout.take(), shared_source);
+    }
     let status = child.wait();
     if let Some(mut relay) = input_router {
         let _ = relay.kill();
@@ -745,6 +783,42 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
         status.with_context(|| format!("等待 Codex CLI 退出失败：{}", target.display()))?;
     let _ = codey_runtime_core::diagnostic_log::flush_diagnostic_log();
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+/// 本地路由模式要求会话一律使用 `codey_router` 提供商：覆盖桌面传入的提供商，并清掉会被
+/// app-server 当作自定义提供商的配置项。返回是否发生了改写。
+///
+/// 网页注入的会话请求走 remote_gateway::shared，同样调用这里以保持行为一致。
+pub(crate) fn rewrite_local_router_message(message: &mut serde_json::Value) -> bool {
+    if !matches!(
+        message.get("method").and_then(serde_json::Value::as_str),
+        Some("thread/start" | "thread/resume" | "thread/fork")
+    ) {
+        return false;
+    }
+    if message.get("params").is_none_or(serde_json::Value::is_null) {
+        message["params"] = serde_json::json!({});
+    }
+    let Some(params) = message
+        .get_mut("params")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    params.insert("modelProvider".into(), "codey_router".into());
+    if let Some(config) = params
+        .get_mut("config")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        config.retain(|key, _| {
+            key != "model_provider"
+                && !key.starts_with("model_provider.")
+                && key != "model_providers"
+                && !key.starts_with("model_providers.")
+        });
+    }
+    true
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -759,33 +833,10 @@ fn route_local_app_server_input(
             return Ok(());
         }
         if let Ok(mut message) = serde_json::from_slice::<serde_json::Value>(&line)
-            && matches!(
-                message.get("method").and_then(serde_json::Value::as_str),
-                Some("thread/start" | "thread/resume" | "thread/fork")
-            )
+            && rewrite_local_router_message(&mut message)
         {
-            if message.get("params").is_none_or(serde_json::Value::is_null) {
-                message["params"] = serde_json::json!({});
-            }
-            if let Some(params) = message
-                .get_mut("params")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                params.insert("modelProvider".into(), "codey_router".into());
-                if let Some(config) = params
-                    .get_mut("config")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    config.retain(|key, _| {
-                        key != "model_provider"
-                            && !key.starts_with("model_provider.")
-                            && key != "model_providers"
-                            && !key.starts_with("model_providers.")
-                    });
-                }
-                line = serde_json::to_vec(&message).map_err(std::io::Error::other)?;
-                line.push(b'\n');
-            }
+            line = serde_json::to_vec(&message).map_err(std::io::Error::other)?;
+            line.push(b'\n');
         }
         output.write_all(&line)?;
         output.flush()?;

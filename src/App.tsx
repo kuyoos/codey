@@ -36,6 +36,7 @@ import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { customContextRestoredNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
+import { RemoteControlCard, type RemoteControlHandle } from "./RemoteControlCard";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { SettingsLayout } from "./SettingsLayout";
@@ -165,6 +166,9 @@ export function App({
     return () => cancelAnimationFrame(frame);
   }, [usageAnalysisOpen]);
   const [busy, setBusy] = useState<string | null>(null);
+  // 远程控制卡片是独立配置文件，草稿留在卡片内，这里只跟踪脏状态和保存入口。
+  const remoteControlRef = useRef<RemoteControlHandle | null>(null);
+  const [remoteDirty, setRemoteDirty] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
   const [injectionRepairRequested, setInjectionRepairRequested] = useState(false);
@@ -182,6 +186,7 @@ export function App({
 
   const provider = providerStatus?.provider;
   const isBusy = busy !== null || (injectionRepairRequested && !restartStatusError);
+  const anyDirty = dirty || remoteDirty;
   useEffect(() => {
     if (!injectionRepairRequested || status.restartInProgress) return;
     setInjectionRepairRequested(false);
@@ -958,7 +963,16 @@ export function App({
 
   async function saveCurrent() {
     if (!config) return;
+    if (!dirty && !remoteDirty) return;
     await runOperation("save", async () => {
+      const remoteSaved = remoteDirty;
+      if (remoteSaved) await remoteControlRef.current?.save();
+      if (!dirty) {
+        if (remoteSaved) {
+          setNotice({ tone: "info", text: "远程控制设置已保存，重启 Codex 后生效" });
+        }
+        return;
+      }
       const retryCountChanged =
         persistedConfigRef.current?.streamMaxRetries !== config.streamMaxRetries;
       const result = await persist(config);
@@ -997,6 +1011,9 @@ export function App({
       if (retryCountChanged && result.restartRequired) {
         noticeText = "Codey 设置已保存；会话重试次数将在重启 Codex 后生效";
       }
+      if (remoteSaved) {
+        noticeText = `远程控制设置已保存，重启 Codex 后生效；${noticeText}`;
+      }
       setNotice({ tone: noticeTone, text: noticeText });
     });
   }
@@ -1004,6 +1021,7 @@ export function App({
   function closeSettings() {
     if (isBusy) return;
     discardDraft();
+    remoteControlRef.current?.reset();
     setModelPickerVisible(false);
     setUsageAnalysisOpen(false);
     usageReturn.current = null;
@@ -1013,7 +1031,7 @@ export function App({
 
   function requestCloseSettings() {
     if (isBusy) return;
-    if (!dirty) {
+    if (!anyDirty) {
       closeSettings();
       return;
     }
@@ -1065,6 +1083,7 @@ export function App({
     if (!config) return;
     await runOperation("restart", async () => {
       if (dirty) await persist(config);
+      if (remoteDirty) await remoteControlRef.current?.save();
       setNotice({
         tone: "info",
         text: "正在重启 Codex，Codey 将自动重新拉起客户端…",
@@ -1385,7 +1404,7 @@ export function App({
         <div className="flex min-w-0 flex-col">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <h1 className="m-0 whitespace-nowrap text-base font-bold tracking-[-0.02em] text-[var(--codey-text,#1d1d1f)]">Codey 控制台</h1>
-            {dirty && (
+            {anyDirty && (
               <Badge variant="warning">
                 未保存更改
               </Badge>
@@ -1434,21 +1453,21 @@ export function App({
             </Button>
           )}
           <Button
-            aria-label={dirty ? "保存更改" : "已保存"}
+            aria-label={anyDirty ? "保存更改" : "已保存"}
             className="h-8! min-w-[84px] px-3 text-xs max-[520px]:min-w-8! max-[520px]:w-8! max-[520px]:px-0!"
-            disabled={!dirty || isBusy}
+            disabled={!anyDirty || isBusy}
             onClick={handleSaveCurrent}
-            variant={dirty ? "default" : "secondary"}
+            variant={anyDirty ? "default" : "secondary"}
           >
             {busy === "save" ? (
               <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
-            ) : dirty ? (
+            ) : anyDirty ? (
               <Save size={14} aria-hidden="true" />
             ) : (
               <Check size={14} aria-hidden="true" />
             )}
             <span className="max-[520px]:hidden">
-              {dirty ? "保存更改" : "已保存"}
+              {anyDirty ? "保存更改" : "已保存"}
             </span>
           </Button>
           {embedded && (
@@ -1665,6 +1684,13 @@ export function App({
               subagentModelOptions={subagentModelOptions}
               onConfigChange={handleConfigChange}
               onSubagentOptimizationChange={handleSubagentOptimizationChange}
+            />
+          ),
+          remote: (
+            <RemoteControlCard
+              isBusy={isBusy}
+              onDirtyChange={setRemoteDirty}
+              handleRef={remoteControlRef}
             />
           ),
           plugins: <CodeyPluginsSection container={popupContainer} />,

@@ -1067,6 +1067,17 @@ async fn resolve_session_name_cached(
     .await
 }
 
+/// 远程控制网关只在 Windows 桌面运行，其余平台如实回传不可用。
+#[cfg(windows)]
+async fn remote_gateway_command(command: &str, args: &Value) -> Result<Value, String> {
+    crate::remote_gateway::console::invoke(command, args).await
+}
+
+#[cfg(not(windows))]
+async fn remote_gateway_command(_command: &str, _args: &Value) -> Result<Value, String> {
+    Err("远程控制仅支持 Windows 桌面".to_owned())
+}
+
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
         "load_codey_config" => load_codey_config(state).await,
@@ -1079,6 +1090,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "reorder_route_models"
         | "delete_route"
         | "fetch_route_models"
+        | "test_route_model"
         | "save_selected_models"
         | "save_default_model"
         | "save_official_route_models" => models::invoke(state, command, &args).await,
@@ -1202,6 +1214,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "open_codey_plugin_logs"
         | "clear_codey_plugin_logs"
         | "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "remote_gateway_status"
+        | "save_remote_gateway_config"
+        | "regenerate_remote_gateway_token" => remote_gateway_command(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
     result.unwrap_or_else(api_error_message)
