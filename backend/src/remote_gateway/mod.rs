@@ -15,6 +15,7 @@ pub(crate) mod console;
 mod frp;
 mod http;
 mod shared;
+mod thread_store;
 mod upstream;
 
 use std::collections::{HashMap, HashSet};
@@ -1028,92 +1029,91 @@ async fn api_threads(state: &State, request: &Request) -> ApiResult {
     } else {
         None
     };
-    let mut cursor = request
-        .query_value("cursor")
-        .filter(|cursor| !cursor.is_empty())
-        .map(str::to_owned);
-    // 上游按最近使用倒序返回，这里按同一顺序拼多页并去重；搜索仍只取一页，避免结果过大。
-    let max_pages = if search.is_some() {
-        1
-    } else {
-        THREAD_MAX_PAGES
-    };
-    let mut collected = Vec::new();
-    let mut seen = HashSet::new();
-    for _ in 0..max_pages {
-        let mut params = json!({ "limit": THREAD_PAGE_LIMIT, "archived": false });
-        if let Some(search) = search.as_deref() {
-            params["searchTerm"] = json!(search);
-        }
-        if let Some(page_cursor) = cursor.as_deref() {
-            params["cursor"] = json!(page_cursor);
-        }
-        let value = state
-            .upstream
-            .request("thread/list", params)
-            .await
-            .map_err(upstream_error)?;
-        let page = value
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut fresh = 0usize;
-        let mut oldest = i64::MAX;
-        for thread in &page {
-            let id = thread.get("id").and_then(Value::as_str);
-            if id.is_some_and(|id| seen.insert(id.to_owned())) {
-                fresh += 1;
-                collected.push(thread.clone());
-            }
-            if let Some(updated_at) = thread_updated_at(thread) {
-                oldest = oldest.min(updated_at);
-            }
-        }
-        cursor = value
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .filter(|cursor| !cursor.is_empty())
-            .map(str::to_owned);
-        // fresh 为 0 说明上游没按游标往后走（或整页都重复），再翻还是同一页，必须停。
-        if page.is_empty() || fresh == 0 || cursor.is_none() {
-            break;
-        }
-        // 这一页已经翻到窗口之外，后面只会更旧，没必要继续。
-        if cutoff.is_some_and(|cutoff| oldest < cutoff) {
-            break;
-        }
+    // 上游 `thread/list` 只返回桌面进程当下正在使用的一小部分会话，刚完成的会话也可能不在
+    // 其中，因此这里只把它当实时字段（运行状态、模型等）的来源；列表本身读桌面 state 库，
+    // 与桌面侧边栏同源。
+    let mut params = json!({ "limit": THREAD_PAGE_LIMIT, "archived": false });
+    if let Some(search) = search.as_deref() {
+        params["searchTerm"] = json!(search);
     }
-    let mut threads = collected
+    let upstream = state
+        .upstream
+        .request("thread/list", params)
+        .await
+        .unwrap_or(Value::Null);
+    let upstream_threads = upstream
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let home = crate::codex_config::codex_home().to_path_buf();
+    let query = thread_store::Query {
+        search: search.clone(),
+        cutoff,
+        limit: if search.is_some() {
+            thread_store::SEARCH_LIMIT
+        } else {
+            thread_store::HOME_LIMIT
+        },
+    };
+    let stored = read_stored_threads(home.clone(), query).await;
+    let mut threads = stored
         .iter()
-        .filter(|thread| thread_in_window(thread, cutoff))
-        .map(compact_thread)
+        .map(|row| merge_thread_row(row, &upstream_threads))
         .collect::<Vec<_>>();
-    // 窗口里一条都没有时至少留最近几条，首页不至于整片空白。
+    // 库里还没有、上游却已经认识的会话（例如刚创建还没落库）补在后面。
+    let listed = threads
+        .iter()
+        .filter_map(|thread| thread.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    for thread in &upstream_threads {
+        let known = thread
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| listed.contains(id));
+        if known || !thread_in_window(thread, cutoff) {
+            continue;
+        }
+        threads.push(compact_thread(thread));
+    }
+    // 库里最近没有活动的会话时至少留最近几条，首页不至于整片空白。
     let used_floor = threads.is_empty() && cutoff.is_some();
     if used_floor {
-        threads = collected
+        let floor = thread_store::Query {
+            search: None,
+            cutoff: None,
+            limit: THREAD_RECENT_FLOOR,
+        };
+        threads = read_stored_threads(home, floor)
+            .await
             .iter()
-            .take(THREAD_RECENT_FLOOR)
-            .map(compact_thread)
+            .map(|row| merge_thread_row(row, &upstream_threads))
             .collect();
+        if threads.is_empty() {
+            threads = upstream_threads
+                .iter()
+                .take(THREAD_RECENT_FLOOR)
+                .map(compact_thread)
+                .collect();
+        }
     }
+    threads.sort_by_key(|thread| std::cmp::Reverse(thread_updated_at(thread).unwrap_or_default()));
     let window_days = match (cutoff, used_floor) {
         (Some(_), false) => json!(THREAD_WINDOW_DAYS),
         _ => Value::Null,
     };
     Ok(json!({
         "threads": threads,
-        // 窗口内的会话已经全部取回，网页不需要也没有办法继续往后翻。
+        // 一次就把窗口内的会话全部取回，网页不需要也没有办法继续往后翻。
         "nextCursor": Value::Null,
         "windowDays": window_days,
     }))
 }
 
-/// 首页一次向上游取多少条；上游 `thread/list` 的页大小也就是这个量级。
+/// 补实时字段时一次向上游取多少条；上游 `thread/list` 的页大小也就是这个量级。
 const THREAD_PAGE_LIMIT: u32 = 60;
-/// 最多翻这么多页：正常情况翻到窗口之外就停，页数上限只是防上游游标异常时一直翻。
-const THREAD_MAX_PAGES: usize = 8;
 /// 首页只列最近这么多天有过活动的会话，更早的用搜索找。
 const THREAD_WINDOW_DAYS: i64 = 3;
 /// 窗口内一条都没有时（例如很久没用过 Codex）至少留最近这么多条。
@@ -1158,6 +1158,51 @@ fn compact_thread(thread: &Value) -> Value {
         "model": thread.get("model"),
         "status": thread.get("status"),
         "source": thread.get("source"),
+    })
+}
+
+/// state 库读取是同步 I/O，放到阻塞线程，别把事件循环卡住；读不到时按空列表处理。
+async fn read_stored_threads(
+    home: PathBuf,
+    query: thread_store::Query,
+) -> Vec<thread_store::ThreadRow> {
+    tokio::task::spawn_blocking(move || thread_store::home_threads(&home, &query))
+        .await
+        .unwrap_or_default()
+}
+
+/// 把 state 库的一行与上游列表里的同一会话合并：列表字段以库为准（更全），
+/// 运行状态、模型等实时字段以当前上游为准。
+fn merge_thread_row(row: &thread_store::ThreadRow, upstream_threads: &[Value]) -> Value {
+    let upstream = upstream_threads
+        .iter()
+        .find(|thread| thread.get("id").and_then(Value::as_str) == Some(row.id.as_str()));
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let updated_at = std::cmp::max(
+        row.updated_at,
+        upstream.and_then(thread_updated_at).unwrap_or_default(),
+    );
+    json!({
+        "id": row.id.clone(),
+        "name": text(upstream.and_then(|thread| thread.get("name"))).or_else(|| row.name.clone()),
+        "preview": text(upstream.and_then(|thread| thread.get("preview"))).or_else(|| row.preview.clone()),
+        "cwd": text(upstream.and_then(|thread| thread.get("cwd")))
+            .or_else(|| row.cwd.clone())
+            .map(|cwd| thread_store::normalize_cwd(&cwd)),
+        "createdAt": upstream
+            .and_then(|thread| thread.get("createdAt"))
+            .and_then(Value::as_i64)
+            .filter(|seconds| *seconds > 0)
+            .or(row.created_at),
+        "updatedAt": updated_at,
+        "model": text(upstream.and_then(|thread| thread.get("model"))).or_else(|| row.model.clone()),
+        "status": upstream.and_then(|thread| thread.get("status")).cloned().unwrap_or(Value::Null),
+        "source": upstream.and_then(|thread| thread.get("source")).cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -2518,5 +2563,36 @@ mod tests {
         assert!(cutoff <= now - span);
         // 取时间与断言之间允许几秒漂移。
         assert!(cutoff > now - span - 5);
+    }
+
+    #[test]
+    fn merged_thread_takes_list_fields_from_store_and_live_fields_from_upstream() {
+        let row = thread_store::ThreadRow {
+            id: "t1".to_owned(),
+            name: Some("库里的名字".to_owned()),
+            preview: Some("库里的预览".to_owned()),
+            cwd: Some(r"\\?\D:\proj\app".to_owned()),
+            model: Some("db-model".to_owned()),
+            created_at: Some(10),
+            updated_at: 100,
+        };
+        let upstream = vec![json!({
+            "id": "t1",
+            "name": "实时名字",
+            "model": "live-model",
+            "updatedAt": 200,
+            "status": { "type": "active" },
+        })];
+
+        let merged = merge_thread_row(&row, &upstream);
+
+        assert_eq!(merged["name"], json!("实时名字"));
+        assert_eq!(merged["preview"], json!("库里的预览"));
+        // verbatim 前缀在合并结果里已经去掉，网页分组不需要再处理。
+        assert_eq!(merged["cwd"], json!(r"D:\proj\app"));
+        assert_eq!(merged["model"], json!("live-model"));
+        assert_eq!(merged["updatedAt"], json!(200));
+        assert_eq!(merged["createdAt"], json!(10));
+        assert_eq!(merged["status"]["type"], json!("active"));
     }
 }
