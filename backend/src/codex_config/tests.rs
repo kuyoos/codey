@@ -918,7 +918,7 @@ tool_namespace = "agents"
 }
 
 #[test]
-fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inputs() {
+fn disabled_subagent_roles_keep_placeholders_in_runtime_registration() {
     let temp = tempfile::tempdir().unwrap();
     let constraints_dir = temp.path().join("codex-constraints");
     let mut configured = crate::config::default_subagent_roles();
@@ -926,6 +926,10 @@ fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inpu
         .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
         .unwrap()
         .enabled = false;
+    configured
+        .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
+        .unwrap()
+        .model = "missing/disabled-model".into();
 
     let runtime_roles = runtime_subagent_roles(
         Some(&configured),
@@ -936,13 +940,24 @@ fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inpu
     assert!(runtime_roles.contains_key(crate::config::SUBAGENT_ROLE_QUICK_SCAN));
     assert!(runtime_roles.contains_key(crate::config::SUBAGENT_ROLE_DEFAULT));
 
-    let plans = plan_runtime_agent_files(&constraints_dir, &runtime_roles, None).unwrap();
-    assert_eq!(plans.len(), runtime_roles.len());
-    assert!(
-        plans
-            .iter()
-            .all(|plan| plan.registration.role != crate::config::SUBAGENT_ROLE_WORKER)
+    let registered = SUBAGENT_ROLE_IDS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let registration_roles = runtime_registration_roles(
+        &runtime_roles,
+        &registered,
+        DEFAULT_SUBAGENT_MODEL,
+        DEFAULT_SUBAGENT_REASONING_EFFORT,
+    )
+    .unwrap();
+    assert_eq!(registration_roles.len(), SUBAGENT_ROLE_IDS.len());
+    assert_eq!(
+        registration_roles[crate::config::SUBAGENT_ROLE_WORKER],
+        runtime_roles[SUBAGENT_ROLE_DEFAULT]
     );
+    let plans = plan_runtime_agent_files(&constraints_dir, &registration_roles, None).unwrap();
+    assert_eq!(plans.len(), SUBAGENT_ROLE_IDS.len());
 
     let stale_worker_path =
         runtime_agent_path(&constraints_dir, crate::config::SUBAGENT_ROLE_WORKER);
@@ -951,13 +966,15 @@ fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inpu
     }
     fs::write(&stale_worker_path, b"stale worker runtime file").unwrap();
     let registrations =
-        prepare_runtime_agent_files(&constraints_dir, &runtime_roles, None).unwrap();
-    assert_eq!(registrations.len(), runtime_roles.len());
-    assert!(!stale_worker_path.exists());
+        prepare_runtime_agent_files(&constraints_dir, &registration_roles, None).unwrap();
+    assert_eq!(registrations.len(), SUBAGENT_ROLE_IDS.len());
+    let worker = fs::read_to_string(&stale_worker_path).unwrap();
+    assert!(!worker.contains("missing/disabled-model"));
+    assert!(worker.contains(DEFAULT_SUBAGENT_MODEL));
 }
 
 #[test]
-fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled() {
+fn runtime_guidance_keeps_analysis_roles_available_for_authorized_writes() {
     let mut configured = crate::config::default_subagent_roles();
     configured
         .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
@@ -979,9 +996,14 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
 
     let instructions = runtime_root_instructions_for_roles("BASE", &runtime_roles);
     assert!(instructions.contains("BASE"));
-    assert!(instructions.contains(NO_WRITABLE_SUBAGENT_GUIDANCE));
-    assert!(instructions.contains("所有创建、修改"));
-    assert!(instructions.contains("由主代理直接完成"));
+    assert_eq!(instructions, "BASE");
+    assert_eq!(
+        runtime_root_instructions_for_roles(
+            &format!("BASE\n\n{NO_WRITABLE_SUBAGENT_GUIDANCE}"),
+            &runtime_roles
+        ),
+        "BASE"
+    );
 
     let writable_roles = runtime_subagent_roles(
         Some(&crate::config::default_subagent_roles()),
@@ -992,6 +1014,173 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
         runtime_root_instructions_for_roles("BASE", &writable_roles),
         "BASE"
     );
+}
+
+fn dynamic_role_runtime_fixture(
+    home: &Path,
+    marker: &Path,
+    config: &CodeyConfig,
+) -> AppliedRuntimeRouterConfig {
+    fs::create_dir_all(home).unwrap();
+    apply_isolated_test_runtime_config(
+        home,
+        false,
+        None,
+        true,
+        &config.subagent_model,
+        &config.subagent_reasoning_effort,
+        Some(&config.subagent_roles),
+        marker,
+        &marker.with_file_name("backups"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn dynamic_roles_can_be_enabled_disabled_and_reenabled_without_changing_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let marker = temp.path().join("state/codex-lease.json");
+    let mut config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
+    let role = crate::config::SUBAGENT_ROLE_WORKER;
+    config.subagent_roles.get_mut(role).unwrap().enabled = false;
+    let applied = dynamic_role_runtime_fixture(&home, &marker, &config);
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .any(|value| value.starts_with(&format!("agents.{role}.config_file=")))
+    );
+    let initial: RuntimeConfigLease = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(
+        initial.registered_subagent_roles.len(),
+        SUBAGENT_ROLE_IDS.len()
+    );
+    assert!(!initial.subagent_roles.contains_key(role));
+    let worker_path = runtime_agent_path(&marker.with_file_name(CODEY_CONSTRAINTS_DIR), role);
+    for enabled in [true, false, true] {
+        let selection = config.subagent_roles.get_mut(role).unwrap();
+        selection.enabled = enabled;
+        selection.model = "custom-worker-model".into();
+        selection.reasoning_effort = "high".into();
+        assert!(
+            reconcile_runtime_subagent_roles_at(&config, &marker)
+                .unwrap()
+                .repaired
+        );
+        assert!(
+            !reconcile_runtime_subagent_roles_at(&config, &marker)
+                .unwrap()
+                .repaired
+        );
+        let current: RuntimeConfigLease =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(
+            current.registered_subagent_roles,
+            initial.registered_subagent_roles
+        );
+        assert_eq!(current.runtime_agent_hashes.len(), SUBAGENT_ROLE_IDS.len());
+        assert_eq!(current.subagent_roles.contains_key(role), enabled);
+        let (policy_path, pending) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+        let policy: serde_json::Value =
+            serde_json::from_slice(&fs::read(policy_path).unwrap()).unwrap();
+        assert_eq!(policy["roles"].get(role).is_some(), enabled);
+        assert!(!pending.exists());
+        assert_eq!(
+            fs::read_to_string(&worker_path)
+                .unwrap()
+                .contains("custom-worker-model"),
+            enabled
+        );
+    }
+}
+
+#[test]
+fn legacy_role_coverage_is_preserved_when_disabling_then_reenabling() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let marker = temp.path().join("state/codex-lease.json");
+    let mut config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
+    dynamic_role_runtime_fixture(&home, &marker, &config);
+    let mut lease: RuntimeConfigLease =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    lease.registered_subagent_roles.clear();
+    write_lease(&marker, &lease).unwrap();
+    let role = crate::config::SUBAGENT_ROLE_WORKER;
+    config.subagent_roles.get_mut(role).unwrap().enabled = false;
+    reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+    config.subagent_roles.get_mut(role).unwrap().enabled = true;
+    reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+    let migrated: RuntimeConfigLease = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(
+        migrated.registered_subagent_roles.len(),
+        SUBAGENT_ROLE_IDS.len()
+    );
+}
+
+#[test]
+fn legacy_unregistered_role_requires_restart_without_mutating_runtime_assets() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let marker = temp.path().join("state/codex-lease.json");
+    let mut config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
+    let role = crate::config::SUBAGENT_ROLE_WORKER;
+    config.subagent_roles.get_mut(role).unwrap().enabled = false;
+    dynamic_role_runtime_fixture(&home, &marker, &config);
+    let mut lease: RuntimeConfigLease =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    lease.registered_subagent_roles.clear();
+    lease.runtime_agent_hashes.remove(role);
+    write_lease(&marker, &lease).unwrap();
+    let original = fs::read(&marker).unwrap();
+    let (policy_path, _) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+    let policy = fs::read(&policy_path).unwrap();
+    config.subagent_roles.get_mut(role).unwrap().enabled = true;
+    let error = reconcile_runtime_subagent_roles_at(&config, &marker).unwrap_err();
+    assert!(error.is::<SubagentRoleRegistrationChanged>());
+    assert_eq!(fs::read(&marker).unwrap(), original);
+    assert_eq!(fs::read(policy_path).unwrap(), policy);
+}
+
+#[test]
+fn invalid_dynamic_role_template_preserves_applied_files_lease_and_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let marker = temp.path().join("state/codex-lease.json");
+    let mut config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
+    dynamic_role_runtime_fixture(&home, &marker, &config);
+    let constraints = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
+    let original_lease = fs::read(&marker).unwrap();
+    let (policy_path, pending) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+    let original_policy = fs::read(&policy_path).unwrap();
+    let role = crate::config::SUBAGENT_ROLE_WORKER;
+    let role_path = runtime_agent_path(&constraints, role);
+    let original_file = fs::read(&role_path).unwrap();
+    config.subagent_roles.get_mut(role).unwrap().enabled = false;
+    fs::write(
+        constraints
+            .join(CODEY_SUBAGENT_SOURCES_DIR)
+            .join(format!("{role}.toml")),
+        "invalid = [",
+    )
+    .unwrap();
+    assert!(reconcile_runtime_subagent_roles_at(&config, &marker).is_err());
+    assert_eq!(fs::read(&marker).unwrap(), original_lease);
+    assert_eq!(fs::read(policy_path).unwrap(), original_policy);
+    assert_eq!(fs::read(role_path).unwrap(), original_file);
+    assert!(!pending.exists());
 }
 
 #[test]

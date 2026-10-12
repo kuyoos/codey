@@ -33,7 +33,7 @@ import type { DiagnosticStorageCleanup, DiagnosticStorageTarget } from "./diagno
 import { DiagnosticCleanupNotice } from "./DiagnosticCleanupNotice";
 import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
-import { customContextRestoredNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
+import { customContextRestoredNote, subagentUpdateNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import { RemoteControlCard, type RemoteControlHandle } from "./RemoteControlCard";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
@@ -939,6 +939,7 @@ export function App({
       const result = await persist(config);
       const subagentHotReloaded = Boolean(result.subagentConfigHotReloaded);
       const subagentHotReloadFailed = Boolean(result.subagentConfigHotReloadError);
+      const subagentNote = subagentUpdateNote(result);
       const subagentConfigRepaired = Boolean(result.subagentConfigRepaired);
       const requestLogHealth = result.routeRequestLogHealth;
       const requestLogHotReloadFailed = requestLogHealth === "failed";
@@ -948,15 +949,14 @@ export function App({
         : "";
       let noticeTone: "success" | "info" | "error" =
         result.restartRequired || subagentHotReloadFailed ? "info" : "success";
-      let noticeText = result.restartRequired
-        ? "Codey 设置已保存，启动参数将在重启 Codex 后生效"
-        : "Codey 设置已保存";
+      let noticeText =
+        result.restartRequired && !subagentNote
+          ? "Codey 设置已保存，启动参数将在重启 Codex 后生效"
+          : "Codey 设置已保存";
       if (subagentConfigRepaired) {
         noticeText = "Codey 设置已保存；子代理配置已同步";
       } else if (subagentHotReloaded) {
         noticeText = "Codey 设置已保存；子代理配置已实时更新";
-      } else if (subagentHotReloadFailed) {
-        noticeText = "Codey 设置已保存；子代理配置暂未能热更新，重启 Codex 后生效";
       }
       if (requestLogHotReloadFailed) {
         noticeTone = "error";
@@ -971,6 +971,10 @@ export function App({
       }
       if (retryCountChanged && result.restartRequired) {
         noticeText = "Codey 设置已保存；会话重试次数将在重启 Codex 后生效";
+      }
+      if (subagentNote) {
+        noticeText += `；${subagentNote}`;
+        if (noticeTone === "success") noticeTone = "info";
       }
       if (remoteSaved) {
         noticeText = `远程控制设置已保存，重启 Codex 后生效；${noticeText}`;

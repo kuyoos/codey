@@ -59,6 +59,11 @@ fn failed_reconciliation_forces_a_restart_but_superseded_work_does_not() {
     assert!(failed.requires_restart());
     assert_eq!(failed.health(), "restart_required");
 
+    let pending = SubagentHotReloadOutcome::pending_restart("role registration changed");
+    assert!(pending.requires_restart());
+    assert_eq!(pending.health(), "pending_restart");
+    assert_eq!(pending.error(), Some("role registration changed"));
+
     let superseded = SubagentHotReloadOutcome::superseded("newer save won");
     assert!(!superseded.requires_restart());
     assert_eq!(superseded.health(), "superseded");
