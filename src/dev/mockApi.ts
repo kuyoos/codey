@@ -96,7 +96,6 @@ if (import.meta.env.DEV) {
     };
     let previewConfig: Config = {
       settingsRevision: 0,
-      autoCheckCodeyUpdates: true,
       localRouterEnabled: true,
       routeRequestLog: {
         enabled: true,
@@ -1523,49 +1522,6 @@ if (import.meta.env.DEV) {
           repaired: configRepairPreview !== "unchanged",
           backupPath: null,
         };
-      }
-      if (command === "get_device_machine_no") {
-        return "m_preview_codey_device_001";
-      }
-      if (command === "check_for_updates") {
-        return {
-          currentVersion: "0.1.0",
-          latestVersion: "0.2.0",
-          updateAvailable: true,
-          selectedAsset: {
-            platform: "macos",
-            arch: "arm64",
-            packageType: "app-zip",
-            fileName: "Codey-0.2.0-macos-arm64-unsigned.zip",
-            url: "https://updates.example.com/releases/v0.2.0/Codey-0.2.0-macos-arm64-unsigned.zip",
-            sha256:
-              "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            size: 31_911_421,
-          },
-        };
-      }
-      if (command === "download_update") {
-        return {
-          latestVersion: "0.2.0",
-          filePath: "/tmp/codey-updates/Codey-0.2.0-macos-arm64-unsigned.zip",
-          fileName: "Codey-0.2.0-macos-arm64-unsigned.zip",
-          size: 31_911_421,
-          sha256:
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-          asset: {
-            platform: "macos",
-            arch: "arm64",
-            packageType: "app-zip",
-            fileName: "Codey-0.2.0-macos-arm64-unsigned.zip",
-            url: "https://updates.example.com/releases/v0.2.0/Codey-0.2.0-macos-arm64-unsigned.zip",
-            sha256:
-              "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            size: 31_911_421,
-          },
-        };
-      }
-      if (command === "install_downloaded_update") {
-        return { status: "installing" };
       }
       if (command === "test_notification_channel") {
         const channel = args.channel as {

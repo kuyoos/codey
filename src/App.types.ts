@@ -87,7 +87,6 @@ export type ModelReasoningEffort = {
 
 export type Config = {
   settingsRevision: number;
-  autoCheckCodeyUpdates: boolean;
   localRouterEnabled: boolean;
   routeRequestLog: RouteRequestLogConfig;
   streamMaxRetries: number;
@@ -207,7 +206,6 @@ export type OfficialAccountsResult = {
 export type RuntimeStatus = {
   running: boolean;
   appVersion?: string;
-  availableUpdate?: UpdateCheck;
   codexAppVersion?: string;
   clientPlatform?: string;
   restartRequired?: boolean;
@@ -264,9 +262,6 @@ export type Confirmation = {
   action:
     | "restart"
     | "repair-codex-config"
-    | "install-update"
-    | "download-update"
-    | "disable-auto-update-check"
     | "discard-settings-changes"
     | "delete-notification-channel"
     | "delete-route"
@@ -303,50 +298,6 @@ export type CrashpadCleanup = {
   limitApplied: boolean;
   stillOverLimit: boolean;
   errors: string[];
-};
-
-export type RollbackDirective = { id: string; sourceVersion: string; targetVersion: string; reason: string };
-
-export type UpdateCheck = {
-  currentVersion: string;
-  latestVersion: string;
-  updateAvailable: boolean;
-  selectedAsset?: UpdateAsset;
-  releaseNotes?: string | null;
-  publishId?: string | null;
-  policyId?: string | null;
-  rollback?: RollbackDirective | null;
-};
-
-export type UpdateAsset = {
-  platform: string;
-  arch: string;
-  packageType: string;
-  fileName: string;
-  url: string;
-  sha256: string;
-  size: number;
-};
-
-export type UpdateDownload = {
-  latestVersion: string;
-  filePath: string;
-  fileName: string;
-  size: number;
-  sha256: string;
-  asset: UpdateAsset;
-  publishId?: string | null;
-  policyId?: string | null;
-  rollback?: RollbackDirective | null;
-};
-
-/// 上一次更新安装留给本次启动的结果。助手在退出前写下，控制台读取后删除，
-/// 保证同一次结果只提示一次。
-export type UpdateInstallReport = {
-  version: string;
-  status: "started" | "installed" | "unverified" | "failed";
-  message: string;
-  writtenAt: number;
 };
 
 export type AppProps = {

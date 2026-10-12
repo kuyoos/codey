@@ -1,22 +1,9 @@
 name: Build desktop packages
-run-name: "${{ inputs.build_id && format('Codey build {0} #{1}', inputs.build_id, inputs.attempt) || github.ref_name }}"
 
 on:
   workflow_dispatch:
     inputs:
-      build_id:
-        type: string
-      attempt:
-        type: string
       source_sha:
-        type: string
-      version:
-        type: string
-      base_sha:
-        type: string
-      base_tag:
-        type: string
-      artifact_run_id:
         type: string
   push:
     tags:
@@ -26,86 +13,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: codey-release-automation
+  group: codey-build-desktop
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_BUILD_DIR: target
   RUSTFLAGS: -D warnings
-  RELEASE_BUILD_ID: ${{ inputs.build_id }}
-  RELEASE_ATTEMPT: ${{ inputs.attempt }}
-  RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
-  RELEASE_VERSION: ${{ inputs.version }}
-  RELEASE_BASE_SHA: ${{ inputs.base_sha }}
-  RELEASE_BASE_TAG: ${{ inputs.base_tag }}
-  RELEASE_ACTION: build
-  RELEASE_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      claimed: ${{ steps.claim.outputs.claimed }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_sha || github.ref }}
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Claim platform build
-        id: claim
-        if: inputs.build_id != ''
-        env:
-          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
-          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
-        run: node scripts/release-automation.mjs claim
-      - name: Save claimed build
-        if: inputs.build_id != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-build-context
-          path: .release-build.json
-          include-hidden-files: true
-          if-no-files-found: error
-
-  notes:
-    if: inputs.build_id != ''
-    needs: prepare
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      copilot-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-build-context
-      - name: Install Copilot CLI
-        continue-on-error: true
-        run: npm install --global @github/copilot@1.0.91
-      - name: Generate evidence-backed release notes
-        env:
-          COPILOT_GITHUB_TOKEN: ${{ github.token }}
-        run: node scripts/release-automation.mjs notes
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-notes-evidence
-          path: release-notes.json
-          if-no-files-found: error
-
   macos:
-    if: inputs.artifact_run_id == ''
-    needs: prepare
     name: macOS ${{ matrix.arch }} unsigned
     runs-on: ${{ matrix.runner }}
     env:
@@ -148,16 +65,6 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Download claimed platform build
-        if: inputs.build_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: release-build-context
-
-      - name: Inject validated platform release version
-        if: inputs.build_id != ''
-        run: node scripts/release-automation.mjs prepare-version
-
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -170,23 +77,10 @@ jobs:
       - name: Build embedded frontend assets
         run: pnpm run vite:build
 
-      - name: Verify release admin endpoint
-        shell: bash
-        env:
-          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
-        run: |
-          set -euo pipefail
-          case "${CODEY_RELEASE_ADMIN_URL%/}" in
-            https://*) ;;
-            *) echo "CODEY_RELEASE_ADMIN_URL must be configured as an HTTPS URL." >&2; exit 1 ;;
-          esac
-
       - name: Build unsigned macOS app
         env:
           CODEY_SKIP_CODESIGN: "1"
           CODEY_SKIP_OVERLAY_BUILD: "1"
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
         run: pnpm run build
 
       - name: Verify and archive macOS app
@@ -214,7 +108,7 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
             VERSION="${VERSION#V}"
-          elif [[ -z "$RELEASE_BUILD_ID" ]]; then
+          else
             VERSION="${VERSION}-${GITHUB_RUN_NUMBER}"
           fi
           VERSION="${VERSION//\//-}"
@@ -232,7 +126,6 @@ jobs:
           if-no-files-found: error
 
   macos-check:
-    needs: prepare
     name: macOS ${{ matrix.arch }} checks
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -303,8 +196,6 @@ jobs:
           CODEY_SKIP_OVERLAY_BUILD: "1"
 
   windows:
-    if: inputs.artifact_run_id == ''
-    needs: prepare
     name: Windows x64
     runs-on: windows-latest
     # 测试和 clippy 在 ci.yml 的 Windows 任务里跑。这里只编 release 并打安装包。
@@ -357,16 +248,6 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Download claimed platform build
-        if: inputs.build_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: release-build-context
-
-      - name: Inject validated platform release version
-        if: inputs.build_id != ''
-        run: node scripts/release-automation.mjs prepare-version
-
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -404,20 +285,9 @@ jobs:
       - name: Build embedded frontend assets
         run: pnpm run vite:build
 
-      - name: Verify release admin endpoint
-        shell: pwsh
-        env:
-          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
-        run: |
-          if (-not $env:CODEY_RELEASE_ADMIN_URL -or $env:CODEY_RELEASE_ADMIN_URL -notmatch '^https://') {
-            throw "CODEY_RELEASE_ADMIN_URL must be configured as an HTTPS URL."
-          }
-
       - name: Build Windows executable
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
         run: pnpm run build
 
       - name: Build Windows packages
@@ -427,7 +297,7 @@ jobs:
           $version = node -p "require('./package.json').version"
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $version = $env:GITHUB_REF_NAME.TrimStart("v", "V")
-          } elseif (-not $env:RELEASE_BUILD_ID) {
+          } else {
             $version = "$version-$env:GITHUB_RUN_NUMBER"
           }
           $version = $version -replace '[\\/]', '-'
@@ -453,8 +323,7 @@ jobs:
             throw "makensis.exe was not found. The NSIS install step must expose it before packaging."
           }
 
-          # 安装包内嵌的版本必须与清单版本一致：更新助手按清单版本校验安装结果，
-          # 两者错位会被判成"安装没有生效"，用户就会在更新提示里原地循环。
+          # 安装包版本必须与源码工作区版本一致，避免发布版本号错位的安装包。
           $cargoMatch = Select-String -Path "Cargo.toml" -Pattern '^\s*version\s*=\s*"([^"]+)"' |
             Select-Object -First 1
           if (-not $cargoMatch) {
@@ -462,7 +331,7 @@ jobs:
           }
           $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
           $manifestVersion = $version
-          if (-not $env:RELEASE_BUILD_ID -and $env:GITHUB_REF_TYPE -ne "tag") {
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
             $manifestVersion = $version -replace '-\d+$', ''
           }
           if ($cargoVersion -ne $manifestVersion) {
@@ -489,10 +358,9 @@ jobs:
           if-no-files-found: error
 
   windows-check:
-    needs: prepare
     name: Windows checks
     runs-on: windows-latest
-    # 打包任务只出安装包。标签发布不触发 ci.yml，所以 Windows 测试放在这里，并作为发布前置。
+    # 打包任务只出安装包。标签发布不触发 ci.yml，所以 Windows 测试放在这里。
 
     steps:
       - name: Checkout Codey
@@ -565,200 +433,3 @@ jobs:
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
 
-  publish:
-    name: Attach packages to GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v') && inputs.build_id == ''
-    permissions:
-      contents: write
-    needs:
-      - macos
-      - macos-check
-      - windows
-      - windows-check
-    runs-on: macos-14
-    env:
-      CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
-      CLOUDFLARE_R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-
-    steps:
-      - name: Checkout release metadata
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: codey-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Verify the release version
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          TAG_VERSION="${TAG_VERSION#V}"
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION" || {
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION." >&2
-            exit 1
-          }
-
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: release-assets/*
-
-      - name: Explain skipped Cloudflare R2 update sync
-        if: env.CLOUDFLARE_R2_BUCKET == '' || env.CLOUDFLARE_R2_PUBLIC_BASE_URL == '' || env.CLOUDFLARE_ACCOUNT_ID == '' || env.CLOUDFLARE_API_TOKEN == ''
-        run: echo "::notice::Cloudflare R2 update sync skipped. Configure the R2 bucket, public base URL, account ID, and API token to enable it."
-
-      - name: Generate Cloudflare R2 update manifest
-        if: env.CLOUDFLARE_R2_BUCKET != '' && env.CLOUDFLARE_R2_PUBLIC_BASE_URL != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          VERSION="${VERSION#V}"
-          BASE_URL="${CLOUDFLARE_R2_PUBLIC_BASE_URL%/}"
-          node scripts/generate-update-manifest.mjs \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --download-base-url "${BASE_URL}/releases/${TAG}" \
-            --output release-assets/latest.json \
-            release-assets/*
-
-      - name: Publish Cloudflare R2 update objects
-        if: env.CLOUDFLARE_R2_BUCKET != '' && env.CLOUDFLARE_R2_PUBLIC_BASE_URL != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$CLOUDFLARE_R2_BUCKET" in
-            *[!A-Za-z0-9.-]* | "")
-              echo "CLOUDFLARE_R2_BUCKET must be a bucket name." >&2
-              exit 1
-              ;;
-          esac
-          case "${CLOUDFLARE_R2_PUBLIC_BASE_URL%/}" in
-            https://*) ;;
-            *)
-              echo "CLOUDFLARE_R2_PUBLIC_BASE_URL must be an HTTPS URL." >&2
-              exit 1
-              ;;
-          esac
-
-          TAG="${GITHUB_REF_NAME}"
-          upload_object() {
-            local key="$1"
-            local file="$2"
-            local content_type="$3"
-            local cache_control="$4"
-            npm exec --yes --package=wrangler@4.112.0 -- wrangler r2 object put "${CLOUDFLARE_R2_BUCKET}/${key}" \
-              --file "$file" \
-              --remote \
-              --content-type "$content_type" \
-              --cache-control "$cache_control"
-          }
-
-          for ASSET in release-assets/*; do
-            test -f "$ASSET" || continue
-            FILE_NAME="$(basename "$ASSET")"
-            test "$FILE_NAME" = "latest.json" && continue
-            case "$FILE_NAME" in
-              *.zip) CONTENT_TYPE="application/zip" ;;
-              *.exe) CONTENT_TYPE="application/octet-stream" ;;
-              *)
-                echo "Unexpected release asset: ${FILE_NAME}" >&2
-                exit 1
-                ;;
-            esac
-            upload_object "releases/${TAG}/${FILE_NAME}" "$ASSET" "$CONTENT_TYPE" "public, max-age=31536000, immutable"
-          done
-          upload_object "releases/${TAG}/latest.json" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
-
-  managed-publish:
-    if: >-
-      always() && inputs.build_id != '' && needs.prepare.result == 'success' &&
-      needs.notes.result == 'success' && needs.macos-check.result == 'success' &&
-      needs.windows-check.result == 'success' &&
-      (needs.macos.result == 'success' || (inputs.artifact_run_id != '' && needs.macos.result == 'skipped')) &&
-      (needs.windows.result == 'success' || (inputs.artifact_run_id != '' && needs.windows.result == 'skipped'))
-    needs:
-      - prepare
-      - notes
-      - macos
-      - macos-check
-      - windows
-      - windows-check
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
-      RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
-      CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
-      CLOUDFLARE_R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-build-context
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-notes-evidence
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: codey-*
-          path: release-assets
-          merge-multiple: true
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.artifact_run_id || github.run_id }}
-      - name: Record immutable artifacts for upload retries
-        run: node scripts/release-automation.mjs artifacts-ready
-      - name: Publish managed draft and verified R2 artifacts
-        run: node scripts/release-automation.mjs publish
-
-  report-failure:
-    if: always() && inputs.build_id != '' && needs.prepare.outputs.claimed == 'true' && needs.managed-publish.result != 'success'
-    needs:
-      - prepare
-      - notes
-      - macos
-      - macos-check
-      - windows
-      - windows-check
-      - managed-publish
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Report failed build without hiding job failures
-        continue-on-error: true
-        env:
-          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
-          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
-          RELEASE_ERROR: 构建、检查或产物验收失败，请查看本次 GitHub Actions 日志
-        run: node scripts/release-automation.mjs failed

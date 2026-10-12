@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "@heroui/react";
 import {
   IconCheck,
-  IconCircleArrowUp,
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
   IconLayoutDashboard,
@@ -42,7 +41,6 @@ import { SettingsPageHeader } from "./SettingsPageHeader";
 import { SettingsLayout } from "./SettingsLayout";
 import { useModelSelection } from "./useModelSelection";
 import { useRuntimeStatus } from "./useRuntimeStatus";
-import { useAppUpdates } from "./useAppUpdates";
 import {
   NoticeLoadingText,
   NoticeToast,
@@ -198,7 +196,6 @@ export function App({
         : "尚未确认主进程注入修复成功，请查看运行状态或失败提示"),
     });
   }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
-  const configLoaded = config !== null;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
       current ? { ...current, subagentOptimization: enabled } : current,
@@ -292,24 +289,6 @@ export function App({
     setPersistedConfig,
     setStatus,
     setNotice,
-  });
-  const {
-    automaticallyChecking,
-    updateResult,
-    updateCheck,
-    downloadedUpdate,
-    checkForUpdates,
-  } = useAppUpdates({
-    embedded,
-    configLoaded,
-    autoCheckCodeyUpdates: config?.autoCheckCodeyUpdates !== false,
-    isBusy,
-    setBusy,
-    setNotice,
-    setConfirmation,
-    beforeInstall: async () => {
-      if (config && dirty) await persist(config);
-    },
   });
 
   useEffect(() => {
@@ -426,24 +405,6 @@ export function App({
       setPluginMarketplaceStatus(next);
       return next;
     }
-  }
-
-  function changeAutomaticUpdateChecks(enabled: boolean) {
-    if (!config || isBusy) return;
-    if (enabled) {
-      editConfig({ ...config, autoCheckCodeyUpdates: true });
-      return;
-    }
-    setConfirmation({
-      action: "disable-auto-update-check",
-      title: "关闭自动检查 Codey 更新？",
-      description: "关闭后，若 Codex 更新导致 Codey 插件无法启动，需要手动下载最新版插件包。",
-      confirmLabel: "确认关闭",
-      run: () => {
-        setConfig((current) => current ? { ...current, autoCheckCodeyUpdates: false } : current);
-        setDirty(true);
-      },
-    });
   }
 
   async function persist(next: Config) {
@@ -1247,7 +1208,6 @@ export function App({
   const handleRepairMainProcessInjection = useStableEvent(
     () => void repairMainProcessInjection(),
   );
-  const handleFooterUpdateClick = useStableEvent(() => void checkForUpdates());
   const handleConfigChange = useStableEvent(editConfig);
   const handleAddNotificationChannel = useStableEvent(addNotificationChannel);
   const handleNotificationChannelChange = useStableEvent(
@@ -1380,22 +1340,6 @@ export function App({
       loadingContent
     );
   }
-
-  const hasUpdate =
-    updateCheck?.updateAvailable === true &&
-    Boolean(updateCheck.selectedAsset);
-  const isCheckingUpdate = busy === "check-update" || automaticallyChecking;
-  const isDownloadingUpdate = busy === "download-update";
-  const isInstallingUpdate = busy === "install-update";
-  const updateTooltipText = downloadedUpdate
-    ? `新版本 v${downloadedUpdate.latestVersion} 已下载，点击检查更新并安装`
-    : hasUpdate
-      ? `发现新版本 v${updateCheck?.latestVersion}，点击重新检查并更新`
-      : isCheckingUpdate
-        ? "正在检查更新…"
-        : updateResult?.text
-          ? `${updateResult.text}（点击再次检查）`
-          : "检查 Codey 在线更新";
 
   const configHeaderContent = (
     <div className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-5 max-[760px]:grid-cols-[minmax(0,1fr)_auto_auto] max-[760px]:gap-2.5">
@@ -1543,40 +1487,7 @@ export function App({
             <div className="sidebar-footer-left">
               <span className="sidebar-footer-version font-mono">
                 v{status.appVersion || "0.0.1"}
-                {(updateCheck?.updateAvailable === true || Boolean(downloadedUpdate)) && (
-                  <span
-                    className="ml-1.5 inline-flex shrink-0"
-                    role="img"
-                    aria-label={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
-                    title={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
-                  >
-                    <span className="size-1.5 rounded-full bg-[var(--codey-red)]" aria-hidden="true" />
-                  </span>
-                )}
               </span>
-              <Tooltip content={updateTooltipText} position="top">
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  className="sidebar-footer-icon-btn"
-                  disabled={isBusy && !isCheckingUpdate}
-                  aria-label={updateTooltipText}
-                  onClick={handleFooterUpdateClick}
-                >
-                  {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
-                    <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
-                  ) : downloadedUpdate ? (
-                    <IconCheck size={14} className="text-success" aria-hidden="true" />
-                  ) : hasUpdate ? (
-                    <span className="relative inline-flex items-center justify-center">
-                      <IconCircleArrowUp size={15} className="text-primary" aria-hidden="true" />
-                      <span className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-primary animate-pulse" />
-                    </span>
-                  ) : (
-                    <IconCircleArrowUp size={15} aria-hidden="true" />
-                  )}
-                </Button>
-              </Tooltip>
             </div>
 
             <div className="sidebar-footer-right">
@@ -1754,8 +1665,6 @@ export function App({
         busy={busy}
         onRepairCodexConfig={askRepairCodexConfig}
         configRepairNotice={configRepairNotice}
-        autoCheckCodeyUpdates={config.autoCheckCodeyUpdates !== false}
-        onAutoCheckCodeyUpdatesChange={changeAutomaticUpdateChecks}
       />
     </main>
   );

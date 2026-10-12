@@ -117,7 +117,6 @@ function modelSectionProps(overrides = {}) {
   const props = {
     config: {
       activeProfileId: "route-a",
-      autoCheckCodeyUpdates: true,
       codexAppPath: "",
       declaredOfficialModelsByProvider: {},
       defaultModel: "route-a/k3",

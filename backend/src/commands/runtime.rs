@@ -13,9 +13,10 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart_with_route_status,
-    current_update_platform, make_bridge_handler, prepare_routes_for_current_launch,
-    provider_route_restart_required_for_runtime, sync_provider_models_for_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, client_platform,
+    config_requires_restart_with_route_status, make_bridge_handler,
+    prepare_routes_for_current_launch, provider_route_restart_required_for_runtime,
+    sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
@@ -87,7 +88,6 @@ pub(super) async fn runtime_status_with_options(
         .map(|profile| profile.name.clone())
         .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
-    let auto_check_codey_updates = config.auto_check_codey_updates;
     let official_account_available = config.official_account_available_this_launch;
     let official_account_status = config.official_account_status_this_launch;
     let runtime_codex_app_path = runtime
@@ -135,8 +135,7 @@ pub(super) async fn runtime_status_with_options(
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
-        "autoCheckCodeyUpdates": auto_check_codey_updates,
-        "clientPlatform": current_update_platform(),
+        "clientPlatform": client_platform(),
         "activeProfileId": active_profile_id,
         "activeProfileName": active_profile_name,
         "officialAccountAvailable": official_account_available,
@@ -157,21 +156,14 @@ pub(super) async fn runtime_status_with_options(
     ) {
         status.extend(feature_status.clone());
     }
-    let (codex_app_version, startup_error, available_update) = tokio::join!(
+    let (codex_app_version, startup_error) = tokio::join!(
         codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path),
         async { state.startup_error.read().await.clone() },
-        async { state.available_update.read().await.clone() },
     );
     if let Some(object) = status.as_object_mut() {
         object.insert("codexAppVersion".into(), Value::String(codex_app_version));
         if let Some(error) = startup_error {
             object.insert("startupError".into(), Value::String(error));
-        }
-        if let Some(update) = available_update {
-            object.insert(
-                "availableUpdate".into(),
-                serde_json::to_value(update).expect("update metadata must be JSON-serializable"),
-            );
         }
     }
     if let Some(runtime) = runtime.as_ref()

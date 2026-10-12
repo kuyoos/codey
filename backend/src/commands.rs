@@ -18,7 +18,6 @@ mod official_accounts;
 mod plugins;
 mod prompt_optimization;
 mod runtime;
-mod updates;
 mod webhooks;
 mod wechat_claw;
 
@@ -59,15 +58,6 @@ pub(crate) use runtime::{cleanup_failed_runtime_start, reap_runtime_child_before
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
-use updates::current_update_platform;
-#[cfg(test)]
-pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
-pub(crate) use updates::{
-    UpdateCandidate, UpdateDownload, check_for_update_candidate, download_update_candidate,
-    start_downloaded_update,
-};
-#[cfg(test)]
-use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
     sync_waiting_webhook_watcher, test_notification_channel,
@@ -152,8 +142,6 @@ pub struct AppState {
     /// Kept apart from `startup_error`, which each launch overwrites and hot
     /// reloads treat as an untrusted runtime.
     config_load_error: Option<String>,
-    available_update: RwLock<Option<updates::UpdateCheck>>,
-    update_candidate_cache: Mutex<Option<updates::CachedUpdateCandidate>>,
     codex_app_version_cache: Mutex<Option<runtime::CodexAppVersionCache>>,
     restart_in_progress: AtomicBool,
     shutting_down: AtomicBool,
@@ -205,7 +193,6 @@ impl Drop for RestartInProgressGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppShutdownReason {
     CodexExited,
-    InstallUpdate,
 }
 
 /// An unreadable config falls back to defaults for this launch. The broken
@@ -274,8 +261,6 @@ impl Default for AppState {
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             config_load_error,
-            available_update: RwLock::new(None),
-            update_candidate_cache: Mutex::new(None),
             codex_app_version_cache: Mutex::new(None),
             restart_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -336,6 +321,18 @@ fn bridge_string_array(payload: &Value, name: &str, limit: usize) -> Vec<String>
         .collect()
 }
 
+/// Operating system identifier reported to the frontend so it can pick
+/// platform-specific behavior.
+fn client_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        std::env::consts::OS
+    }
+}
+
 impl AppState {
     /// Codey's own store of ChatGPT accounts, kept next to the config file.
     pub(crate) fn official_accounts(&self) -> OfficialAccountStore {
@@ -369,10 +366,6 @@ impl AppState {
 
     pub fn request_shutdown(&self) {
         self.request_shutdown_with_reason(AppShutdownReason::CodexExited);
-    }
-
-    pub fn request_update_shutdown(&self) {
-        self.request_shutdown_with_reason(AppShutdownReason::InstallUpdate);
     }
 
     fn request_shutdown_with_reason(&self, reason: AppShutdownReason) {
@@ -1193,11 +1186,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(error),
             }
         }
-        "check_for_updates"
-        | "get_device_machine_no"
-        | "download_update"
-        | "update_install_report"
-        | "install_downloaded_update" => updates::invoke(state, command, &args).await,
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
@@ -1602,7 +1590,6 @@ pub async fn save_codey_config(
 
 struct CodeyConfigSaveInput {
     config: CodeyConfig,
-    auto_check_codey_updates_present: bool,
     model_reasoning_efforts_present: bool,
     model_context_present: bool,
     local_router_enabled_present: bool,
@@ -1619,7 +1606,6 @@ impl CodeyConfigSaveInput {
     fn complete(config: CodeyConfig) -> Self {
         Self {
             config,
-            auto_check_codey_updates_present: true,
             model_reasoning_efforts_present: true,
             model_context_present: true,
             local_router_enabled_present: true,
@@ -1641,7 +1627,6 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let fields = config_value
         .as_object()
         .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
-    let auto_check_codey_updates_present = fields.contains_key("autoCheckCodeyUpdates");
     let local_router_enabled_present = fields.contains_key("localRouterEnabled");
     let model_reasoning_efforts_present = fields.contains_key("modelReasoningEffortsByProvider");
     let model_context_present = fields.contains_key("modelContextByProvider");
@@ -1655,7 +1640,6 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
         config,
-        auto_check_codey_updates_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1691,7 +1675,6 @@ async fn save_codey_config_locked(
 ) -> Result<SavedCodeyConfig, String> {
     let CodeyConfigSaveInput {
         config: mut config_input,
-        auto_check_codey_updates_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1801,9 +1784,6 @@ async fn save_codey_config_locked(
                     .model_reasoning_efforts_by_provider
                     .contains_key(provider_id)
             });
-    }
-    if auto_check_codey_updates_present {
-        config.auto_check_codey_updates = config_input.auto_check_codey_updates;
     }
     if local_router_enabled_present {
         config.local_router_enabled = config_input.local_router_enabled;

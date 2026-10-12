@@ -1511,40 +1511,6 @@ async fn native_model_cache_without_saved_route_does_not_block_settings_or_reena
 }
 
 #[tokio::test]
-async fn auto_check_codey_updates_save_persists_explicit_and_legacy_values() {
-    let directory = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        store: ConfigStore::new(directory.path().join("config.json")),
-        ..AppState::default()
-    });
-
-    for enabled in [false, true] {
-        let mut payload = serde_json::to_value(state.config.read().await.clone()).unwrap();
-        payload["autoCheckCodeyUpdates"] = json!(enabled);
-        let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
-        save_codey_config_locked(&state, input).await.unwrap();
-        assert_eq!(state.config.read().await.auto_check_codey_updates, enabled);
-        assert_eq!(
-            state.store.load().unwrap().auto_check_codey_updates,
-            enabled
-        );
-
-        let mut legacy = serde_json::to_value(state.config.read().await.clone()).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("autoCheckCodeyUpdates");
-        legacy["slimCodexPet"] = json!(false);
-        let input = codey_config_save_input(&json!({ "config": legacy })).unwrap();
-        save_codey_config_locked(&state, input).await.unwrap();
-        let saved = state.config.read().await.clone();
-        assert_eq!(saved.auto_check_codey_updates, enabled);
-        assert!(!saved.slim_codex_pet);
-        assert_eq!(state.store.load().unwrap(), saved);
-    }
-}
-
-#[tokio::test]
 async fn legacy_save_without_local_router_field_preserves_disabled_state() {
     let directory = tempfile::tempdir().unwrap();
     let initial = CodeyConfig {
@@ -1879,106 +1845,6 @@ fn selected_codex_app_path_accepts_a_custom_install_root() {
     );
 }
 
-#[test]
-fn update_manifest_reports_a_newer_https_release() {
-    let manifest = serde_json::from_value::<UpdateManifest>(json!({
-        "schema_version": 1,
-        "version": "0.2.0",
-        "tag": "v0.2.0",
-        "assets": [{
-            "platform": "windows",
-            "arch": "x64",
-            "package_type": "nsis",
-            "file_name": "Codey-0.2.0-windows-x64-setup.exe",
-            "url": "https://updates.example.com/releases/v0.2.0/Codey-0.2.0-windows-x64-setup.exe",
-            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "size": 1024
-        }]
-    }))
-    .unwrap();
-
-    let result = assess_update_manifest("0.1.0", &manifest).unwrap();
-
-    assert_eq!(result.current_version, "0.1.0");
-    assert_eq!(result.latest_version, "0.2.0");
-    assert!(result.update_available);
-}
-
-#[test]
-fn update_manifest_selects_only_a_supported_current_platform_installer() {
-    let platform = current_update_platform();
-    let arch = current_update_arch();
-    let (package_type, file_name, expected_package_type) = match platform {
-        "windows" => (
-            "nsis",
-            format!("Codey-0.2.0-windows-{arch}-setup.exe"),
-            Some("nsis"),
-        ),
-        "macos" => (
-            "app-zip",
-            format!("Codey-0.2.0-macos-{arch}-unsigned.zip"),
-            Some("app-zip"),
-        ),
-        _ => (
-            "app-zip",
-            format!("Codey-0.2.0-{platform}-{arch}-unsupported.zip"),
-            None,
-        ),
-    };
-    let manifest = serde_json::from_value::<UpdateManifest>(json!({
-        "schema_version": 1,
-        "version": "0.2.0",
-        "tag": "v0.2.0",
-        "assets": [{
-            "platform": platform,
-            "arch": arch,
-            "package_type": package_type,
-            "file_name": &file_name,
-            "url": format!("https://updates.example.com/releases/v0.2.0/{file_name}"),
-            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "size": 2048
-        }]
-    }))
-    .unwrap();
-
-    let result = assess_update_manifest("0.1.0", &manifest).unwrap();
-
-    assert_eq!(
-        result
-            .selected_asset
-            .as_ref()
-            .map(|asset| asset.package_type.as_str()),
-        expected_package_type
-    );
-    assert_eq!(
-        result
-            .selected_asset
-            .as_ref()
-            .map(|asset| asset.arch.as_str()),
-        expected_package_type.map(|_| arch)
-    );
-    assert_eq!(
-        result
-            .selected_asset
-            .as_ref()
-            .map(|asset| asset.file_name.as_str()),
-        expected_package_type.map(|_| file_name.as_str())
-    );
-}
-
-#[tokio::test]
-async fn app_state_preserves_update_shutdown_reason() {
-    let state = AppState::default();
-
-    state.request_update_shutdown();
-    state.request_shutdown();
-
-    assert_eq!(
-        state.wait_for_shutdown().await,
-        AppShutdownReason::InstallUpdate
-    );
-}
-
 #[tokio::test]
 async fn shutdown_signal_wakes_every_waiter_without_losing_the_reason() {
     let state = Arc::new(AppState::default());
@@ -1990,7 +1856,7 @@ async fn shutdown_signal_wakes_every_waiter_without_losing_the_reason() {
         .collect::<Vec<_>>();
     tokio::task::yield_now().await;
 
-    state.request_update_shutdown();
+    state.request_shutdown();
 
     for waiter in waiters {
         assert_eq!(
@@ -1998,57 +1864,7 @@ async fn shutdown_signal_wakes_every_waiter_without_losing_the_reason() {
                 .await
                 .expect("shutdown waiter timed out")
                 .expect("shutdown waiter panicked"),
-            AppShutdownReason::InstallUpdate
+            AppShutdownReason::CodexExited
         );
     }
-}
-
-#[test]
-fn update_manifest_rejects_insecure_asset_urls() {
-    let manifest = serde_json::from_value::<UpdateManifest>(json!({
-        "schema_version": 1,
-        "version": "0.2.0",
-        "tag": "v0.2.0",
-        "assets": [{
-            "platform": "windows",
-            "arch": "x64",
-            "package_type": "nsis",
-            "file_name": "Codey-0.2.0-windows-x64-setup.exe",
-            "url": "http://updates.example.com/Codey-0.2.0-windows-x64-setup.exe",
-            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "size": 1024
-        }]
-    }))
-    .unwrap();
-
-    assert!(
-        assess_update_manifest("0.1.0", &manifest)
-            .unwrap_err()
-            .contains("必须使用 HTTPS")
-    );
-}
-
-#[test]
-fn update_manifest_rejects_asset_path_traversal() {
-    let manifest = serde_json::from_value::<UpdateManifest>(json!({
-        "schema_version": 1,
-        "version": "0.2.0",
-        "tag": "v0.2.0",
-        "assets": [{
-            "platform": "windows",
-            "arch": "x64",
-            "package_type": "nsis",
-            "file_name": "../Codey.exe",
-            "url": "https://updates.example.com/Codey.exe",
-            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "size": 1024
-        }]
-    }))
-    .unwrap();
-
-    assert!(
-        assess_update_manifest("0.1.0", &manifest)
-            .unwrap_err()
-            .contains("文件名无效")
-    );
 }
