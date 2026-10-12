@@ -15,6 +15,7 @@ pub(crate) mod console;
 mod frp;
 mod http;
 mod shared;
+mod thread_activity;
 mod thread_store;
 mod upstream;
 
@@ -23,7 +24,7 @@ use std::ffi::OsString;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -48,6 +49,8 @@ const DEFAULT_PAGE_TURNS: u32 = 8;
 /// 网页只展示概要，工具输出保留一小段预览。
 const OUTPUT_PREVIEW_CHARS: usize = 400;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// 「运行中」快照的刷新间隔：够快跟上网页刷新，又不至于频繁扫盘。
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const PAGE: &str = include_str!("page.html");
 
 /// 包装器协议变量不能传给同源 app-server，否则会被误认为受控 CLI 启动。
@@ -360,8 +363,10 @@ async fn serve_forever(
         token,
         overrides,
         shared: false,
+        active: RwLock::new(HashSet::new()),
     });
     spawn_request_responder(Arc::clone(&state));
+    spawn_activity_refresher(&state);
     tokio::spawn(async move {
         loop {
             app.ensure_running().await;
@@ -419,8 +424,10 @@ async fn serve_shared(
         token,
         overrides,
         shared: true,
+        active: RwLock::new(HashSet::new()),
     });
     spawn_request_responder(Arc::clone(&state));
+    spawn_activity_refresher(&state);
     publish_url(&home, port, &state.token);
     log(
         "codey.remote_gateway.started",
@@ -643,6 +650,8 @@ struct State {
     overrides: Vec<String>,
     /// 共享模式的上游就是桌面会话，反向请求由桌面应答，网页不能替它给默认值。
     shared: bool,
+    /// 磁盘探测到的运行中会话：上游看不到其他客户端执行的 turn（见 [`thread_activity`]）。
+    active: RwLock<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -757,6 +766,26 @@ fn spawn_request_responder(state: Arc<State>) {
                     }
                 }
             });
+        }
+    });
+}
+
+/// 后台刷新「运行中」快照：其他客户端（其他 Codey 实例、桌面官方应用）执行的 turn
+/// 不会出现在上游 `thread/list` 里，只能从磁盘投影判断；网页请求直接读快照。
+fn spawn_activity_refresher(state: &Arc<State>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let home = crate::codex_config::codex_home().to_path_buf();
+        loop {
+            let home = home.clone();
+            let active =
+                tokio::task::spawn_blocking(move || thread_activity::active_thread_ids(&home))
+                    .await
+                    .unwrap_or_default();
+            if let Ok(mut guard) = state.active.write() {
+                *guard = active;
+            }
+            tokio::time::sleep(ACTIVITY_REFRESH_INTERVAL).await;
         }
     });
 }
@@ -1048,6 +1077,11 @@ async fn api_threads(state: &State, request: &Request) -> ApiResult {
         .unwrap_or_default();
 
     let home = crate::codex_config::codex_home().to_path_buf();
+    let active = state
+        .active
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
     let query = thread_store::Query {
         search: search.clone(),
         cutoff,
@@ -1060,7 +1094,7 @@ async fn api_threads(state: &State, request: &Request) -> ApiResult {
     let stored = read_stored_threads(home.clone(), query).await;
     let mut threads = stored
         .iter()
-        .map(|row| merge_thread_row(row, &upstream_threads))
+        .map(|row| merge_thread_row(row, &upstream_threads, &active))
         .collect::<Vec<_>>();
     // 库里还没有、上游却已经认识的会话（例如刚创建还没落库）补在后面。
     let listed = threads
@@ -1076,7 +1110,7 @@ async fn api_threads(state: &State, request: &Request) -> ApiResult {
         if known || !thread_in_window(thread, cutoff) {
             continue;
         }
-        threads.push(compact_thread(thread));
+        threads.push(compact_thread(thread, &active));
     }
     // 库里最近没有活动的会话时至少留最近几条，首页不至于整片空白。
     let used_floor = threads.is_empty() && cutoff.is_some();
@@ -1089,13 +1123,13 @@ async fn api_threads(state: &State, request: &Request) -> ApiResult {
         threads = read_stored_threads(home, floor)
             .await
             .iter()
-            .map(|row| merge_thread_row(row, &upstream_threads))
+            .map(|row| merge_thread_row(row, &upstream_threads, &active))
             .collect();
         if threads.is_empty() {
             threads = upstream_threads
                 .iter()
                 .take(THREAD_RECENT_FLOOR)
-                .map(compact_thread)
+                .map(|thread| compact_thread(thread, &active))
                 .collect();
         }
     }
@@ -1147,7 +1181,11 @@ fn thread_window_cutoff() -> i64 {
     now - THREAD_WINDOW_DAYS * 24 * 60 * 60
 }
 
-fn compact_thread(thread: &Value) -> Value {
+fn compact_thread(thread: &Value, active: &HashSet<String>) -> Value {
+    let status = match thread.get("id").and_then(Value::as_str) {
+        Some(id) => merged_status(Some(thread), id, active),
+        None => thread.get("status").cloned().unwrap_or(Value::Null),
+    };
     json!({
         "id": thread.get("id"),
         "name": thread.get("name"),
@@ -1156,7 +1194,7 @@ fn compact_thread(thread: &Value) -> Value {
         "createdAt": thread.get("createdAt"),
         "updatedAt": thread.get("updatedAt"),
         "model": thread.get("model"),
-        "status": thread.get("status"),
+        "status": status,
         "source": thread.get("source"),
     })
 }
@@ -1173,7 +1211,11 @@ async fn read_stored_threads(
 
 /// 把 state 库的一行与上游列表里的同一会话合并：列表字段以库为准（更全），
 /// 运行状态、模型等实时字段以当前上游为准。
-fn merge_thread_row(row: &thread_store::ThreadRow, upstream_threads: &[Value]) -> Value {
+fn merge_thread_row(
+    row: &thread_store::ThreadRow,
+    upstream_threads: &[Value],
+    active: &HashSet<String>,
+) -> Value {
     let upstream = upstream_threads
         .iter()
         .find(|thread| thread.get("id").and_then(Value::as_str) == Some(row.id.as_str()));
@@ -1201,9 +1243,25 @@ fn merge_thread_row(row: &thread_store::ThreadRow, upstream_threads: &[Value]) -
             .or(row.created_at),
         "updatedAt": updated_at,
         "model": text(upstream.and_then(|thread| thread.get("model"))).or_else(|| row.model.clone()),
-        "status": upstream.and_then(|thread| thread.get("status")).cloned().unwrap_or(Value::Null),
+        "status": merged_status(upstream, &row.id, active),
         "source": upstream.and_then(|thread| thread.get("source")).cloned().unwrap_or(Value::Null),
     })
+}
+
+/// 合并运行状态：上游只认识桌面进程自己执行的会话，磁盘探测覆盖其他客户端
+/// （其他 Codey 实例、官方应用）的会话；任一边认为在运行就标为 active。
+fn merged_status(upstream: Option<&Value>, id: &str, active: &HashSet<String>) -> Value {
+    let upstream_status = upstream
+        .and_then(|thread| thread.get("status"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if upstream_status.get("type").and_then(Value::as_str) == Some("active") {
+        return upstream_status;
+    }
+    if active.contains(id) {
+        return json!({ "type": "active" });
+    }
+    upstream_status
 }
 
 async fn api_thread(state: &State, id: &str) -> ApiResult {
@@ -2584,7 +2642,7 @@ mod tests {
             "status": { "type": "active" },
         })];
 
-        let merged = merge_thread_row(&row, &upstream);
+        let merged = merge_thread_row(&row, &upstream, &HashSet::new());
 
         assert_eq!(merged["name"], json!("实时名字"));
         assert_eq!(merged["preview"], json!("库里的预览"));
@@ -2594,5 +2652,35 @@ mod tests {
         assert_eq!(merged["updatedAt"], json!(200));
         assert_eq!(merged["createdAt"], json!(10));
         assert_eq!(merged["status"]["type"], json!("active"));
+    }
+
+    #[test]
+    fn merged_thread_marks_disk_detected_activity() {
+        let row = thread_store::ThreadRow {
+            id: "t2".to_owned(),
+            name: None,
+            preview: None,
+            cwd: None,
+            model: None,
+            created_at: None,
+            updated_at: 5,
+        };
+        // 上游不认识这个会话，磁盘探测认为它在运行。
+        let active = HashSet::from(["t2".to_owned()]);
+        let merged = merge_thread_row(&row, &[], &active);
+        assert_eq!(merged["status"]["type"], json!("active"));
+        // 探测过期后状态回到上游的未知。
+        let merged = merge_thread_row(&row, &[], &HashSet::new());
+        assert_eq!(merged["status"], Value::Null);
+        // 上游已给出 active 时保留上游字段（含 activeFlags）。
+        let upstream = vec![json!({
+            "id": "t2",
+            "status": { "type": "active", "activeFlags": ["waitingOnApproval"] },
+        })];
+        let merged = merge_thread_row(&row, &upstream, &HashSet::new());
+        assert_eq!(
+            merged["status"]["activeFlags"],
+            json!(["waitingOnApproval"])
+        );
     }
 }
