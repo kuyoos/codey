@@ -792,6 +792,8 @@ const state = {
   token: "",
   threads: [],
   threadWindowDays: 0,
+  threadsSeq: 0,
+  threadSignature: "",
   models: [],
   threadId: null,
   detail: null,
@@ -2094,12 +2096,36 @@ function reportError(error) {
 async function loadThreads() {
   const search = $("search").value.trim();
   const query = search ? "?search=" + encodeURIComponent(search) : "";
+  // 轮询会与搜索、返回列表并发：只让最新一次请求的结果落地。
+  const seq = (state.threadsSeq += 1);
   const body = await api("/api/threads" + query);
-  state.threads = body.threads || [];
+  if (seq !== state.threadsSeq) return;
   // 首页只取最近几天有过活动的会话；搜索时后端不带窗口，这里也就没有天数。
-  state.threadWindowDays = Number(body.windowDays) || 0;
+  const windowDays = Number(body.windowDays) || 0;
+  const threads = body.threads || [];
+  // 3 秒轮询只为对齐运行状态：内容没变就不重排，免得侧边栏闪烁、滚动跳位或打断点击。
+  const signature = JSON.stringify([
+    search,
+    windowDays,
+    threads.map((thread) => [
+      thread.id,
+      thread.name,
+      thread.preview,
+      thread.model,
+      thread.updatedAt,
+      thread.status ? thread.status.type : null,
+    ]),
+  ]);
+  const unchanged = signature === state.threadSignature;
+  state.threads = threads;
+  state.threadWindowDays = windowDays;
+  state.threadSignature = signature;
   state.loaded = true;
+  if (unchanged) return;
+  const list = $("threads");
+  const keep = list.scrollTop;
   renderThreads();
+  list.scrollTop = keep;
 }
 
 async function loadModels() {
@@ -3084,6 +3110,13 @@ async function boot() {
     if (!state.autoScroll) return;
     loadTurns(null).catch(() => {});
   }, 5000);
+  // 其他客户端执行的回合要能及时出现在列表里，所以每 3 秒对齐一次；页面不可见时暂停。
+  const pollThreadList = () => {
+    if (document.visibilityState === "hidden") return;
+    loadThreads().catch(() => {});
+  };
+  setInterval(pollThreadList, 3000);
+  document.addEventListener("visibilitychange", pollThreadList);
   try {
     await Promise.all([loadModels(), loadThreads()]);
   } catch (error) {
