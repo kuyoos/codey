@@ -848,14 +848,6 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     if let Some(reason) = ledger_capacity_denial(&ledger) {
         return Ok(Some(reason));
     }
-    if let Some(conflict) = resource_conflict(&prepared, &ledger) {
-        return Ok(Some(conflict));
-    }
-    if let Some(conflict) =
-        resource_conflict_in_other_sessions(state_root, runtime_id, &store.ledger_path, &prepared)?
-    {
-        return Ok(Some(conflict));
-    }
     if let Some(reason) = concurrency_denial(&ledger, &prepared, active_agents) {
         return Ok(Some(reason));
     }
@@ -2539,109 +2531,6 @@ fn reservation_trace(reservation: &Reservation) -> TraceContext {
     }
 }
 
-fn resource_conflict(prepared: &PreparedContract, ledger: &SessionLedger) -> Option<String> {
-    for existing in ledger
-        .reservations
-        .values()
-        .filter(|reservation| !reservation.spawn_failed && reservation.state.is_active())
-    {
-        if let Some(conflict) = reservation_resource_conflict(prepared, existing) {
-            return Some(conflict);
-        }
-    }
-    None
-}
-
-fn resource_conflict_in_other_sessions(
-    state_root: &Path,
-    runtime_id: &str,
-    current_ledger_path: &Path,
-    prepared: &PreparedContract,
-) -> Result<Option<String>> {
-    let runtime_id_hash = hash_component(runtime_id);
-    for entry in fs::read_dir(state_root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let ledger_path = entry.path().join(LEDGER_FILE);
-        if ledger_path == current_ledger_path {
-            continue;
-        }
-        let bytes = match crate::fs_util::read_bounded(&ledger_path, MAX_LEDGER_BYTES) {
-            Ok(bytes) => bytes,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("读取跨会话子代理账本失败：{}", ledger_path.display())
-                });
-            }
-        };
-        // A ledger left behind by a crashed or older Codey must not block every
-        // other session: skip it, keep looking, and leave the diagnostics on stderr.
-        let ledger: SessionLedger = match serde_json::from_slice(&bytes) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                eprintln!(
-                    "Codey 跳过无法解析的跨会话子代理账本 {}：{error}",
-                    ledger_path.display()
-                );
-                continue;
-            }
-        };
-        if ledger.runtime_id_hash != runtime_id_hash {
-            continue;
-        }
-        for existing in ledger
-            .reservations
-            .values()
-            .filter(|reservation| !reservation.spawn_failed && reservation.state.is_active())
-        {
-            if let Some(conflict) = reservation_resource_conflict(prepared, existing) {
-                return Ok(Some(conflict));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn reservation_resource_conflict(
-    prepared: &PreparedContract,
-    existing: &Reservation,
-) -> Option<String> {
-    if prepared.policy.access != RoleAccess::Write && !existing.write_capable {
-        return None;
-    }
-    let overlaps = match (&prepared.workspace_root, &existing.workspace_root) {
-        (Some(left), Some(right)) => paths_overlap(left, right),
-        _ => true,
-    };
-    overlaps.then(|| {
-        format!(
-            "Codey 能力/资源冲突门禁：任务 `{}` 与活动任务 `{}` 共享工作区且至少一方可写；请串行执行。",
-            prepared.capsule.id, existing.task_id
-        )
-    })
-}
-
-fn paths_overlap(left: &str, right: &str) -> bool {
-    path_is_within(left, right) || path_is_within(right, left)
-}
-
-fn path_is_within(path: &str, parent: &str) -> bool {
-    path == parent
-        || parent.ends_with('/') && path.starts_with(parent)
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
 pub(crate) fn safe_child_reporting_tool(tool_name: &str, tool_input: Option<&Value>) -> bool {
     if rules::normalize_tool_name(tool_name) != "send_message" {
         return false;
@@ -2822,11 +2711,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_ledger_in_another_session_does_not_block_spawns() {
+    fn writers_in_other_sessions_share_the_workspace() {
         let temp = tempdir().unwrap();
-        let stale_session = temp.path().join("deadbeef");
-        std::fs::create_dir_all(&stale_session).unwrap();
-        std::fs::write(stale_session.join(LEDGER_FILE), b"{not json").unwrap();
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
@@ -2840,16 +2726,47 @@ mod tests {
             .unwrap(),
             None
         );
-    }
-
-    #[test]
-    fn writer_uses_a_workspace_wide_conflict_lock() {
-        let temp = tempdir().unwrap();
+        // Another session of the same runtime may write to the same workspace.
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
                 "runtime-a",
                 "session-b",
+                Some(&spawn_input("writer_b", "codey_worker")),
+                Some("/repo"),
+                1,
+                11,
+            )
+            .unwrap(),
+            None
+        );
+        // A stale cross-session ledger no longer participates in admission.
+        let stale_session = temp.path().join("deadbeef");
+        std::fs::create_dir_all(&stale_session).unwrap();
+        std::fs::write(stale_session.join(LEDGER_FILE), b"{not json").unwrap();
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-c",
+                Some(&spawn_input("writer_c", "codey_worker")),
+                Some("/repo"),
+                1,
+                12,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn writers_in_the_same_workspace_run_without_exclusion() {
+        let temp = tempdir().unwrap();
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-a",
                 Some(&spawn_input("writer_a", "codey_worker")),
                 Some("/repo"),
                 0,
@@ -2858,44 +2775,34 @@ mod tests {
             .unwrap(),
             None
         );
-        let denial = pre_spawn_with_workspace(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&spawn_input("writer_b", "codey_worker")),
-            Some("/repo"),
-            1,
-            11,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("资源冲突"));
+        // A second writer in the same workspace and session is admitted: only
+        // the mixed concurrency limit gates dispatch, not file ownership.
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
                 "runtime-a",
-                "session-c",
-                Some(&spawn_input("writer_c", "codey_worker")),
-                Some("/other-repo"),
-                0,
-                12,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            pre_spawn_with_workspace(
-                temp.path(),
-                "runtime-b",
-                "session-d",
-                Some(&spawn_input("writer_d", "codey_worker")),
+                "session-a",
+                Some(&spawn_input("writer_b", "codey_worker")),
                 Some("/repo"),
-                0,
-                13,
+                1,
+                11,
             )
             .unwrap(),
             None
         );
+        let denial = pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&spawn_input("writer_c", "codey_worker")),
+            Some("/repo"),
+            2,
+            12,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("并发上限 2"));
+        assert!(!denial.contains("资源冲突"));
     }
 
     #[test]
