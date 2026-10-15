@@ -27,7 +27,7 @@ test("settings reports startup health and the confirmed main-process injection m
   ]);
   const launcherSource = `${launcherRootSource}\n${launcherProcessSource}`;
 
-  assert.match(commandsSource, /"clientPlatform": current_update_platform\(\)/);
+  assert.match(commandsSource, /"clientPlatform": client_platform\(\)/);
   assert.match(typesSource, /clientPlatform\?: string/);
   assert.match(
     sectionsSource,

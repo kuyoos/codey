@@ -611,7 +611,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
         accountUsageCalls += 1;
         return accountUsageResult;
       }
-      if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+      if (path === "/backend/status") return { status: "ok" };
       if (path === "/backend/health") return { status: "ok" };
       throw new Error(`unexpected bridge path: ${path}`);
     },
@@ -801,7 +801,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.equal(await window.__codeyReadQuotaAccountUsage(), quotaUsageResult, "missing capability does not turn a backend error into success");
 });
 
-const createStartupUpdateFixture = (bridge) => {
+const createStartupFixture = (bridge) => {
   const visibleHeader = new FakeElement("header", { right: 1200 });
   const documentElement = new FakeElement("html");
   const elementsById = new Map();
@@ -950,141 +950,11 @@ const createStartupUpdateFixture = (bridge) => {
   };
 };
 
-test("hydrates the passive update badge from startup backend state", async () => {
-  const bridgeCalls = [];
-  const fixture = createStartupUpdateFixture(async (path, payload) => {
-    bridgeCalls.push({ path, payload });
-    if (path === "/backend/status") {
-      return {
-        status: "ok",
-        availableUpdate: {
-          currentVersion: "0.3.9",
-          latestVersion: "0.4.0",
-          updateAvailable: true,
-          selectedAsset: { fileName: "Codey-0.4.0.zip" },
-        },
-      };
-    }
-    if (path === "/backend/health") return { status: "ok" };
-    throw new Error(`unexpected bridge path: ${path}`);
-  });
-
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const button = fixture.document.getElementById("codey-settings-button");
-  assert.ok(button);
-  assert.equal(button.getAttribute("data-codey-update-available"), "true");
-  assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置，有可用更新");
-  assert.equal(fixture.window.__codeyUpdateAvailability.latestVersion, "0.4.0");
-  const updateEvents = fixture.events.filter(
-    (event) => event.type === "codey-update-availability-changed",
-  );
-  assert.equal(updateEvents.length, 1);
-  assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
-  assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
-  assert.equal(
-    fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
-    false,
-  );
-  assert.deepEqual(
-    bridgeCalls.map(({ path }) => path),
-    ["/backend/status", "/backend/health"],
-  );
-  assert.equal(
-    fixture.activeTimers().some((timer) => timer.delay === 30_000),
-    true,
-  );
-
-  let unchangedAttributeWrites = 0;
-  const originalSetAttribute = button.setAttribute.bind(button);
-  button.setAttribute = (...args) => {
-    unchangedAttributeWrites += 1;
-    originalSetAttribute(...args);
-  };
-  await fixture.window.__codeyRefreshRuntimeHealth();
-  assert.equal(unchangedAttributeWrites, 0);
-});
-
-test("falls back to a passive periodic check when backend update state hangs", async () => {
-  const fixture = createStartupUpdateFixture(
-    async () => new Promise(() => {}),
-  );
-
-  const timeoutTimer = fixture.activeTimers().find(
-    (timer) => timer.delay === 10_000,
-  );
-  assert.ok(timeoutTimer);
-  timeoutTimer.cleared = true;
-  timeoutTimer.callback();
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
-  assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
-  assert.equal(fixture.window.__codeyUpdateAvailability, null);
-  assert.equal(
-    fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
-    true,
-  );
-});
-
-test("saved automatic update preference controls renderer polling and manual update badges", async () => {
-  const calls = [];
-  const fixture = createStartupUpdateFixture(async (path) => {
-    calls.push(path);
-    if (path === "/backend/status") return { autoCheckCodeyUpdates: false };
-    if (path === "/backend/health") return { status: "ok" };
-    if (path === "/account/usage") return { status: "disabled" };
-    if (path === "/api/check_for_updates") return { updateAvailable: false };
-    throw new Error(`unexpected bridge path: ${path}`);
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  const updateTimers = () => fixture.activeTimers().filter((timer) => timer.delay === 30 * 60 * 1000);
-  assert.equal(updateTimers().length, 0);
-  assert.equal(calls.includes("/api/check_for_updates"), false);
-
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: true } } });
-  for (const timer of fixture.activeTimers().filter((timer) => timer.delay === 0)) {
-    timer.cleared = true;
-    timer.callback();
-  }
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls.filter((path) => path === "/api/check_for_updates").length, 1);
-  assert.equal(updateTimers().length, 1);
-
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
-  assert.equal(updateTimers().length, 0);
-  fixture.window.dispatchEvent({ type: "codey:config-changed" });
-  assert.equal(updateTimers().length, 0);
-  fixture.window.dispatchEvent({ type: "codey-update-availability-changed", detail: { updateAvailable: true, latestVersion: "2.0.0" } });
-  assert.equal(fixture.document.getElementById("codey-settings-button").getAttribute("data-codey-update-available"), "true");
-});
-
-test("disabling renderer automatic checks ignores an in-flight update response", async () => {
-  let resolveUpdate;
-  const fixture = createStartupUpdateFixture(async (path) => {
-    if (path === "/backend/status") return { autoCheckCodeyUpdates: true };
-    if (path === "/backend/health") return { status: "ok" };
-    if (path === "/api/check_for_updates") return new Promise((resolve) => { resolveUpdate = resolve; });
-    throw new Error(`unexpected bridge path: ${path}`);
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  const timer = fixture.activeTimers().find((entry) => entry.delay === 30 * 60 * 1000);
-  assert.ok(timer);
-  timer.cleared = true;
-  timer.callback();
-  assert.equal(typeof resolveUpdate, "function");
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
-  resolveUpdate({ updateAvailable: true, latestVersion: "2.0.0" });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.window.__codeyUpdateAvailability, null);
-  assert.equal(fixture.activeTimers().some((entry) => entry.delay === 30 * 60 * 1000), false);
-});
-
 test("marks the Codey icon unavailable after consecutive hung health checks and recovers", async () => {
   let healthMode = "hang";
-  const fixture = createStartupUpdateFixture(async (path) => {
+  const fixture = createStartupFixture(async (path) => {
     if (path === "/backend/status") {
-      return { status: "ok", availableUpdate: null };
+      return { status: "ok" };
     }
     if (path === "/backend/health") {
       return healthMode === "healthy"
@@ -1143,8 +1013,8 @@ test("marks the Codey icon unavailable after consecutive hung health checks and 
 
 test("pauses Codey health checks while the page is hidden and resumes immediately", async () => {
   let healthCalls = 0;
-  const fixture = createStartupUpdateFixture(async (path) => {
-    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+  const fixture = createStartupFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok" };
     if (path === "/backend/health") {
       healthCalls += 1;
       return { status: "ok" };
@@ -1179,8 +1049,8 @@ test("pauses Codey health checks while the page is hidden and resumes immediatel
 });
 
 test("widens the health check budget right after the machine resumes from sleep", async () => {
-  const fixture = createStartupUpdateFixture(async (path) => {
-    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+  const fixture = createStartupFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok" };
     if (path === "/account/usage") return { status: "disabled" };
     if (path === "/backend/health") return new Promise(() => {});
     throw new Error(`unexpected bridge path: ${path}`);
@@ -1447,7 +1317,7 @@ test("mounts usage into the sidebar footer container Codex renders itself", asyn
       if (path === "/api/query_official_account_usage") return usageSnapshot;
       if (path === "/account/usage") return usageSnapshot;
       if (path === "/api/store_official_account_usage") return { status: "ok" };
-      if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+      if (path === "/backend/status") return { status: "ok" };
       if (path === "/backend/health") return { status: "ok" };
       throw new Error(`unexpected bridge path: ${path}`);
     },

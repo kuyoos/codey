@@ -1,7 +1,7 @@
 //! Native `agents.spawn_agent` task-capsule validation.
 //!
-//! Resource paths are conservative coordination metadata. Codex remains the
-//! filesystem authority.
+//! Workspace paths are recorded metadata. Codex remains the filesystem
+//! authority.
 
 use std::fs;
 use std::path::PathBuf;
@@ -62,8 +62,6 @@ pub(super) fn prepare_task_capsule(
     }
     let mut capabilities = match policy.access {
         RoleAccess::ReadOnly => vec!["files.read".to_string()],
-        // ponytail: one workspace-wide writer lock; add narrower native ownership
-        // only if the executor exposes a trusted path field.
         RoleAccess::Write => vec![
             "command.execute".to_string(),
             "files.read".to_string(),
@@ -112,8 +110,8 @@ pub(super) fn validate_task_id(value: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Canonicalize existing ancestors when possible so coordination claims for
-/// obvious aliases overlap. These paths are scheduling metadata, not a file
+/// Canonicalize existing ancestors when possible so recorded workspace paths
+/// stay stable across obvious aliases. These paths are metadata, not a file
 /// ACL: metadata/canonicalization failures fall back to the lexical absolute
 /// path, while the Codex executor remains the only filesystem authority.
 pub(super) fn normalize_coordination_path(value: &str) -> std::result::Result<String, String> {

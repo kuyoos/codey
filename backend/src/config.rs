@@ -732,9 +732,6 @@ impl RouteRequestLogConfig {
 pub struct CodeyConfig {
     #[serde(default)]
     pub settings_revision: u64,
-    /// 控制启动和运行期间的自动更新检查，包括 Codex 启动失败后的检查。
-    #[serde(default = "default_true")]
-    pub auto_check_codey_updates: bool,
     /// Controls whether Codey installs and uses its process-local multi-route
     /// gateway. Missing values default to enabled so existing installations
     /// keep their current behavior after upgrading.
@@ -856,22 +853,6 @@ pub struct CodeyConfig {
     /// preserves whether the preflight was authoritative or inconclusive.
     #[serde(skip)]
     pub official_account_status_this_launch: LaunchOfficialAccountStatus,
-    /// Public HTTPS endpoint for the version manifest published to Cloudflare R2.
-    /// This is build-time configuration, not a user setting.
-    #[serde(
-        default = "default_update_manifest_url",
-        skip_serializing,
-        skip_deserializing
-    )]
-    pub update_manifest_url: String,
-    /// Optional release-admin Worker endpoint for device-aware publishing.
-    /// This is build-time configuration, never a user setting.
-    #[serde(
-        default = "default_release_admin_url",
-        skip_serializing,
-        skip_deserializing
-    )]
-    pub release_admin_url: String,
 }
 
 /// User-declared operating budget, never proof of upstream model capacity.
@@ -945,7 +926,6 @@ impl Default for CodeyConfig {
         let profile = ProviderProfile::new("默认配置");
         Self {
             settings_revision: 0,
-            auto_check_codey_updates: true,
             local_router_enabled: true,
             route_request_log: RouteRequestLogConfig::default(),
             stream_max_retries: default_stream_max_retries(),
@@ -978,8 +958,6 @@ impl Default for CodeyConfig {
             show_account_usage_in_header: true,
             official_account_available_this_launch: false,
             official_account_status_this_launch: LaunchOfficialAccountStatus::Unauthenticated,
-            update_manifest_url: default_update_manifest_url(),
-            release_admin_url: default_release_admin_url(),
         }
     }
 }
@@ -990,8 +968,6 @@ fn default_stream_max_retries() -> u32 {
 
 impl CodeyConfig {
     pub fn normalize(mut self) -> Self {
-        self.update_manifest_url = default_update_manifest_url();
-        self.release_admin_url = default_release_admin_url();
         self.stream_max_retries = self.stream_max_retries.min(100);
         self.route_request_log.normalize();
         self.profiles
@@ -2593,31 +2569,6 @@ fn default_subagent_model() -> String {
 
 fn default_subagent_reasoning_effort() -> String {
     DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
-}
-
-const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
-const DEFAULT_RELEASE_ADMIN_URL: &str = "https://codey-release-admin.kimzane9991.workers.dev";
-
-fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
-    let base_url = configured_base_url
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .unwrap_or(DEFAULT_UPDATE_BASE_URL)
-        .trim_end_matches('/');
-    format!("{base_url}/latest.json")
-}
-
-pub fn default_update_manifest_url() -> String {
-    update_manifest_url_from_base(option_env!("CODEY_UPDATE_BASE_URL"))
-}
-
-pub fn default_release_admin_url() -> String {
-    option_env!("CODEY_RELEASE_ADMIN_URL")
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .unwrap_or(DEFAULT_RELEASE_ADMIN_URL)
-        .trim_end_matches('/')
-        .to_string()
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -4255,28 +4206,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_check_codey_updates_defaults_to_enabled_and_preserves_explicit_value() {
-        assert!(CodeyConfig::default().auto_check_codey_updates);
-        let legacy = serde_json::from_str::<CodeyConfig>(r#"{}"#)
-            .unwrap()
-            .normalize();
-        assert!(legacy.auto_check_codey_updates);
-
-        for enabled in [false, true] {
-            let config = serde_json::from_value::<CodeyConfig>(serde_json::json!({
-                "autoCheckCodeyUpdates": enabled,
-            }))
-            .unwrap()
-            .normalize();
-            assert_eq!(config.auto_check_codey_updates, enabled);
-            assert_eq!(
-                serde_json::to_value(config).unwrap()["autoCheckCodeyUpdates"],
-                enabled
-            );
-        }
-    }
-
-    #[test]
     fn route_request_log_is_opt_in_and_normalizes_resource_bounds() {
         let legacy = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
             .unwrap()
@@ -4322,31 +4251,6 @@ mod tests {
         assert_eq!(configured.route_request_log.max_file_bytes, 1024 * 1024);
         assert_eq!(configured.route_request_log.retained_files, 1);
         assert_eq!(configured.route_request_log.retention_days, 1);
-    }
-
-    #[test]
-    fn user_update_manifest_url_is_ignored_and_not_persisted() {
-        let config = serde_json::from_str::<CodeyConfig>(
-            r#"{"activeProfileId":"","profiles":[],"updateManifestUrl":"https://example.com/latest.json"}"#,
-        )
-        .unwrap()
-        .normalize();
-        let serialized = serde_json::to_value(&config).unwrap();
-
-        assert_eq!(config.update_manifest_url, default_update_manifest_url());
-        assert!(serialized.get("updateManifestUrl").is_none());
-    }
-
-    #[test]
-    fn update_manifest_url_defaults_to_the_public_source_for_local_builds() {
-        let expected = format!("{DEFAULT_UPDATE_BASE_URL}/latest.json");
-
-        assert_eq!(update_manifest_url_from_base(None), expected);
-        assert_eq!(update_manifest_url_from_base(Some("  ")), expected);
-        assert_eq!(
-            update_manifest_url_from_base(Some("https://updates.example.com/codey/")),
-            "https://updates.example.com/codey/latest.json"
-        );
     }
 
     #[test]

@@ -18,7 +18,6 @@ mod official_accounts;
 mod plugins;
 mod prompt_optimization;
 mod runtime;
-mod updates;
 mod webhooks;
 mod wechat_claw;
 
@@ -59,15 +58,6 @@ pub(crate) use runtime::{cleanup_failed_runtime_start, reap_runtime_child_before
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
-use updates::current_update_platform;
-#[cfg(test)]
-pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
-pub(crate) use updates::{
-    UpdateCandidate, UpdateDownload, check_for_update_candidate, download_update_candidate,
-    start_downloaded_update,
-};
-#[cfg(test)]
-use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
     sync_waiting_webhook_watcher, test_notification_channel,
@@ -152,8 +142,6 @@ pub struct AppState {
     /// Kept apart from `startup_error`, which each launch overwrites and hot
     /// reloads treat as an untrusted runtime.
     config_load_error: Option<String>,
-    available_update: RwLock<Option<updates::UpdateCheck>>,
-    update_candidate_cache: Mutex<Option<updates::CachedUpdateCandidate>>,
     codex_app_version_cache: Mutex<Option<runtime::CodexAppVersionCache>>,
     restart_in_progress: AtomicBool,
     shutting_down: AtomicBool,
@@ -205,7 +193,6 @@ impl Drop for RestartInProgressGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppShutdownReason {
     CodexExited,
-    InstallUpdate,
 }
 
 /// An unreadable config falls back to defaults for this launch. The broken
@@ -274,8 +261,6 @@ impl Default for AppState {
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             config_load_error,
-            available_update: RwLock::new(None),
-            update_candidate_cache: Mutex::new(None),
             codex_app_version_cache: Mutex::new(None),
             restart_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -336,6 +321,18 @@ fn bridge_string_array(payload: &Value, name: &str, limit: usize) -> Vec<String>
         .collect()
 }
 
+/// Operating system identifier reported to the frontend so it can pick
+/// platform-specific behavior.
+fn client_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        std::env::consts::OS
+    }
+}
+
 impl AppState {
     /// Codey's own store of ChatGPT accounts, kept next to the config file.
     pub(crate) fn official_accounts(&self) -> OfficialAccountStore {
@@ -369,10 +366,6 @@ impl AppState {
 
     pub fn request_shutdown(&self) {
         self.request_shutdown_with_reason(AppShutdownReason::CodexExited);
-    }
-
-    pub fn request_update_shutdown(&self) {
-        self.request_shutdown_with_reason(AppShutdownReason::InstallUpdate);
     }
 
     fn request_shutdown_with_reason(&self, reason: AppShutdownReason) {
@@ -1067,6 +1060,17 @@ async fn resolve_session_name_cached(
     .await
 }
 
+/// 远程控制网关只在 Windows 桌面运行，其余平台如实回传不可用。
+#[cfg(windows)]
+async fn remote_gateway_command(command: &str, args: &Value) -> Result<Value, String> {
+    crate::remote_gateway::console::invoke(command, args).await
+}
+
+#[cfg(not(windows))]
+async fn remote_gateway_command(_command: &str, _args: &Value) -> Result<Value, String> {
+    Err("远程控制仅支持 Windows 桌面".to_owned())
+}
+
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
         "load_codey_config" => load_codey_config(state).await,
@@ -1079,6 +1083,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "reorder_route_models"
         | "delete_route"
         | "fetch_route_models"
+        | "test_route_model"
         | "save_selected_models"
         | "save_default_model"
         | "save_official_route_models" => models::invoke(state, command, &args).await,
@@ -1181,11 +1186,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(error),
             }
         }
-        "check_for_updates"
-        | "get_device_machine_no"
-        | "download_update"
-        | "update_install_report"
-        | "install_downloaded_update" => updates::invoke(state, command, &args).await,
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
@@ -1202,6 +1202,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "open_codey_plugin_logs"
         | "clear_codey_plugin_logs"
         | "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "remote_gateway_status"
+        | "save_remote_gateway_config"
+        | "regenerate_remote_gateway_token" => remote_gateway_command(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
     result.unwrap_or_else(api_error_message)
@@ -1587,7 +1590,6 @@ pub async fn save_codey_config(
 
 struct CodeyConfigSaveInput {
     config: CodeyConfig,
-    auto_check_codey_updates_present: bool,
     model_reasoning_efforts_present: bool,
     model_context_present: bool,
     local_router_enabled_present: bool,
@@ -1604,7 +1606,6 @@ impl CodeyConfigSaveInput {
     fn complete(config: CodeyConfig) -> Self {
         Self {
             config,
-            auto_check_codey_updates_present: true,
             model_reasoning_efforts_present: true,
             model_context_present: true,
             local_router_enabled_present: true,
@@ -1626,7 +1627,6 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let fields = config_value
         .as_object()
         .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
-    let auto_check_codey_updates_present = fields.contains_key("autoCheckCodeyUpdates");
     let local_router_enabled_present = fields.contains_key("localRouterEnabled");
     let model_reasoning_efforts_present = fields.contains_key("modelReasoningEffortsByProvider");
     let model_context_present = fields.contains_key("modelContextByProvider");
@@ -1640,7 +1640,6 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
         config,
-        auto_check_codey_updates_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1676,7 +1675,6 @@ async fn save_codey_config_locked(
 ) -> Result<SavedCodeyConfig, String> {
     let CodeyConfigSaveInput {
         config: mut config_input,
-        auto_check_codey_updates_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1786,9 +1784,6 @@ async fn save_codey_config_locked(
                     .model_reasoning_efforts_by_provider
                     .contains_key(provider_id)
             });
-    }
-    if auto_check_codey_updates_present {
-        config.auto_check_codey_updates = config_input.auto_check_codey_updates;
     }
     if local_router_enabled_present {
         config.local_router_enabled = config_input.local_router_enabled;
@@ -1902,7 +1897,8 @@ async fn save_codey_config_locked(
     // Codex reads each registered role config_file again when spawning a child.
     // Check the Codey-owned runtime files on every save while the policy stays
     // enabled, even when the in-memory role summary did not change. Enabling or
-    // disabling still requires a restart to register/unregister tools and hooks.
+    // disabling a registered role applies on the next spawn; only a role that
+    // was never registered in this instance requires one restart.
     let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
@@ -2457,6 +2453,7 @@ enum SubagentHotReloadStatus {
     Unchanged,
     Applied,
     Repaired,
+    PendingRestart,
     Superseded,
     Failed,
 }
@@ -2469,6 +2466,14 @@ pub(super) struct SubagentHotReloadOutcome {
 }
 
 impl SubagentHotReloadOutcome {
+    fn pending_restart(reason: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::PendingRestart,
+            error: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
     fn unchanged() -> Self {
         Self {
             status: SubagentHotReloadStatus::Unchanged,
@@ -2516,7 +2521,10 @@ impl SubagentHotReloadOutcome {
     }
 
     pub(super) fn requires_restart(&self) -> bool {
-        self.status == SubagentHotReloadStatus::Failed
+        matches!(
+            self.status,
+            SubagentHotReloadStatus::Failed | SubagentHotReloadStatus::PendingRestart
+        )
     }
 
     pub(super) fn health(&self) -> &'static str {
@@ -2525,6 +2533,7 @@ impl SubagentHotReloadOutcome {
             SubagentHotReloadStatus::Unchanged => "healthy",
             SubagentHotReloadStatus::Applied => "applied",
             SubagentHotReloadStatus::Repaired => "repaired",
+            SubagentHotReloadStatus::PendingRestart => "pending_restart",
             SubagentHotReloadStatus::Superseded => "superseded",
             SubagentHotReloadStatus::Failed => "restart_required",
         }
@@ -2598,12 +2607,11 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };
-    let result = tokio::task::spawn_blocking(move || {
-        reconcile_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
-    })
-    .await
-    .map_err(|error| format!("子代理运行时文件更新任务异常退出：{error}"))
-    .and_then(std::convert::identity);
+    let result =
+        tokio::task::spawn_blocking(move || reconcile_runtime_subagent_roles(&runtime_config))
+            .await
+            .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
+            .and_then(std::convert::identity);
     match result {
         Ok(report) => {
             if !report.repaired && !applied_config_changed {
@@ -2639,6 +2647,9 @@ pub(super) async fn hot_reload_runtime_subagent_config(
             )
         }
         Err(error) => {
+            if error.is::<crate::codex_config::SubagentRoleRegistrationChanged>() {
+                return SubagentHotReloadOutcome::pending_restart(error.to_string());
+            }
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",

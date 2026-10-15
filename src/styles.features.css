@@ -1175,6 +1175,132 @@
   line-height: 1.3;
 }
 
+/* Remote control (局域网远程控制) */
+.remote-control-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.remote-control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--codey-border, #e7e8eb);
+  border-radius: 12px;
+  background: var(--codey-surface-muted, #fafafc);
+}
+
+.remote-control-group-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-control-group-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.remote-control-group-title {
+  color: var(--codey-text, #1d1d1f);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+
+.remote-control-group-desc {
+  color: var(--codey-subtle, #8e8e93);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.remote-control-group-aside {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.remote-control-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.remote-control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 16px;
+  min-width: 0;
+}
+
+.remote-control-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.remote-control-inline > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.remote-control-status {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--codey-border-subtle, rgba(0, 0, 0, 0.05));
+  border-radius: 10px;
+  background: var(--codey-surface-sunken, #f2f2f5);
+}
+
+.remote-control-status-row {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+  color: var(--codey-text-soft, #3a3a3c);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.remote-control-status-key {
+  flex-shrink: 0;
+  min-width: 52px;
+  color: var(--codey-subtle, #8e8e93);
+}
+
+.remote-control-status-value {
+  min-width: 0;
+  word-break: break-all;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+
+.remote-control-status-row.is-warning .remote-control-status-value {
+  color: var(--codey-amber, #c26d00);
+}
+
+@media (max-width: 640px) {
+  .remote-control-group {
+    padding: 12px;
+  }
+
+  .remote-control-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 
 
 .settings-page .notification-title > span {

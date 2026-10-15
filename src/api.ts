@@ -6,6 +6,7 @@ export const CODEY_API_COMMANDS = [
   "reorder_route_models",
   "delete_route",
   "fetch_route_models",
+  "test_route_model",
   "save_selected_models",
   "save_default_model",
   "save_official_route_models",
@@ -37,11 +38,6 @@ export const CODEY_API_COMMANDS = [
   "optimize_prompt",
   "test_prompt_optimization",
   "fetch_prompt_optimization_models",
-  "check_for_updates",
-  "get_device_machine_no",
-  "download_update",
-  "install_downloaded_update",
-  "update_install_report",
   "plugin_marketplace_status",
   "repair_plugin_marketplace",
   "prepare_computer_use",
@@ -60,6 +56,9 @@ export const CODEY_API_COMMANDS = [
   "clear_codey_plugin_logs",
   "invoke_codey_plugin",
   "codex_extensions",
+  "remote_gateway_status",
+  "save_remote_gateway_config",
+  "regenerate_remote_gateway_token",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];

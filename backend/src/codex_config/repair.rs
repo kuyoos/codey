@@ -211,11 +211,25 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
         let lease = lease.as_ref().expect("active role lease");
         // Saved settings can have pending edits. Preserve the settings currently
         // attested by this lease rather than applying the next launch's settings.
+        let applied_roles = SUBAGENT_ROLE_IDS
+            .into_iter()
+            .map(|role| {
+                let selection = lease.subagent_roles.get(role).cloned().unwrap_or_else(|| {
+                    let mut disabled = SubagentRoleConfig::new(
+                        &lease.subagent_model,
+                        &lease.subagent_reasoning_effort,
+                    );
+                    disabled.enabled = false;
+                    disabled
+                });
+                (role.to_string(), selection)
+            })
+            .collect();
         let applied = CodeyConfig {
             subagent_optimization: true,
             subagent_model: lease.subagent_model.clone(),
             subagent_reasoning_effort: lease.subagent_reasoning_effort.clone(),
-            subagent_roles: lease.subagent_roles.clone(),
+            subagent_roles: applied_roles,
             ..CodeyConfig::default()
         };
         roles_repaired = reconcile_runtime_subagent_roles_at(&applied, marker)

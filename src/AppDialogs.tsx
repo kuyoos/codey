@@ -2,7 +2,6 @@ import { memo, useEffect, useMemo, useState } from "react";
 import {
   IconAlertTriangle as AlertTriangle,
   IconCheck as Check,
-  IconCircleArrowUp as CircleArrowUp,
   IconCpu,
   IconLoader2 as LoaderCircle,
   IconPlus as Plus,
@@ -503,9 +502,6 @@ function ConfirmationDialogComponent({
     confirmation?.action === "delete-notification-channel" ||
     confirmation?.action === "delete-route" ||
     confirmation?.action === "delete-official-account";
-  const isUpdate =
-    confirmation?.action === "download-update" ||
-    confirmation?.action === "install-update";
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="confirmation-dialog" container={container}>
@@ -515,7 +511,7 @@ function ConfirmationDialogComponent({
         </DialogHeader>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>
-            {isUpdate ? "稍后" : "取消"}
+            取消
           </Button>
           <Button
             variant={
@@ -533,8 +529,6 @@ function ConfirmationDialogComponent({
               <Trash2 aria-hidden="true" />
             ) : confirmation?.action === "restart" ? (
               <RefreshCw aria-hidden="true" />
-            ) : isUpdate ? (
-              <CircleArrowUp aria-hidden="true" />
             ) : (
               <Check aria-hidden="true" />
             )}

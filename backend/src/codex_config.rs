@@ -19,7 +19,7 @@ use crate::codex_config_guidance::{
     ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
     SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
     append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
-    remove_subagent_guidance, subagent_source_config,
+    remove_owned_guidance_paragraph, remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -103,6 +103,8 @@ struct RuntimeConfigLease {
     subagent_reasoning_effort: String,
     #[serde(default)]
     subagent_roles: BTreeMap<String, SubagentRoleConfig>,
+    #[serde(default)]
+    registered_subagent_roles: Vec<String>,
     #[serde(default)]
     runtime_home: PathBuf,
     #[serde(default)]
@@ -464,6 +466,14 @@ fn apply_isolated_runtime_router_config(
     };
     let runtime_roles =
         runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
+    let registered_subagent_roles = if subagent_optimization {
+        SUBAGENT_ROLE_IDS
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
         let root_path = constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE);
         let root_instructions = read_or_create_versioned_constraint_file(
@@ -478,9 +488,15 @@ fn apply_isolated_runtime_router_config(
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
             ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
         )?;
+        let registration_roles = runtime_registration_roles(
+            &runtime_roles,
+            &registered_subagent_roles,
+            subagent_model,
+            subagent_reasoning_effort,
+        )?;
         let runtime_agents = prepare_runtime_agent_files(
             &constraints_dir,
-            &runtime_roles,
+            &registration_roles,
             fastctx_instructions.as_deref(),
         )?;
         (
@@ -567,6 +583,7 @@ fn apply_isolated_runtime_router_config(
         subagent_model: subagent_model.to_string(),
         subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
         subagent_roles: runtime_roles,
+        registered_subagent_roles,
         runtime_home: home.to_path_buf(),
         runtime_agent_schema_version: if subagent_optimization {
             RUNTIME_AGENT_SCHEMA_VERSION
@@ -716,18 +733,54 @@ fn runtime_subagent_roles(
         .collect()
 }
 
+// 注册集合在启动时固定；停用角色使用有效的默认配置占位，派发权限由策略控制。
+fn runtime_registration_roles(
+    enabled_roles: &BTreeMap<String, SubagentRoleConfig>,
+    registered_roles: &[String],
+    legacy_model: &str,
+    legacy_reasoning_effort: &str,
+) -> Result<BTreeMap<String, SubagentRoleConfig>> {
+    anyhow::ensure!(
+        registered_roles
+            .iter()
+            .all(|role| SUBAGENT_ROLE_IDS.contains(&role.as_str())),
+        "Codey 子代理注册集合包含未知角色"
+    );
+    if enabled_roles
+        .keys()
+        .any(|role| !registered_roles.contains(role))
+    {
+        return Err(SubagentRoleRegistrationChanged.into());
+    }
+    let fallback = enabled_roles
+        .get(SUBAGENT_ROLE_DEFAULT)
+        .or_else(|| enabled_roles.values().next())
+        .cloned()
+        .unwrap_or_else(|| SubagentRoleConfig::new(legacy_model, legacy_reasoning_effort));
+    Ok(registered_roles
+        .iter()
+        .map(|role| {
+            let selection = enabled_roles.get(role).unwrap_or(&fallback).clone();
+            (role.clone(), selection)
+        })
+        .collect())
+}
+
+fn registered_roles_for_lease(state: &RuntimeConfigLease) -> Vec<String> {
+    if state.registered_subagent_roles.is_empty() {
+        // 旧租约只注册当时启用的角色，不能把新增文件视为已在 Codex 注册。
+        state.subagent_roles.keys().cloned().collect()
+    } else {
+        state.registered_subagent_roles.clone()
+    }
+}
+
 fn runtime_root_instructions_for_roles(
     root_instructions: &str,
-    roles: &BTreeMap<String, SubagentRoleConfig>,
+    _roles: &BTreeMap<String, SubagentRoleConfig>,
 ) -> String {
-    let has_writable_role = roles.contains_key(SUBAGENT_ROLE_WORKER)
-        || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER)
-        || roles.contains_key(SUBAGENT_ROLE_DEFAULT);
-    if has_writable_role {
-        root_instructions.to_string()
-    } else {
-        append_constraint_text(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
-    }
+    remove_owned_guidance_paragraph(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
+        .unwrap_or_else(|| root_instructions.to_string())
 }
 
 fn prepare_runtime_agent_files(
@@ -1079,6 +1132,17 @@ pub(crate) struct RuntimeSubagentReconcileReport {
     pub reasons: Vec<RuntimeSubagentRepairReason>,
 }
 
+#[derive(Debug)]
+pub(crate) struct SubagentRoleRegistrationChanged;
+
+impl std::fmt::Display for SubagentRoleRegistrationChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("当前 Codex 尚未注册新增的子代理角色，请重启一次以启用动态角色配置")
+    }
+}
+
+impl std::error::Error for SubagentRoleRegistrationChanged {}
+
 /// Verifies the complete Codey-owned generated role documents, their lease
 /// hashes and the child-runtime attestation policy. Any drift is rebuilt from
 /// the current saved role matrix. Editable source constraints and user-owned
@@ -1115,15 +1179,17 @@ fn reconcile_runtime_subagent_roles_at(
         &config.subagent_model,
         &config.subagent_reasoning_effort,
     );
-    anyhow::ensure!(
-        state.subagent_roles.keys().eq(runtime_roles.keys()),
-        "Codey 子代理角色启用状态已变化，需要重启 Codex 以重新注册可用角色"
-    );
+    let registration_roles = runtime_registration_roles(
+        &runtime_roles,
+        &registered_roles_for_lease(&state),
+        &config.subagent_model,
+        &config.subagent_reasoning_effort,
+    )?;
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     let fastctx_instructions = runtime_fastctx_instructions(&constraints_dir, &state)?;
     let plans = plan_runtime_agent_files(
         &constraints_dir,
-        &runtime_roles,
+        &registration_roles,
         fastctx_instructions.as_deref(),
     )
     .context("预检 Codey 子代理运行时配置失败；未写入运行时配置")?;

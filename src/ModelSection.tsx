@@ -12,6 +12,7 @@ import {
   IconInfoCircle,
   IconListDetails,
   IconPlus as Plus,
+  IconPlugConnected,
   IconRefresh as RefreshCw,
   IconRoute,
   IconServer as Server,
@@ -58,6 +59,7 @@ import {
 } from "./routeShortNames";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
 import { invoke } from "./api";
+import { errorText, withTimeout } from "./appUtils";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
 
@@ -250,6 +252,8 @@ function ModelSectionComponent({
   // 模型只能在所属线路内拖动排序，因此拖动状态同时记录线路和模型。
   const [draggedModel, setDraggedModel] = useState<RouteModelRef | null>(null);
   const [dropModel, setDropModel] = useState<RouteModelRef | null>(null);
+  // 同一时刻只允许探测一个模型，避免并发请求同一线路的上游模型列表。
+  const [testingModel, setTestingModel] = useState<string | null>(null);
   const [pendingRouteToggle, setPendingRouteToggle] = useState<{
     id: string;
     enabled: boolean;
@@ -642,6 +646,31 @@ function ModelSectionComponent({
     } finally {
       // 待保存状态仅用于显示，失败后自然恢复后端配置，避免改动设置草稿。
       setPendingRouteToggle(null);
+    }
+  };
+
+  // 只读探测线路的模型列表，判断连接与模型是否存在；不发对话请求，不产生计费。
+  const testModelConnection = async (
+    routeId: string,
+    model: string,
+    displayName: string,
+  ) => {
+    setTestingModel(model);
+    try {
+      const result = await withTimeout(
+        invoke<{ modelCount: number; found: boolean }>("test_route_model", { routeId, model }),
+        15_000,
+        "测试连接超时，请稍后重试。",
+      );
+      onNotice(
+        result.found
+          ? { tone: "success", text: `${displayName} 连接正常：线路返回 ${result.modelCount} 个模型，包含该模型` }
+          : { tone: "info", text: `${displayName} 连接正常，但返回的 ${result.modelCount} 个模型里没有它` },
+      );
+    } catch (error) {
+      onNotice({ tone: "error", text: errorText(error) });
+    } finally {
+      setTestingModel(null);
     }
   };
 
@@ -1069,6 +1098,18 @@ function ModelSectionComponent({
                                   </span>
                                   <span className="model-tag-name">{displayName}</span>
                                   {isDefault && <span className="model-tag-badge">默认</span>}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="model-tag-test"
+                                  disabled={routeConfigReadOnly || isBusy || dirty || testingModel !== null}
+                                  title={`测试连接：${displayName}`}
+                                  aria-label={`测试连接 ${displayName}`}
+                                  onClick={() => void testModelConnection(profile.id, model, displayName)}
+                                >
+                                  {testingModel === model
+                                    ? <RefreshCw size={13} className="animate-spin" aria-hidden="true" />
+                                    : <IconPlugConnected size={13} aria-hidden="true" />}
                                 </button>
                               </div>
                             );

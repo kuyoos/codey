@@ -25,9 +25,8 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   );
   assert.match(
     inject,
-    /armSessionToolsInteraction\(\);\s*scheduleSessionToolsIdleLoad\(\);\s*scan\(\);\s*void hydrateUpdateAvailability\(\)/,
+    /armSessionToolsInteraction\(\);\s*scheduleSessionToolsIdleLoad\(\);\s*scan\(\);/,
   );
-  assert.match(inject, /const backendStatusPath = "\/backend\/status"/);
   assert.doesNotMatch(inject, /showUpdateDialog|codey-update-check-status/);
   assert.match(inject, /document\.addEventListener\("pointerover", loadSessionToolsFromInteraction/);
   assert.match(inject, /document\.addEventListener\("focusin", loadSessionToolsFromInteraction/);

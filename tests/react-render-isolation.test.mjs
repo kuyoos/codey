@@ -9,7 +9,6 @@ const root = new URL("../", import.meta.url);
 test("settings panels declare render-isolation hooks and stable handlers", async () => {
   const [
     app,
-    appUpdates,
     notice,
     confirmation,
     sections,
@@ -17,7 +16,6 @@ test("settings panels declare render-isolation hooks and stable handlers", async
     draftConfig,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
-    readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
     readFile(new URL("src/useAppNotice.tsx", root), "utf8"),
     readFile(new URL("src/useConfirmationDialog.tsx", root), "utf8"),
     Promise.all(
@@ -37,25 +35,6 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(notice, /export const NoticeToast = memo\(/);
   assert.match(confirmation, /useSyncExternalStore\(/);
   assert.match(confirmation, /export const ConfirmationDialogHost = memo\(/);
-  assert.doesNotMatch(app, /async function checkForUpdates\(/);
-  assert.match(appUpdates, /export function useAppUpdates/);
-  assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates", \{ forceRefresh \}\)/);
-  assert.equal(
-    appUpdates.match(/invoke<UpdateCheck>\("check_for_updates",/g)?.length,
-    1,
-  );
-  assert.match(
-    appUpdates,
-    /updateCheckInFlightRef = useRef<Promise<UpdateCheck> \| null>/,
-  );
-  assert.match(appUpdates, /const result = await requestUpdateCheck\(\)/);
-  assert.match(appUpdates, /const result = await requestUpdateCheck\(true\)/);
-  assert.match(
-    app,
-    /const handleFooterUpdateClick = useStableEvent\(\(\) => void checkForUpdates\(\)\)/,
-  );
-  assert.match(appUpdates, /invoke<UpdateDownload>\(\s*"download_update",/);
-  assert.match(appUpdates, /invoke\("install_downloaded_update"/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onAnalyzeDiagnosticStorage=\{handleAnalyzeDiagnosticStorage\}/);
   assert.match(app, /onToggleDraftModel=\{toggleDraftModel\}/);

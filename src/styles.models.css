@@ -390,6 +390,34 @@
   outline-offset: 2px;
 }
 
+/* 模型行的连接探测按钮：只读拉取线路模型列表，不发送对话请求。 */
+.model-tag-test {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 18px;
+  height: 27px;
+  border-radius: 5px;
+  transition: color 130ms ease, background 130ms ease;
+  color: var(--mac-text-secondary);
+}
+
+.model-tag-test:hover:not(:disabled) {
+  background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.05);
+  color: var(--mac-text-primary);
+}
+
+.model-tag-test:disabled {
+  opacity: .45;
+  cursor: default;
+}
+
+.model-tag-test:focus-visible {
+  outline: 2px solid var(--mac-blue);
+  outline-offset: 1px;
+}
+
 /* Individual Model Tag Pill */
 .model-tag-pill {
   display: inline-flex;
