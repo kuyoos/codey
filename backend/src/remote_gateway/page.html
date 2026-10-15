@@ -3109,7 +3109,7 @@ async function boot() {
     // 用户翻历史时不再打断，等回到最新再续上。
     if (!state.autoScroll) return;
     loadTurns(null).catch(() => {});
-  }, 5000);
+  }, 3000);
   // 其他客户端执行的回合要能及时出现在列表里，所以每 3 秒对齐一次；页面不可见时暂停。
   const pollThreadList = () => {
     if (document.visibilityState === "hidden") return;
