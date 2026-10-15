@@ -673,6 +673,26 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "the AppServerRequestClient route preflight must patch without compatibility errors",
     );
 
+    // Codex 26.1007 把 AppServerRequestClient 与 Electron 桥接转发器移入
+    // app-shared-*.js；该资源块必须留在补丁过滤内，否则模型请求链路不会被注入。
+    const sharedChunkResponse = await installedHandler({
+      url: "app://-/webview/assets/app-shared-8bd9d0399038.js",
+    });
+    const patchedSharedChunk = await sharedChunkResponse.text();
+    assert.match(
+      patchedSharedChunk,
+      /__codeyAppServerRequestClients/,
+    );
+    assert.match(
+      patchedSharedChunk,
+      /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/,
+    );
+    // 补丁集之外的资源必须原样返回。
+    const unrelatedChunkResponse = await installedHandler({
+      url: "app://-/webview/assets/app-primary-6f60e9ac4103.js",
+    });
+    assert.equal(await unrelatedChunkResponse.text(), appServerRequestSource);
+
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
       "from\"./codex-avatar-BpKnWN_W.js\";",
