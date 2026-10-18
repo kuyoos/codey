@@ -26,7 +26,7 @@ import {
   IconWorld,
 } from "@tabler/icons-react";
 
-import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus, RuntimeStatus } from "./App.types";
+import type { Config, ModelContextConfig, ModelState, OfficialAccount, Profile, ProviderStatus, RuntimeStatus } from "./App.types";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { ModelCombobox } from "./components/ModelCombobox";
 import { ModelSettingsFields } from "./components/ModelSettingsFields";
@@ -72,7 +72,7 @@ import {
 } from "./routeConnectionImport";
 import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
-import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
+import { listOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
 import { getRouteCompactionStatus } from "./remoteCompactionStatus";
 
@@ -82,8 +82,6 @@ type ModelSectionProps = {
   currentProvider: ProviderStatus["provider"] | null;
   officialAccountAvailable: boolean;
   popupContainer: HTMLElement | null;
-  /** 该页是否正显示在设置里：额度等官方数据只在打开「线路与模型」时获取。 */
-  active: boolean;
   modelState: ModelState;
   dirty: boolean;
   canSyncCurrentProvider: boolean;
@@ -100,7 +98,6 @@ type ModelSectionProps = {
   onReorderRouteModels: (routeId: string, models: string[]) => Promise<void>;
   onDeleteRoute: (routeId: string) => void;
   onFetchRouteModels: (route: Profile) => void;
-  onOfficialAccountsChanged: (result: OfficialAccountsResult) => void;
   onNotice: (notice: { tone: "success" | "info" | "error"; text: string }) => void;
   onSaveOfficialRouteSettings?: (
     routeId: string,
@@ -119,7 +116,6 @@ type ModelSectionProps = {
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
   onConfigChange?: (config: Config) => void;
-  onRequestConfirmation?: (confirmation: Confirmation) => void;
 };
 
 type RouteModelRef = { routeId: string; model: string };
@@ -230,7 +226,6 @@ function ModelSectionComponent({
   currentProvider,
   officialAccountAvailable,
   popupContainer,
-  active,
   modelState,
   dirty,
   canSyncCurrentProvider,
@@ -247,12 +242,10 @@ function ModelSectionComponent({
   onReorderRouteModels,
   onDeleteRoute,
   onFetchRouteModels,
-  onOfficialAccountsChanged,
   onNotice,
   onSaveOfficialRouteSettings,
   onSetDefaultModel,
   onConfigChange,
-  onRequestConfirmation,
 }: ModelSectionProps) {
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [draggedRouteId, setDraggedRouteId] = useState<string | null>(null);
@@ -320,18 +313,7 @@ function ModelSectionComponent({
     }
   }, []);
 
-  const handleOfficialAccountsChanged = useCallback(
-    (result: OfficialAccountsResult) => {
-      if (Array.isArray(result.accounts)) {
-        rememberOfficialAccounts(result);
-        setOfficialAccounts(result.accounts);
-      }
-      onOfficialAccountsChanged(result);
-    },
-    [onOfficialAccountsChanged],
-  );
-
-  // 账号面板只在开启本地路由时挂载，只读模式下线路卡片仍要显示所属账号邮箱。
+  // 本地路由关闭时线路卡片仍要显示所属账号邮箱，因此只读模式补取一次账号列表。
   useEffect(() => {
     if (!routeConfigReadOnly) return;
     void refreshOfficialAccounts();

@@ -13,8 +13,8 @@ test("设置页只在首次打开对应菜单后挂载模块", () => {
 });
 
 test("线路与模型菜单保留激活状态且不再渲染官方账号面板", () => {
-  assert.match(app, /models: \(active\) => \(/);
-  assert.match(app, /<ModelSection\s+active=\{active\}/);
+  assert.match(app, /models: \(\) => \(/);
+  assert.doesNotMatch(app, /<ModelSection\s+active=\{active\}/);
   assert.doesNotMatch(models, /<OfficialAccountsPanel/);
 });
 

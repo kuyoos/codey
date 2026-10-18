@@ -1549,9 +1549,8 @@ export function App({
               />
             </>
           ),
-          models: (active) => (
+          models: () => (
             <ModelSection
-              active={active}
               config={config}
               runtimeStatus={status}
               currentProvider={provider ?? null}
@@ -1573,12 +1572,10 @@ export function App({
               onReorderRouteModels={handleReorderRouteModels}
               onDeleteRoute={handleDeleteRoute}
               onFetchRouteModels={handleFetchRouteModels}
-              onOfficialAccountsChanged={handleOfficialAccountsChanged}
               onNotice={handleNotice}
               onSaveOfficialRouteSettings={handleSaveOfficialRouteSettings}
               onSetDefaultModel={handleSetRouteDefaultModel}
               onConfigChange={handleConfigChange}
-              onRequestConfirmation={setConfirmation}
             />
           ),
           prompt: (

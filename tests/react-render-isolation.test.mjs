@@ -46,10 +46,6 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(app, /onSetDefaultModel=\{handleSetRouteDefaultModel\}/);
   assert.match(app, /onToggleLocalRouter=\{handleToggleLocalRouter\}/);
   assert.match(app, /onToggleRouteRequestLog=\{handleToggleRouteRequestLog\}/);
-  assert.match(
-    app,
-    /onOfficialAccountsChanged=\{handleOfficialAccountsChanged\}/,
-  );
   assert.match(app, /onSave=\{saveModelSelection\}/);
   assert.doesNotMatch(modelSelection, /withTimeout/);
   assert.match(modelSelection, /routeId: modelPickerRouteId/);

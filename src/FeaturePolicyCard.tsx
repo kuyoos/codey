@@ -371,9 +371,7 @@ export function SubagentPolicyCardComponent({
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : writableRolesDisabled
-                      ? `${writableRolesDisabledMessage}角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；旧实例首次启用未注册角色时需重启一次。`
-                      : "可搜索并选择任意可用线路模型；角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；旧实例首次启用未注册角色时需重启一次。角色权限仍受父任务权限模式约束。"}
+                    : "各角色工具权限一致，按任务分工选择模型。角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；实际操作受父任务权限约束。"}
                 </div>
               </div>
             </>
