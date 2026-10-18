@@ -479,7 +479,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(windows)]
 /// 本地路由模式要求会话一律使用 `codey_router` 提供商：覆盖桌面传入的提供商，并清掉会被
 /// app-server 当作自定义提供商的配置项。返回是否发生了改写。
 ///
