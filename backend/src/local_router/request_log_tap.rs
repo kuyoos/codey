@@ -92,7 +92,51 @@ pub(crate) struct RequestLogMetadataProjector {
     pub(crate) capturing_scalar: Option<ProjectedMetadataScalar>,
     pub(crate) event_type_has_user_content: bool,
     pub(crate) event_delta_has_content: bool,
+    event_type_has_output_delta: bool,
+    event_delta_quarters: u64,
+    delta_counter: ProjectedDeltaCounter,
     pub(crate) usage: Option<UsageCapture>,
+}
+
+/// 增量计数字符，跳过 JSON 编码和 UTF-8 延续字节；不缓冲输出正文。
+#[derive(Default)]
+struct ProjectedDeltaCounter {
+    quarters: u64,
+    escaped: bool,
+    unicode_remaining: u8,
+    unicode_value: u16,
+}
+
+impl ProjectedDeltaCounter {
+    fn observe(&mut self, byte: u8) {
+        if self.unicode_remaining > 0 {
+            let Some(digit) = (byte as char).to_digit(16) else {
+                self.unicode_remaining = 0;
+                return;
+            };
+            self.unicode_value = (self.unicode_value << 4) | digit as u16;
+            self.unicode_remaining -= 1;
+            if self.unicode_remaining == 0 && !(0xdc00..=0xdfff).contains(&self.unicode_value) {
+                self.quarters =
+                    self.quarters
+                        .saturating_add(if self.unicode_value < 128 { 1 } else { 4 });
+            }
+        } else if self.escaped {
+            self.escaped = false;
+            if byte == b'u' {
+                self.unicode_remaining = 4;
+                self.unicode_value = 0;
+            } else {
+                self.quarters = self.quarters.saturating_add(1);
+            }
+        } else if byte == b'\\' {
+            self.escaped = true;
+        } else if byte != b'"' && byte < 128 {
+            self.quarters = self.quarters.saturating_add(1);
+        } else if byte >= 0xc2 {
+            self.quarters = self.quarters.saturating_add(4);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -524,12 +568,15 @@ impl RequestLogMetadataProjector {
                 let complete = capture.observe_byte(byte)?;
                 if complete {
                     let capture = self.usage.take().expect("usage capture exists");
-                    probe.observe_event(&json!({"usage": capture.into_value()}));
+                    probe.observe_event_at(&json!({"usage": capture.into_value()}), written_at);
                 }
                 continue;
             }
 
             if self.in_string {
+                if matches!(self.capturing_scalar, Some(ProjectedMetadataScalar::Delta)) {
+                    self.delta_counter.observe(byte);
+                }
                 if self.escaped {
                     self.escaped = false;
                 } else if byte == b'\\' {
@@ -547,6 +594,7 @@ impl RequestLogMetadataProjector {
                                 ));
                             }
                             ProjectedMetadataScalar::Delta => {
+                                self.event_delta_quarters = self.delta_counter.quarters;
                                 self.event_delta_has_content =
                                     self.string_overflow || !self.string.is_empty();
                                 if self.event_type_has_user_content && self.event_delta_has_content
@@ -558,6 +606,8 @@ impl RequestLogMetadataProjector {
                                 let value = String::from_utf8_lossy(&self.string);
                                 self.event_type_has_user_content =
                                     responses_event_type_has_user_content(&value);
+                                self.event_type_has_output_delta =
+                                    crate::route_request_log::is_output_delta_event(&value);
                                 if self.event_type_has_user_content && self.event_delta_has_content
                                 {
                                     probe.mark_first_downstream_content_at(written_at);
@@ -599,6 +649,7 @@ impl RequestLogMetadataProjector {
                     self.string.clear();
                     self.string_overflow = false;
                     self.capturing_scalar = self.awaiting_scalar.take();
+                    self.delta_counter = ProjectedDeltaCounter::default();
                     self.awaiting_message = false;
                     self.awaiting_usage = false;
                 }
@@ -648,6 +699,8 @@ impl RequestLogMetadataProjector {
                     if self.depth == 0 {
                         self.event_type_has_user_content = false;
                         self.event_delta_has_content = false;
+                        self.event_type_has_output_delta = false;
+                        self.event_delta_quarters = 0;
                     }
                     self.depth += 1;
                     if self.awaiting_response {
@@ -671,6 +724,9 @@ impl RequestLogMetadataProjector {
                     self.last_key = None;
                 }
                 b'}' | b']' => {
+                    if self.depth == 1 && byte == b'}' && self.event_type_has_output_delta {
+                        probe.observe_output_delta_estimate(self.event_delta_quarters, written_at);
+                    }
                     if self.response_depth == Some(self.depth) {
                         self.response_depth = None;
                     }
@@ -714,6 +770,90 @@ pub(crate) fn projected_metadata_key(value: &[u8]) -> Option<ProjectedMetadataKe
 #[cfg(test)]
 mod billing_tests {
     use super::*;
+
+    #[test]
+    fn live_speed_projects_chunked_unicode_without_counting_json_encoding() {
+        let bodies = [
+            "{\"type\":\"response.output_text.delta\",\"delta\":\"abcd中😀\\n\\\\\\\"\"}"
+                .as_bytes()
+                .to_vec(),
+            br#"{"delta":"abcd\u4e2d\ud83d\ude00\n\\\"","type":"response.output_text.delta"}"#
+                .to_vec(),
+        ];
+        for body in bodies {
+            for chunk_size in 1..=17 {
+                let probe = RouteRequestLogProbe::detached_test_probe();
+                let mut projector = RequestLogMetadataProjector::default();
+                for chunk in body.chunks(chunk_size) {
+                    projector.observe(chunk, &probe, Instant::now()).unwrap();
+                }
+                assert_eq!(projector.event_delta_quarters, 15);
+                assert!(projector.event_type_has_output_delta);
+                assert_eq!(projector.depth, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn live_speed_raw_sse_updates_only_for_delta_and_keeps_bounded_memory() {
+        let controller = crate::route_request_log::RouteRequestLogController::with_root(
+            std::path::PathBuf::new(),
+        );
+        let registry = controller.session_stats();
+        let now = Instant::now();
+        let probe = controller
+            .begin(|producer| {
+                producer.begin(crate::route_request_log::RouteRequestLogStart {
+                    request_id: "raw-live",
+                    started_at: now - Duration::from_secs(4),
+                    request_protocol: crate::route_request_log::RequestProtocol::Sse,
+                    request_kind: "responses",
+                    requested_model: "model",
+                    reasoning_effort: None,
+                    thinking_budget_tokens: None,
+                    codex_session_id: Some("raw-session"),
+                    codex_session_is_parent: false,
+                })
+            })
+            .unwrap();
+        let mut projector = RequestLogMetadataProjector::default();
+        projector
+            .observe(
+                br#"data: {"type":"response.created","response":{"usage":{"output_tokens":0}}}"#,
+                &probe,
+                now - Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.snapshot("raw-session").unwrap().speed_state,
+            Some("waiting")
+        );
+        let content = "x".repeat(256 * 1024);
+        let event = format!(
+            "data: {{\"delta\":\"{content}\",\"type\":\"response.output_text.delta\"}}\n\n"
+        );
+        for chunk in event.as_bytes().chunks(3) {
+            projector
+                .observe(chunk, &probe, now - Duration::from_secs(2))
+                .unwrap();
+        }
+        let active = registry.snapshot("raw-session").unwrap();
+        assert_eq!(active.speed_state, Some("streaming"));
+        assert!(active.speed_is_estimate);
+        assert!(active.output_tokens_per_second.unwrap() > 20_000.0);
+        assert_eq!(active.output_tokens, None);
+        assert!(projector.string.len() <= REQUEST_LOG_METADATA_STRING_BYTES);
+        let repeated = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"text\":\"{content}\",\"delta\":\"ignored\"}}]}}}}\n\n"
+        );
+        projector
+            .observe(repeated.as_bytes(), &probe, now - Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(projector.event_delta_quarters, 0);
+        assert!(!projector.event_type_has_output_delta);
+        probe.finish_success();
+        assert_eq!(registry.snapshot("raw-session").unwrap().speed_state, None);
+    }
 
     #[test]
     fn upstream_reported_model_projects_from_chunked_sse() {

@@ -167,6 +167,7 @@ function modelSectionProps(overrides = {}) {
       webhook: { channels: [] },
     },
     busy: null,
+    runtimeStatus: { running: false },
     canSyncCurrentProvider: true,
     currentProvider: null,
     dirty: false,

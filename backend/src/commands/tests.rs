@@ -4,6 +4,75 @@ use super::*;
 use crate::config::ProviderProfile;
 
 #[tokio::test]
+async fn official_concurrency_command_rejects_invalid_values_before_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        ..AppState::default()
+    });
+    for invalid in [
+        json!(-1),
+        json!(1.5),
+        json!(u64::from(u32::MAX) + 1),
+        json!("2"),
+        json!(true),
+        Value::Null,
+    ] {
+        let error = models::invoke(
+            &state,
+            "save_official_route_models",
+            &json!({
+                "routeId": "route", "models": ["gpt-5.6-sol"], "maxConcurrency": invalid,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("maxConcurrency"), "{error}");
+    }
+    assert!(!state.store.path().exists());
+    assert_eq!(
+        optional_argument::<u32>(&json!({}), "maxConcurrency").unwrap(),
+        None
+    );
+    assert_eq!(
+        optional_argument::<u32>(&json!({"maxConcurrency": 0}), "maxConcurrency").unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        optional_argument::<u32>(&json!({"maxConcurrency": u32::MAX}), "maxConcurrency").unwrap(),
+        Some(u32::MAX)
+    );
+}
+
+#[tokio::test]
+async fn official_concurrency_command_rejects_another_accounts_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = ProviderProfile::new("官方账号");
+    profile.official_account = true;
+    profile.official_account_id = Some("acct-one".into());
+    let mut config = CodeyConfig::default();
+    config.apply_launch_official_profiles(vec![profile]);
+    let route_id = config.profiles[0].id.clone();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(config.clone()),
+        ..AppState::default()
+    });
+    let error = models::invoke(
+        &state,
+        "save_official_route_models",
+        &json!({
+            "routeId": route_id, "models": ["gpt-5.6-sol"], "accountId": "acct-two", "maxConcurrency": 2,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("不匹配"), "{error}");
+    assert_eq!(*state.config.read().await, config);
+    assert!(!state.store.path().exists());
+}
+
+#[tokio::test]
 async fn context_recovery_preserves_other_settings_and_backs_up_the_budget() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = CodeyConfig::default();
@@ -621,8 +690,15 @@ fn provider_secret_merge_preserves_user_remote_compaction_setting() {
 
     let mut disabled = saved.clone();
     disabled.supports_remote_compaction = false;
+    disabled.remote_compaction_protocol = crate::config::RemoteCompactionProtocol::CompactEndpoint;
+    disabled.api_key.clear();
     let merged = merge_profile_secrets(vec![disabled], &previous).unwrap();
     assert!(!merged[0].supports_remote_compaction);
+    assert_eq!(
+        merged[0].remote_compaction_protocol,
+        crate::config::RemoteCompactionProtocol::CompactEndpoint
+    );
+    assert_eq!(merged[0].api_key, "saved-secret");
 
     let mut previous_disabled_profile = saved;
     previous_disabled_profile.supports_remote_compaction = false;
@@ -660,12 +736,14 @@ fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
 
     let mut at_limit = legacy.clone();
     at_limit.name = "名".repeat(15);
+    at_limit.short_name = "旧".to_string();
     let merged = merge_profile_secrets(vec![at_limit.clone()], &previous).unwrap();
     assert_eq!(merged[0].name, at_limit.name);
 
     // 改名以后超过上限会被拒绝,直接调用后端接口也无法写进界面存不下的名称。
     let mut renamed = legacy.clone();
     renamed.name = "名".repeat(16);
+    renamed.short_name = "旧".to_string();
     let error = merge_profile_secrets(vec![renamed], &previous).unwrap_err();
     assert!(error.contains("最多 15 个字符"), "{error}");
 }
@@ -922,6 +1000,7 @@ fn saving_a_route_keeps_the_official_account_id_when_the_form_omits_it() {
     let mut incoming = saved.clone();
     incoming.official_account_id = None;
     incoming.name = "主力".to_string();
+    incoming.short_name = "主".to_string();
     let previous = CodeyConfig {
         profiles: vec![saved],
         ..CodeyConfig::default()
@@ -1133,6 +1212,166 @@ fn stored_official_account(
         }
     }))
     .expect("可反序列化的官方账号记录")
+}
+
+#[tokio::test]
+async fn official_launch_commit_rebuilds_routes_after_a_newer_account_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("config.toml"), "").unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(CodeyConfig::default()),
+        ..AppState::default()
+    });
+    let store = state.official_accounts();
+    let mut existing = stored_official_account("existing", 1);
+    existing.route_name = Some("旧名称".into());
+    existing.route_short_name = Some("旧".into());
+    existing.max_concurrency = 2;
+    existing.upstream_proxy = Some("http://127.0.0.1:8080".into());
+    existing.base_url = Some("https://old.example/v1".into());
+    store.upsert(&existing).unwrap();
+    store
+        .upsert(&stored_official_account("removed", 2))
+        .unwrap();
+    store.set_default_account_id(Some("existing")).unwrap();
+    let stale_probe = crate::codex_provider::OfficialAccountLaunch::resolve(&home, &store).unwrap();
+    assert!(matches!(
+        stale_probe.status,
+        OfficialAccountProfileStatus::Available(_)
+    ));
+
+    // 旧探测结束后新增默认账号、删除账号，同时修改原账号的全部线路设置。
+    store
+        .upsert(&stored_official_account("imported", 3))
+        .unwrap();
+    store.set_default_account_id(Some("imported")).unwrap();
+    store.remove_with_codex_login("removed", &home).unwrap();
+    store
+        .update_route_settings_with_concurrency(
+            "existing",
+            Some("新名称".into()),
+            Some("新".into()),
+            None,
+            None,
+            Some(5),
+        )
+        .unwrap();
+    let siwc = serde_json::from_value(json!({
+        "clientId": "snapshot-test-client", "accessToken": "snapshot-test-access",
+        "scopes": ["chatgpt.tokens.use.direct"],
+    }))
+    .unwrap();
+    store.attach_siwc("existing", &siwc).unwrap();
+
+    let fresh_probe = crate::codex_provider::OfficialAccountLaunch::resolve(&home, &store).unwrap();
+    commit_official_launch_routes(&state, fresh_probe, home.clone())
+        .await
+        .unwrap();
+    {
+        let mut config = state.config.write().await;
+        let imported_id = crate::config::official_profile_id("imported");
+        config
+            .profiles
+            .iter_mut()
+            .find(|route| route.id == imported_id)
+            .unwrap()
+            .enabled = false;
+        config
+            .selected_models_by_provider
+            .insert(imported_id, vec!["gpt-5.6-sol".into()]);
+        config.settings_revision += 1;
+        *config = config.clone().normalize();
+        state.store.save(&config).unwrap();
+    }
+    let current = state.config.read().await.clone();
+
+    // 较新的导入刷新先提交；再提交旧探测也必须保留新账号与当前配置。
+    commit_official_launch_routes(&state, stale_probe, home.clone())
+        .await
+        .unwrap();
+    let config = state.config.read().await.clone();
+    let routes = config
+        .profiles
+        .iter()
+        .filter(|route| route.official_account)
+        .collect::<Vec<_>>();
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0].official_account_id.as_deref(), Some("imported"));
+    assert!(!routes[0].enabled);
+    assert_eq!(routes[1].official_account_id.as_deref(), Some("existing"));
+    assert_eq!(routes[1].name, "新名称");
+    assert_eq!(routes[1].short_name, "新");
+    assert_eq!(routes[1].max_concurrency, 5);
+    assert!(routes[1].upstream_proxy.is_empty());
+    assert!(routes[1].base_url.is_empty());
+    assert!(routes[1].official_siwc);
+    assert_eq!(
+        config.selected_models_by_provider,
+        current.selected_models_by_provider
+    );
+    assert_eq!(config.settings_revision, current.settings_revision);
+    assert_eq!(
+        config.official_account_status_this_launch,
+        LaunchOfficialAccountStatus::Authenticated
+    );
+}
+
+#[tokio::test]
+async fn official_launch_commit_includes_import_during_config_lock_without_changing_probe_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("config.toml"), "").unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(CodeyConfig::default()),
+        ..AppState::default()
+    });
+    let store = state.official_accounts();
+    let old_probe = crate::codex_provider::OfficialAccountLaunch::resolve(&home, &store).unwrap();
+    assert!(matches!(
+        old_probe.status,
+        OfficialAccountProfileStatus::Unavailable { .. }
+    ));
+
+    let commit_guard = state.config_write_lock.lock().await;
+    let commit = tokio::spawn({
+        let state = Arc::clone(&state);
+        let home = home.clone();
+        async move { commit_official_launch_routes(&state, old_probe, home).await }
+    });
+    tokio::task::yield_now().await;
+    // 导入不持有配置锁。读取当前账号必须在等待配置锁之后发生。
+    store
+        .upsert(&stored_official_account("imported", 1))
+        .unwrap();
+    store.set_default_account_id(Some("imported")).unwrap();
+    drop(commit_guard);
+    tokio::time::timeout(Duration::from_secs(5), commit)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let config = state.config.read().await.clone();
+    assert_eq!(
+        config.profiles[0].official_account_id.as_deref(),
+        Some("imported")
+    );
+    assert_eq!(
+        config.official_account_status_this_launch,
+        LaunchOfficialAccountStatus::Unauthenticated
+    );
+    assert!(!config.official_account_available_this_launch);
+    let saved: CodeyConfig =
+        serde_json::from_slice(&std::fs::read(state.store.path()).unwrap()).unwrap();
+    assert_eq!(
+        saved.profiles[0].official_account_id.as_deref(),
+        Some("imported")
+    );
 }
 
 #[tokio::test]
@@ -1608,6 +1847,37 @@ async fn legacy_subagent_scalars_update_only_the_default_role() {
 }
 
 #[tokio::test]
+async fn codex_launch_proxy_saves_after_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = CodeyConfig::default();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    // 带凭据的地址交给本地认证中继，允许保存。
+    let mut payload = serde_json::to_value(&initial).unwrap();
+    payload["codexLaunchProxy"] = json!(" http://user:pass@127.0.0.1:7890 ");
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    assert_eq!(
+        state.config.read().await.codex_launch_proxy,
+        "http://user:pass@127.0.0.1:7890"
+    );
+
+    // 第一次保存已推进 settings_revision，从当前配置重建请求。
+    let current = state.config.read().await.clone();
+    let mut payload = serde_json::to_value(&current).unwrap();
+    payload["codexLaunchProxy"] = json!(" socks5h://127.0.0.1 ");
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "failed");
+    assert!(result["message"].as_str().unwrap().contains("启动代理"));
+}
+
+#[tokio::test]
 async fn partial_subagent_role_payload_merges_with_existing_roles() {
     let directory = tempfile::tempdir().unwrap();
     let mut initial = CodeyConfig::default();
@@ -1824,6 +2094,7 @@ fn selected_codex_app_path_requires_a_desktop_executable() {
 
     let executable = directory.path().join("Codex.exe");
     fs::write(&executable, []).unwrap();
+    write_codex_app_package(directory.path());
     assert_eq!(
         validate_codex_app_path(directory.path().to_str().unwrap()).unwrap(),
         directory.path()
@@ -1838,11 +2109,28 @@ fn selected_codex_app_path_accepts_a_custom_install_root() {
     let current = install_root.join("versions").join("current");
     fs::create_dir_all(&current).unwrap();
     fs::write(current.join("ChatGPT.exe"), []).unwrap();
+    write_codex_app_package(&current);
 
     assert_eq!(
         validate_codex_app_path(install_root.to_str().unwrap()).unwrap(),
         current
     );
+}
+
+#[cfg(windows)]
+fn write_codex_app_package(app_dir: &std::path::Path) {
+    let package_dir = app_dir.join("resources").join("app");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(
+        package_dir.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "openai-codex-electron",
+            "productName": "Codex",
+            "version": "26.924.22138"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]

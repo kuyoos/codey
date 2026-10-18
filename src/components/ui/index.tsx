@@ -21,14 +21,13 @@ import {
   useFilter,
 } from "@heroui/react";
 export { Label } from "@heroui/react";
-export type LabelProps = React.ComponentProps<typeof Label>;
 import type { Key } from "@heroui/react";
 import { UNSAFE_PortalProvider } from "react-aria";
 
 // 本文件是控制台各模块共用的业务控件层：把项目内统一的语义（按钮语义变体、徽章语义、
 // optionList 形式的下拉、受控对话框）映射到 HeroUI 组件，避免各处重复拼装复合组件。
 
-export type ToastContainerRegister = (element: HTMLElement | null) => () => void;
+type ToastContainerRegister = (element: HTMLElement | null) => () => void;
 export const ToastContainerContext = React.createContext<ToastContainerRegister>(() => () => {});
 export function useToastContainer(element: HTMLElement | null, active = true) {
   const register = React.useContext(ToastContainerContext);
@@ -331,6 +330,7 @@ export type SelectOption = { disabled?: boolean; label: React.ReactNode; value: 
 export interface SelectProps {
   "aria-label"?: string;
   "aria-labelledby"?: string;
+  "aria-required"?: boolean;
   className?: string;
   disabled?: boolean;
   filter?: boolean;
@@ -500,7 +500,7 @@ export function Dialog({ children, onOpenChange, open }: DialogProps) {
   const value = React.useMemo(() => ({ open, setOpen }), [open, setOpen]);
   return <DialogContext.Provider value={value}>{children}</DialogContext.Provider>;
 }
-export interface DialogDismissEvent { readonly defaultPrevented: boolean; preventDefault: () => void }
+interface DialogDismissEvent { readonly defaultPrevented: boolean; preventDefault: () => void }
 export interface DialogContentProps {
   children?: React.ReactNode;
   className?: string;
@@ -660,5 +660,4 @@ export function DrawerDescription({ id, className, ...props }: React.HTMLAttribu
   const labels = React.useContext(DrawerLabelContext);
   return <p {...props} id={id ?? labels?.descriptionId} className={cn("m-0 text-xs leading-relaxed text-muted", className)} />;
 }
-
 

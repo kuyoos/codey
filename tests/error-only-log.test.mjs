@@ -28,7 +28,7 @@ test("desktop and FastCtx entrypoints keep crash logging wired", async () => {
     source("backend/src/error_log.rs"),
     source("backend/src/main.rs"),
     source("backend/src/bin/codey-fastctx.rs"),
-    source("backend/src/codex_startup_patch.js"),
+    source("backend/src/renderer_asset_patch.js"),
   ]);
 
   assert.match(errorLog, /codey-errors\.log/);

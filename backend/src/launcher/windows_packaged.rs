@@ -13,7 +13,7 @@ const STATE_DIRECTORY: &str = "windows-package-launch";
 /// serializes launch settings across Codey sessions for the current user.
 struct LaunchJournal {
     path: PathBuf,
-    _lock: File,
+    lock: File,
 }
 
 impl LaunchJournal {
@@ -30,7 +30,7 @@ impl LaunchJournal {
             .context("另一个 Codey 会话正在处理 Windows 包启动设置，请稍后重试")?;
         Ok(Self {
             path: directory.join("pending.json"),
-            _lock: lock,
+            lock,
         })
     }
 
@@ -55,6 +55,13 @@ impl LaunchJournal {
         // Persist before EnableDebugging, including when that call later fails.
         crate::fs_util::atomic_write_private(&self.path, &serde_json::to_vec(package)?)
             .context("保存 Windows 包启动清理记录失败")
+    }
+}
+
+impl Drop for LaunchJournal {
+    fn drop(&mut self) {
+        // Unix 上复制或被子进程继承的句柄可能延长锁的寿命，因此主动解锁。
+        let _ = fs2::FileExt::unlock(&self.lock);
     }
 }
 
@@ -857,7 +864,23 @@ mod tests {
         let first = LaunchJournal::acquire(directory.path()).unwrap();
         assert!(LaunchJournal::acquire(directory.path()).is_err());
         drop(first);
-        assert!(LaunchJournal::acquire(directory.path()).is_ok());
+        LaunchJournal::acquire(directory.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_releases_lock_while_a_duplicate_handle_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = LaunchJournal::acquire(directory.path()).unwrap();
+        // dup 与 fork 继承的文件描述符共享同一个 flock 锁。
+        let duplicate = journal.lock.try_clone().unwrap();
+        assert!(LaunchJournal::acquire(directory.path()).is_err());
+        drop(journal);
+        let restarted = LaunchJournal::acquire(directory.path()).unwrap();
+        drop(duplicate);
+        assert!(LaunchJournal::acquire(directory.path()).is_err());
+        drop(restarted);
+        LaunchJournal::acquire(directory.path()).unwrap();
     }
 
     #[test]

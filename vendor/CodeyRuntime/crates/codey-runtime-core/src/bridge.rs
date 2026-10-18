@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -66,6 +66,34 @@ impl Drop for BridgePumpHandle {
     }
 }
 
+/// 同一 target 上已注册的持久文档脚本标识（按 WebSocket 地址区分目标）。重复
+/// 装桥时先注销上一批再注册，否则每次重试或看门狗重建都会让脚本在后续导航里
+/// 多执行一遍。标识只在同一 target 上有效；目标销毁后的残项随下次装桥清掉。
+static DOCUMENT_SCRIPT_REGISTRATIONS: OnceLock<Mutex<HashMap<String, Vec<String>>>> =
+    OnceLock::new();
+
+fn document_script_registrations() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    DOCUMENT_SCRIPT_REGISTRATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// addScriptToEvaluateOnNewDocument 的响应带 `result.identifier`；注册一条记
+/// 一条，装桥中途失败留下的残项也能被下次装桥完整注销。
+fn remember_document_script(websocket_url: &str, response: &Value) {
+    let Some(identifier) = response
+        .get("result")
+        .and_then(|result| result.get("identifier"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    document_script_registrations()
+        .lock()
+        .expect("document script registry poisoned")
+        .entry(websocket_url.to_string())
+        .or_default()
+        .push(identifier.to_string());
+}
+
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(100);
 
 pub fn build_bridge_script(binding_name: &str) -> String {
@@ -79,6 +107,21 @@ fn build_bridge_script_for_session(binding_name: &str, session_token: &str) -> S
         r#"
 (() => {{
   const bridgeSession = {session_token};
+  // 重新注入会替换回调表，先把上一代表里仍在等待的调用全部置为失败，
+  // 否则它们的 Promise 永远挂起，调用方（如会话时间戳刷新）会被一次性卡死。
+  const previousCallbacks = window.__codexSessionDeleteCallbacks;
+  if (previousCallbacks && typeof previousCallbacks.forEach === "function") {{
+    previousCallbacks.forEach((callback) => {{
+      try {{
+        if (callback?.timeout) window.clearTimeout(callback.timeout);
+        callback?.resolve?.({{
+          status: "failed",
+          code: "bridge_reinstalled",
+          message: "Codey 桥接已重新注入，请重试",
+        }});
+      }} catch {{}}
+    }});
+  }}
   window.__codexSessionDeleteCallbacks = new Map();
   window.__codexSessionDeleteSeq = 0;
   const takeCallback = (id) => {{
@@ -215,14 +258,32 @@ pub async fn install_bridge(
         .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
         .await?;
 
+    // 重复装桥先注销同一 target 上的旧持久脚本：注册标识没有枚举接口，只能由
+    // 上一次装桥记下。注销失败不阻断安装，残项随下次装桥再清。
+    let stale_registrations = document_script_registrations()
+        .lock()
+        .expect("document script registry poisoned")
+        .remove(websocket_url)
+        .unwrap_or_default();
+    for identifier in stale_registrations {
+        let _ = session
+            .send_command(
+                next_message_id(),
+                "Page.removeScriptToEvaluateOnNewDocument",
+                json!({ "identifier": identifier }),
+            )
+            .await;
+    }
+
     let bridge_script = build_bridge_script_for_session(binding_name, &session_token);
-    session
+    let response = session
         .send_command(
             4,
             "Page.addScriptToEvaluateOnNewDocument",
             json!({ "source": bridge_script }),
         )
         .await?;
+    remember_document_script(websocket_url, &response);
     let response = session
         .send_command(
             5,
@@ -234,13 +295,14 @@ pub async fn install_bridge(
 
     for script in new_document_scripts {
         let message_id = next_message_id();
-        session
+        let response = session
             .send_command(
                 message_id,
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({ "source": script }),
             )
             .await?;
+        remember_document_script(websocket_url, &response);
         let message_id = next_message_id();
         let response = session
             .send_command(
@@ -300,10 +362,10 @@ pub fn reject_bridge_expression(request_id: &str, message: &str) -> anyhow::Resu
     ))
 }
 
-type ConnectedCdpSocket =
+pub type ConnectedCdpSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
+pub async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
     let candidates = cdp_websocket_connect_candidates(websocket_url);
     // 候选共享原来的连接总预算，避免回退把单轮代价翻倍后吃掉启动注入窗口。
     let attempt_timeout = cdp_connect_attempt_timeout(candidates.len());

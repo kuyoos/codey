@@ -6,6 +6,24 @@ export type UpstreamProtocol =
   | "openaiChatCompletions"
   | "anthropicMessages";
 
+export type TransportOptions = {
+  accountEmail: string;
+  models?: Record<string, { contextWindow: number; autoCompactTokenLimit: number }>;
+  imageGeneration?: boolean;
+  imageEdit?: boolean;
+};
+
+export type PluginRouteSpec = {
+  name: string;
+  baseUrl: string;
+  upstreamProtocol: string;
+  models: string[];
+  modelReasoningEfforts?: Record<string, string[]>;
+  headers: Record<string, string>;
+  shortName: string;
+  transport?: TransportOptions;
+};
+
 export type Profile = {
   enabled?: boolean;
   id: string;
@@ -19,14 +37,17 @@ export type Profile = {
   clearApiKey?: boolean;
   modelRequestHeaders?: Record<string, string>;
   upstreamProxy?: string;
+  /** 官方账号线路的最高并发数；0 或缺省表示不限制。 */
+  maxConcurrency?: number;
   sourceProviderId?: string;
   pluginOwnerId?: string;
   /** 宿主已返回的插件声明；这里只使用独立于用户设置的模型能力。 */
-  pluginRouteSpec?: { modelReasoningEfforts?: Record<string, string[]> };
+  pluginRouteSpec?: PluginRouteSpec;
   officialAccount: boolean;
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;
   supportsRemoteCompaction?: boolean;
+  remoteCompactionProtocol?: "responses" | "compactEndpoint";
   supportsWebsockets?: boolean;
   supportsNativeWebSearch?: boolean;
   supportsAutoReview?: boolean;
@@ -111,6 +132,7 @@ export type Config = {
   protectCrashpadPending: boolean;
   slimCodexPet: boolean;
   gpuLaunchMode: "off" | "disableGpu" | "disableGpuRasterization";
+  codexLaunchProxy: string;
   fastContextTools: boolean;
   subagentOptimization: boolean;
   subagentModel: string;
@@ -182,15 +204,20 @@ export type OfficialAccount = {
   lastRefresh?: string;
   routeName?: string;
   routeShortName?: string;
+  maxConcurrency?: number;
   upstreamProxy?: string;
   /** 自定义 OpenAI 网关。留空时使用官方默认地址。 */
   baseUrl?: string;
   invalid?: boolean;
   invalidReason?: string;
+  /** 官方直连（SIWC）凭据状态：none 未启用 / active 可用 / invalid 已失效。 */
+  siwcStatus?: "none" | "active" | "invalid";
+  siwcInvalidReason?: string;
   isDefault: boolean;
 };
 
 export type OfficialAccountsResult = {
+  configApply?: ConfigApplyStatus | null;
   accounts?: OfficialAccount[];
   accountId?: string;
   defaultAccountId?: string | null;
@@ -203,8 +230,23 @@ export type OfficialAccountsResult = {
   warning?: string;
 };
 
+export type ConfigApplyStatus = {
+  revision: number;
+  state: "pending" | "applied" | "restart_required" | "failed" | "saved";
+  error?: string | null;
+};
+
 export type RuntimeStatus = {
+  configApply?: ConfigApplyStatus | null;
   running: boolean;
+  remoteCompaction?: {
+    configured: boolean;
+    active: boolean | null;
+    configuredMode?: "local" | "remote" | "mixed";
+    activeMode?: "local" | "remote" | "mixed" | null;
+    restartRequired: boolean;
+    blockingRoutes: Array<{ routeId: string; routeName: string; reason: string }>;
+  };
   appVersion?: string;
   codexAppVersion?: string;
   clientPlatform?: string;
@@ -265,7 +307,9 @@ export type Confirmation = {
     | "discard-settings-changes"
     | "delete-notification-channel"
     | "delete-route"
-    | "delete-official-account";
+    | "delete-official-account"
+    | "disable-official-account-siwc"
+    | "set-default-official-account";
   title: string;
   description: string;
   confirmLabel: string;

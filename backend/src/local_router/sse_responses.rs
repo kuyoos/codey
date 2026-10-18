@@ -431,7 +431,7 @@ impl<'a> ResponsesSseState<'a> {
             }));
         }
 
-        for tool in self.tools.values_mut() {
+        for (&upstream_index, tool) in &mut self.tools {
             if tool.arguments.is_empty()
                 && let Some(fallback) = tool.fallback_arguments.take()
             {
@@ -466,6 +466,8 @@ impl<'a> ResponsesSseState<'a> {
                 self.next_output_index += 1;
                 tool.output_index = Some(output_index);
                 tool.added = true;
+                self.output_order
+                    .push(StreamOutputKind::Tool(upstream_index));
                 events.push(json!({
                     "type":"response.output_item.added",
                     "response_id":self.response_id,

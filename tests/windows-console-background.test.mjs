@@ -127,10 +127,6 @@ test("Windows source contract: helper entry points run before the desktop app", 
     main,
     /codey_lib::run_plugin_log_terminal_if_requested\(\)[\s\S]*codey_lib::run_desktop_application\(\)/,
   );
-  assert.match(
-    main,
-    /codey_lib::run_overlay_recovery_if_requested\(\)\?[\s\S]*codey_lib::run_desktop_application\(\)/,
-  );
   assert.doesNotMatch(main, /run_update_helper_if_requested|update_helper/);
 });
 

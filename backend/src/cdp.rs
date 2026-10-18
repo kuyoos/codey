@@ -18,15 +18,31 @@ const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 // 发现与选择阶段的失败只付一次 loopback 请求的代价，既不触碰 renderer，也不
-// 留下 CDP 副作用，因此可以用更密的节奏跟随 renderer 就绪。一旦失败进入桥接
-// 安装阶段，每次重试都会重建 WebSocket 并重复注册持久注入脚本，必须保持原有
-// 退避，避免在 Codex 冷启动的 CPU 高峰窗口里叠加负担。
+// 留下 CDP 副作用，因此可以用更密的节奏跟随 renderer 就绪。校验阶段的失败
+// 复用已装好的桥接，但每次探测仍要在页面里跑一轮资产导入与 React 遍历；
+// 桥接安装失败则必须重建 WebSocket 并重复注册持久注入脚本。两类失败都保持
+// 原有退避，避免在 Codex 冷启动的 CPU 高峰窗口里叠加负担。
 const DISCOVERY_RETRY_STEP: Duration = Duration::from_millis(50);
 const DISCOVERY_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(200);
 // 发现阶段单次失败超过这个预算就不再算廉价探测：正常情况是一次被拒绝或返回空
 // 列表的 loopback 请求，远低于此值。
 const DISCOVERY_RETRY_COST_BUDGET: Duration = Duration::from_millis(100);
 const BRIDGE_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(500);
+// 模型请求入口校验降级条件：桥已存活的页面连续不就绪超过这个时长仍拿不到
+// request client，说明当前 Codex 构建不支持或补丁锚点已漂移。请求路由另有
+// CLI 包装层的 stdin 改写兜底，此时让注入以降级状态完成而不是永久轮询。
+const REQUEST_GATE_DEGRADE_AFTER: Duration = Duration::from_secs(10);
+const REQUEST_GATE_DEGRADE_MIN_FAILURES: u32 = 3;
+
+/// 请求入口连续不就绪达到阈值后放行本轮注入：无限重装只会拖长启动并在同一
+/// target 上反复叠加补丁会话，而模型路由仍有 CLI 包装层的 stdin 改写兜底。
+fn should_degrade_request_gate(not_ready_count: u32, not_ready_for: Option<Duration>) -> bool {
+    not_ready_count >= REQUEST_GATE_DEGRADE_MIN_FAILURES
+        && not_ready_for.is_some_and(|elapsed| elapsed >= REQUEST_GATE_DEGRADE_AFTER)
+}
+/// 校验 evaluate 的 CDP 层超时：页内等待最多跑满降级预算，外加页面被挂起等
+/// 开销余量；超时按桥不可用处理，走整轮重装而不是无限等下去。
+const REQUEST_GATE_VERIFY_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
@@ -44,16 +60,21 @@ pub(crate) const SETTINGS_OVERLAY_SCRIPT: &str =
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
 const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/prompt-optimize.js");
+const CONVERSATION_STATS_SCRIPT: &str =
+    include_str!("../../dist-overlay/inject/conversation-stats-inject.js");
 const MAX_INJECTION_ERROR_CHARS: usize = 500;
+// 面向用户的是归类后的摘要；完整错误链只进诊断与错误日志，单独给一个更大预算。
+const MAX_INJECTION_DETAIL_CHARS: usize = 2000;
 static SETTINGS_OVERLAY_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 static SESSION_TOOLS_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 enum InjectionPhase {
     DiscoverTargets,
     SelectTarget,
     InstallBridge,
+    VerifyRequestGate,
     VerifyOverlay,
     ReadStatuses,
 }
@@ -63,6 +84,7 @@ impl InjectionPhase {
         match value {
             value if value == Self::SelectTarget as u8 => Self::SelectTarget,
             value if value == Self::InstallBridge as u8 => Self::InstallBridge,
+            value if value == Self::VerifyRequestGate as u8 => Self::VerifyRequestGate,
             value if value == Self::VerifyOverlay as u8 => Self::VerifyOverlay,
             value if value == Self::ReadStatuses as u8 => Self::ReadStatuses,
             _ => Self::DiscoverTargets,
@@ -74,6 +96,7 @@ impl InjectionPhase {
             Self::DiscoverTargets => "枚举 CDP 页面",
             Self::SelectTarget => "选择 Codex renderer",
             Self::InstallBridge => "安装 CDP bridge 与注入脚本",
+            Self::VerifyRequestGate => "校验模型请求入口",
             Self::VerifyOverlay => "验证 Codey 浮层",
             Self::ReadStatuses => "读取注入状态",
         }
@@ -85,6 +108,7 @@ impl InjectionPhase {
             Self::DiscoverTargets => "discoverTargets",
             Self::SelectTarget => "selectTarget",
             Self::InstallBridge => "installBridge",
+            Self::VerifyRequestGate => "verifyRequestGate",
             Self::VerifyOverlay => "verifyOverlay",
             Self::ReadStatuses => "readStatuses",
         }
@@ -96,6 +120,16 @@ impl InjectionPhase {
         matches!(self, Self::DiscoverTargets | Self::SelectTarget)
     }
 }
+
+const INJECTION_PHASES: [InjectionPhase; 6] = [
+    InjectionPhase::DiscoverTargets,
+    InjectionPhase::SelectTarget,
+    InjectionPhase::InstallBridge,
+    InjectionPhase::VerifyRequestGate,
+    InjectionPhase::VerifyOverlay,
+    InjectionPhase::ReadStatuses,
+];
+const INJECTION_PHASE_COUNT: usize = INJECTION_PHASES.len();
 
 /// 触发这一轮注入重试的入口：首次启动等待渲染进程就绪，与看门狗在运行期按
 /// 健康判定重建，失败画像的含义完全不同，日志里必须能分开。
@@ -156,6 +190,7 @@ pub struct InjectionScriptStatus {
 pub struct PreparedInjectionScripts {
     scripts: Arc<[String]>,
     descriptors: Arc<[InjectionScriptDescriptor]>,
+    disable_pet: bool,
 }
 
 pub struct InjectedTarget {
@@ -167,11 +202,30 @@ pub struct InjectedTarget {
 #[derive(Debug)]
 pub struct InjectionRetryFailure {
     error: anyhow::Error,
+    detail: Option<String>,
+    /// 重试终止时所处的阶段：一直停在发现阶段意味着调试端点本身已不可达，
+    /// 看门狗据此把「页面修不好」与「Codex 已在托管外重启」分开处理。
+    final_phase: InjectionPhase,
+    /// 进入过桥接安装及之后阶段的失败轮数：非零说明端点曾经可达。
+    reached_bridge_stage: u32,
 }
 
 impl InjectionRetryFailure {
     pub fn into_error(self) -> anyhow::Error {
         self.error
+    }
+
+    /// 最后一次注入尝试的完整错误链（已截断）。对外错误只保留归类摘要，
+    /// 排查需要这条原始信息，调用方把它写进错误日志上下文。
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    /// 整轮重试都停在枚举/选择目标阶段：调试端口已随旧进程消失，或当前
+    /// 进程里没有任何可注入页面——在这条会话上继续重试不可能恢复。
+    /// 只要有一轮摸到过桥接阶段就说明端点活着，不再适用。
+    pub fn debug_endpoint_unreachable(&self) -> bool {
+        self.final_phase.is_discovery() && self.reached_bridge_stage == 0
     }
 }
 
@@ -314,6 +368,15 @@ pub fn prepare_injection_scripts(
             Internal,
         ),
         (
+            "conversation-stats",
+            "会话状态条",
+            CONVERSATION_STATS_SCRIPT,
+            r#"window.__codeyConversationStats?.installed === true
+              ? "会话状态条已就绪" : """#
+                .to_string(),
+            Internal,
+        ),
+        (
             "plugin-marketplace-compatibility",
             "插件市场兼容",
             PLUGIN_MARKETPLACE_FIX_SCRIPT,
@@ -347,10 +410,13 @@ pub fn prepare_injection_scripts(
             "额度状态兼容",
             QUOTA_UNLOCK_SCRIPT,
             r#"(() => {
-              const status = window.__codeyQuotaUnlock?.status?.();
+              const helper = window.__codeyQuotaUnlock;
+              const status = helper?.status?.();
               if (!status) return "";
+              if (typeof helper.allowsLocalSend !== "function")
+                return { effective: false, detail: "本机第三方模型发送额度判断未就绪" };
               return status.enabled === true
-                ? { effective: true, detail: `额度状态兼容已处理 ${status.sanitized ?? 0} 次` }
+                ? { effective: true, detail: "本机第三方模型发送额度判断已启用" }
                 : { effective: false, inactive: true, detail: "额度状态兼容已关闭" };
             })()"#
                 .to_string(),
@@ -366,6 +432,7 @@ pub fn prepare_injection_scripts(
             + QUOTA_UNLOCK_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
             + PROMPT_OPTIMIZE_SCRIPT.len()
+            + CONVERSATION_STATS_SCRIPT.len()
             + 4096,
     );
     let mut descriptors = Vec::with_capacity(builtin_scripts.len() + user_scripts.len());
@@ -411,6 +478,7 @@ pub fn prepare_injection_scripts(
     PreparedInjectionScripts {
         scripts: Arc::from(scripts),
         descriptors: Arc::from(descriptors),
+        disable_pet: slim_codex_pet,
     }
 }
 
@@ -481,11 +549,26 @@ fn append_guarded_script(
     }
 }
 
+/// 预取（含浏览器端点早期挂载）的内部预算与注入总期限同级。
+pub const PREFETCH_BUDGET: Duration = CDP_INJECTION_TIMEOUT;
+
+/// 在 Codex 进程拉起与 CLI 包装器握手窗口内预取页面目标：调试端口在
+/// Chromium 主进程就绪后先于握手完成可用。除 /json 枚举外还会尝试浏览器
+/// 端点的自动挂载——窗口在首个导航前被暂停时，Fetch 拦截能赶在任何资产
+/// 请求之前落位（early_attach 模块负责）。找不到目标返回 None，注入主
+/// 流程照常走发现重试。
+pub fn spawn_injectable_target_prefetch(
+    debug_port: u16,
+) -> tokio::task::JoinHandle<Option<crate::early_attach::PrefetchedPage>> {
+    crate::early_attach::spawn_early_attach_prefetch(debug_port, PREFETCH_BUDGET)
+}
+
 pub async fn retry_inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
     source: InjectionRetrySource,
+    prefetched_target: Option<tokio::task::JoinHandle<Option<crate::early_attach::PrefetchedPage>>>,
 ) -> std::result::Result<InjectedTarget, InjectionRetryFailure> {
     // Renderer asset preparation on newer Windows Codex builds can consume
     // more than ten seconds before the first injectable page appears. Keep
@@ -493,30 +576,84 @@ pub async fn retry_inject_with_scripts(
     // hard startup deadline.
     let started = tokio::time::Instant::now();
     let deadline = started + CDP_INJECTION_TIMEOUT;
+    // 预取任务本身就在做同样的只读枚举：等它出结果而不是并行跑第二份轮询。
+    // 它只在首轮建立注入时消费一次，后续重试照旧枚举（目标可能已换）。
+    let mut prefetched_target = match prefetched_target {
+        Some(handle) => match tokio::time::timeout_at(deadline, handle).await {
+            Ok(Ok(target)) => target,
+            _ => None,
+        },
+        None => None,
+    };
     let mut delay = INITIAL_RETRY_INTERVAL;
     let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
     let mut previous_error = None;
+    let mut previous_detail = None;
     let mut stats = InjectionRetryStats::default();
+    // 校验失败时桥接本身仍然可用：把它跨轮保留，下一轮只在原 WebSocket 上
+    // 重跑校验，不再重连并重放全部注入脚本。
+    let mut retained_bridge: Option<EstablishedInjection> = None;
+    // 模型请求入口校验依赖页面侧补丁或会话工具能拿到 request client；页面已
+    // 应答却始终拿不到时（例如 Codex 更新后源补丁锚点漂移、注入脚本根本没落
+    // 到当前文档），不能无限重装——重装只会不断叠加新的补丁会话。只按"校验
+    // 阶段连续不就绪"计时，超过预算就降级接受本次注入；请求路由另有 CLI 包装
+    // 层的 stdin 改写兜底。
+    let mut gate_not_ready_since: Option<tokio::time::Instant> = None;
+    let mut gate_not_ready_count: u32 = 0;
+    let mut degrade_request_gate = false;
     let last_error = loop {
-        phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
         stats.attempts += 1;
         let attempt_started = tokio::time::Instant::now();
         match tokio::time::timeout_at(
             deadline,
-            inject_with_scripts(debug_port, handler.clone(), scripts, &phase),
+            run_injection_attempt(
+                retained_bridge.take(),
+                prefetched_target.take(),
+                debug_port,
+                handler.clone(),
+                scripts,
+                &phase,
+                degrade_request_gate,
+            ),
         )
         .await
         {
-            Ok(Ok(target)) => {
-                stats.report(source, "injected", started.elapsed());
+            Ok(AttemptOutcome::Injected(target)) => {
+                stats.report(source, "injected", started.elapsed(), None);
                 return Ok(target);
             }
-            Ok(Err(error)) => {
+            Ok(AttemptOutcome::Retry {
+                error,
+                retained,
+                request_gate_unready,
+            }) => {
+                retained_bridge = retained;
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
                 let failure_cost = attempt_started.elapsed();
                 stats.record_failure(current_phase, failure_cost);
+                if matches!(current_phase, InjectionPhase::VerifyRequestGate)
+                    && request_gate_unready
+                {
+                    gate_not_ready_count += 1;
+                    gate_not_ready_since.get_or_insert(attempt_started);
+                } else {
+                    gate_not_ready_count = 0;
+                    gate_not_ready_since = None;
+                }
+                // 至少确认过两次页面应答后再考虑降级，避免把启动早期的瞬态
+                // "尚未就绪"误判成永久不可用。
+                degrade_request_gate = should_degrade_request_gate(
+                    gate_not_ready_count,
+                    gate_not_ready_since.map(|since| since.elapsed()),
+                );
+                previous_detail = Some(injection_failure_detail(&error));
                 if tokio::time::Instant::now() + delay > deadline {
-                    stats.report(source, "noRetryBudget", started.elapsed());
+                    stats.report(
+                        source,
+                        "noRetryBudget",
+                        started.elapsed(),
+                        previous_detail.as_deref(),
+                    );
                     break anyhow::anyhow!(
                         "Codex CDP bridge 注入失败（阶段：{}；{}）",
                         current_phase.label(),
@@ -529,7 +666,12 @@ pub async fn retry_inject_with_scripts(
             }
             Err(_) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
-                stats.report(source, "deadlineExceeded", started.elapsed());
+                stats.report(
+                    source,
+                    "deadlineExceeded",
+                    started.elapsed(),
+                    previous_detail.as_deref(),
+                );
                 let previous_error = previous_error
                     .as_deref()
                     .map(|error| format!("；最近一次失败：{error}"))
@@ -543,15 +685,20 @@ pub async fn retry_inject_with_scripts(
             }
         }
     };
-    Err(InjectionRetryFailure { error: last_error })
+    Err(InjectionRetryFailure {
+        error: last_error,
+        detail: previous_detail,
+        final_phase: InjectionPhase::from_raw(phase.load(Ordering::Acquire)),
+        reached_bridge_stage: stats.bridge_failures(),
+    })
 }
 
 /// 下一次重试前的等待时长。发现与选择阶段的失败通常只付一次 loopback 请求的
 /// 代价，既不触碰 renderer 也不留 CDP 副作用，用小步长逼近 renderer 就绪即可。
 /// 但同一阶段的失败也可能突然变贵（例如调试端口被别的服务占用而让请求挂到
 /// 超时），因此还要看刚结束的那次失败的实付代价：一旦不再廉价就立刻退回保守
-/// 退避。桥接及之后的阶段每次失败都会重建 WebSocket 并重复注册持久脚本，无论
-/// 代价高低都沿用原来的指数退避。
+/// 退避。桥接安装失败要重建 WebSocket 并重放脚本，校验失败虽然复用桥接却仍要
+/// 驱动一轮页面内探测，两者无论代价高低都沿用原来的指数退避。
 fn next_injection_retry_delay(
     current: Duration,
     phase: InjectionPhase,
@@ -563,41 +710,72 @@ fn next_injection_retry_delay(
     (current * 2).min(BRIDGE_RETRY_MAX_INTERVAL)
 }
 
-/// 单次注入重试的失败画像：把「注入慢」区分为等待 renderer 还是重复桥接，
-/// 不必只凭重试间隔反推。每次启动只写一条汇总，不随重试次数增长。
+/// 单次注入重试的失败画像：按阶段分别计数，不再把桥接安装与后续校验压缩成
+/// 同一个 bucket——「注入慢」的归因直接读 failures 即可。每次启动只写一条
+/// 汇总，不随重试次数增长。
 #[derive(Default)]
 struct InjectionRetryStats {
     attempts: u32,
-    discovery_failures: u32,
-    bridge_failures: u32,
+    phase_failures: [u32; INJECTION_PHASE_COUNT],
     failure_expense_ms: u64,
     last_failure_phase: Option<InjectionPhase>,
 }
 
 impl InjectionRetryStats {
     fn record_failure(&mut self, phase: InjectionPhase, cost: Duration) {
-        if phase.is_discovery() {
-            self.discovery_failures += 1;
-        } else {
-            self.bridge_failures += 1;
-        }
+        self.phase_failures[phase as usize] += 1;
         self.failure_expense_ms += cost.as_millis() as u64;
         self.last_failure_phase = Some(phase);
     }
 
-    fn report(&self, source: InjectionRetrySource, outcome: &str, elapsed: Duration) {
+    fn discovery_failures(&self) -> u32 {
+        self.phase_failures[..=InjectionPhase::SelectTarget as usize]
+            .iter()
+            .sum()
+    }
+
+    fn bridge_failures(&self) -> u32 {
+        self.phase_failures[InjectionPhase::InstallBridge as usize..]
+            .iter()
+            .sum()
+    }
+
+    fn report(
+        &self,
+        source: InjectionRetrySource,
+        outcome: &str,
+        elapsed: Duration,
+        last_error: Option<&str>,
+    ) {
+        let failures: serde_json::Map<String, serde_json::Value> = INJECTION_PHASES
+            .iter()
+            .filter(|phase| self.phase_failures[**phase as usize] > 0)
+            .map(|phase| {
+                let index = *phase as usize;
+                (
+                    phase.key().to_string(),
+                    serde_json::json!(self.phase_failures[index]),
+                )
+            })
+            .collect();
+        let mut detail = serde_json::json!({
+            "source": source.key(),
+            "outcome": outcome,
+            "attempts": self.attempts,
+            "discoveryFailures": self.discovery_failures(),
+            "bridgeFailures": self.bridge_failures(),
+            "failures": failures,
+            "failureExpenseMs": self.failure_expense_ms,
+            "lastFailurePhase": self.last_failure_phase.map(InjectionPhase::key),
+            "totalMs": elapsed.as_millis() as u64,
+        });
+        // 汇总文案只保留归类结果，完整错误链随最后一次尝试一起进诊断记录。
+        if let Some(last_error) = last_error {
+            detail["lastError"] = serde_json::json!(last_error);
+        }
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "cdp.injection_retry_summary",
-            serde_json::json!({
-                "source": source.key(),
-                "outcome": outcome,
-                "attempts": self.attempts,
-                "discoveryFailures": self.discovery_failures,
-                "bridgeFailures": self.bridge_failures,
-                "failureExpenseMs": self.failure_expense_ms,
-                "lastFailurePhase": self.last_failure_phase.map(InjectionPhase::key),
-                "totalMs": elapsed.as_millis() as u64,
-            }),
+            detail,
         );
     }
 }
@@ -672,28 +850,321 @@ fn safe_injection_error_summary(error: &anyhow::Error) -> String {
         "CDP 命令未在单次响应预算内完成".to_string()
     } else if normalized.contains("codey 内嵌配置面板注入失败") {
         "Codey 浮层未就绪".to_string()
+    } else if normalized.contains("codex 页面没有 cdp websocket 地址") {
+        "Codex 页面缺少调试连接地址".to_string()
+    } else if normalized.contains("cdp websocket closed before response") {
+        let method = message
+            .split_once("CDP websocket closed before response for ")
+            .and_then(|(_, rest)| rest.split_once(" id ").map(|(method, _)| method.trim()));
+        method.map_or_else(
+            || "CDP 连接被 Codex 关闭".to_string(),
+            |method| format!("CDP 连接被 Codex 关闭（{method}）"),
+        )
+    } else if normalized.contains("failed to send cdp command")
+        || normalized.contains("failed to read cdp websocket message")
+        || normalized.contains("failed to parse cdp message")
+    {
+        "CDP 连接中断".to_string()
+    } else if normalized.contains("cdp command ") && normalized.contains(" failed: ") {
+        cdp_command_failure_summary(&message).unwrap_or_else(|| "CDP 命令被 Codex 拒绝".to_string())
+    } else if normalized.contains("模型请求校验未通过：") {
+        // 校验脚本以 JSON 返回页面侧失败原因（"当前 Codex 暂不支持模型请求
+        // 校验"、"模型请求补丁未注入"等），文案本身就是可用的归类摘要。
+        message
+            .lines()
+            .next()
+            .map(|line| truncate_chars(line, MAX_INJECTION_ERROR_CHARS))
+            .unwrap_or_else(|| "模型请求校验未通过".to_string())
+    } else if normalized.contains("安装 codex 模型请求校验失败")
+        || normalized.contains("校验模型请求入口失败")
+    {
+        // 校验入口失败时页面抛出的错误（"模型请求校验尚未就绪"、"当前 Codex
+        // 暂不支持模型请求校验"等）藏在 exceptionDetails 里，取出来才有定位价值。
+        evaluate_exception_detail(&message).map_or_else(
+            || "模型请求校验未通过".to_string(),
+            |detail| format!("模型请求校验未通过：{detail}"),
+        )
+    } else if normalized.contains("runtime.evaluate raised an exception") {
+        evaluate_exception_detail(&message).map_or_else(
+            || "页面脚本执行异常".to_string(),
+            |detail| format!("页面脚本执行异常：{detail}"),
+        )
     } else {
         "内部注入尝试失败".to_string()
     }
 }
 
-async fn inject_with_scripts(
+/// 完整错误链（含 anyhow 上下文）只进诊断与错误日志，不进用户可见文案。
+fn injection_failure_detail(error: &anyhow::Error) -> String {
+    truncate_chars(&format!("{error:#}"), MAX_INJECTION_DETAIL_CHARS)
+}
+
+/// CDP 命令错误响应形如 `{"code":-32601,"message":"..."}`，摘出方法与
+/// 协议消息比笼统的"内部注入尝试失败"更能定位是哪一步被拒绝。
+fn cdp_command_failure_summary(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once("CDP command ")?;
+    let (method, rest) = rest.split_once(" id ")?;
+    let (_, error_json) = rest.split_once(" failed: ")?;
+    let payload = serde_json::from_str::<serde_json::Value>(error_json.trim()).ok()?;
+    let reason = payload.get("message").and_then(serde_json::Value::as_str)?;
+    Some(truncate_chars(
+        &format!(
+            "CDP 命令 {} 被 Codex 拒绝：{}",
+            method.trim(),
+            reason.trim()
+        ),
+        MAX_INJECTION_ERROR_CHARS,
+    ))
+}
+
+/// Runtime.evaluate 的 exceptionDetails 里带页面侧错误首行（注入脚本或
+/// Codex 内部抛出的错误），取它比只说"执行异常"更有定位价值。
+fn evaluate_exception_detail(message: &str) -> Option<String> {
+    let (_, details) = message.split_once("Runtime.evaluate raised an exception: ")?;
+    let payload = serde_json::from_str::<serde_json::Value>(details.trim_end()).ok()?;
+    let exception = payload.get("exception")?;
+    let description = exception
+        .get("description")
+        .and_then(serde_json::Value::as_str)?;
+    let first_line = description.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    // "Error: 描述" / "TypeError: 描述" 的首行去掉类型前缀，只留可读内容。
+    let detail = first_line
+        .split_once(": ")
+        .filter(|(head, _)| {
+            !head.is_empty()
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '$' | '_' | '.'))
+        })
+        .map(|(_, rest)| rest.trim())
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(first_line);
+    Some(truncate_chars(detail, MAX_INJECTION_ERROR_CHARS / 2))
+}
+
+/// 已成功安装桥接的 CDP 会话。校验阶段失败时保留它，下一轮重试只在原
+/// WebSocket 上重跑校验，不重连也不重放注入脚本。
+struct EstablishedInjection {
+    target_id: String,
+    websocket_url: Arc<str>,
+    pump: BridgePumpHandle,
+}
+
+/// 校验阶段的失败需要区分恢复方式：页面端报告 Codex 尚未就绪时只要保留桥接
+/// 继续轮询；注入脚本缺失、桥接被替换或 CDP 连接失效时才需要整轮重装。
+struct VerifyFailure {
+    reinstall: bool,
+    /// 失败发生在请求入口校验阶段且页面已应答：只有这种形态参与降级预算。
+    request_gate_unready: bool,
+    error: anyhow::Error,
+}
+
+/// 校验脚本返回 JSON 而不是抛异常：页面侧能分清「还没就绪」与「补丁根本没
+/// 装上」，宿主据此决定轮询还是重装。waitedMs/polls/sourceGate 是页内等待的
+/// 运行画像：门禁通常要等 Codex 自己把 request client 建好，逐次 evaluate +
+/// 指数退避只会放大检出延迟，所以等待被放进单次 evaluate 里完成。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestGateVerdict {
+    ready: bool,
+    #[serde(default)]
+    reinstall: bool,
+    message: Option<String>,
+    #[serde(default)]
+    waited_ms: u64,
+    #[serde(default)]
+    polls: u32,
+    #[serde(default)]
+    source_gate: bool,
+    #[serde(default)]
+    module_gate: bool,
+}
+
+/// 页内等待的默认预算与降级阈值一致：等待耗尽即视为「页面持续应答却长期拿不
+/// 到 request client」，宿主据此直接降级。测试或诊断可用
+/// `window.__codeyRequestGateWaitMs` 缩短。
+const REQUEST_GATE_WAIT_BUDGET_MS: u64 = REQUEST_GATE_DEGRADE_AFTER.as_millis() as u64;
+/// 单次 ensureRequestGate 调用的页内上限：会话工具加载与模块探测各有自己的
+/// 预算，卡住的调用不拖累整轮等待的终止判定。
+const REQUEST_GATE_POLL_STEP_MS: u64 = 200;
+const REQUEST_GATE_POLL_CALL_MS: u64 = 2_000;
+
+// Runtime.evaluate 未开 returnByValue 时只有原始类型回传 value，判定结果
+// 必须用 JSON 字符串承载，与注入状态快照同一约定。预算等数值由宿主注入，
+// 页面默认值与降级阈值由 request_gate_verify_script() 统一保持同步。
+const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
+  const started = Date.now();
+  const overrideBudget = Number(window.__codeyRequestGateWaitMs);
+  const budgetMs = Number.isFinite(overrideBudget) && overrideBudget >= 0
+    ? Math.min(overrideBudget, 60_000)
+    : __CODEY_GATE_BUDGET_MS__;
+  const deadline = started + budgetMs;
+  let polls = 0;
+  let lastMessage = "";
+  const verdict = (ready, reinstall, message) => JSON.stringify({
+    ready, reinstall, message,
+    waitedMs: Date.now() - started,
+    polls,
+    sourceGate: window.__codeyModelRequestSourceGateInstalled === true,
+    moduleGate: window.__codeyModelRequestModuleGateInstalled === true,
+  });
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return verdict(false, false, lastMessage || "模型请求校验未就绪");
+    }
+    const patch = window.__codeyModelWhitelistPatch;
+    if (!patch || typeof patch.ensureRequestGate !== "function") {
+      return verdict(false, true, "模型请求补丁未注入");
+    }
+    polls += 1;
+    const timedOut = Symbol("timeout");
+    const outcome = await Promise.race([
+      Promise.resolve().then(() => patch.ensureRequestGate()).then(
+        (ready) => ({ ready }),
+        (error) => ({ error }),
+      ),
+      new Promise((resolve) => setTimeout(
+        () => resolve(timedOut),
+        Math.min(__CODEY_GATE_CALL_MS__, remaining),
+      )),
+    ]);
+    if (outcome === timedOut) {
+      // 单次调用超时不覆盖已拿到的真实失败原因——耗尽预算时诊断更需要后者。
+      lastMessage = lastMessage || "模型请求校验探测超时";
+    } else if (outcome.error !== undefined) {
+      lastMessage = String(
+        (outcome.error && outcome.error.message) || outcome.error || "模型请求校验失败",
+      );
+      // 等待期间补丁对象被脚本重放替换：旧实例只会持续拒绝，必须整轮重装。
+      if (window.__codeyModelWhitelistPatch !== patch) {
+        return verdict(false, true, lastMessage);
+      }
+    } else if (outcome.ready === true) {
+      return verdict(true, false, "");
+    } else {
+      lastMessage = "模型请求校验未就绪";
+    }
+    await new Promise((resolve) => setTimeout(
+      resolve,
+      Math.min(__CODEY_GATE_STEP_MS__, Math.max(0, deadline - Date.now())),
+    ));
+  }
+})()"#;
+
+fn request_gate_verify_script() -> String {
+    REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE
+        .replace(
+            "__CODEY_GATE_BUDGET_MS__",
+            &REQUEST_GATE_WAIT_BUDGET_MS.to_string(),
+        )
+        .replace(
+            "__CODEY_GATE_CALL_MS__",
+            &REQUEST_GATE_POLL_CALL_MS.to_string(),
+        )
+        .replace(
+            "__CODEY_GATE_STEP_MS__",
+            &REQUEST_GATE_POLL_STEP_MS.to_string(),
+        )
+}
+
+enum AttemptOutcome {
+    Injected(InjectedTarget),
+    Retry {
+        error: anyhow::Error,
+        retained: Option<EstablishedInjection>,
+        /// 本轮失败发生在请求入口校验且页面已应答，参与降级预算计次。
+        request_gate_unready: bool,
+    },
+}
+
+async fn run_injection_attempt(
+    retained: Option<EstablishedInjection>,
+    prefetched_page: Option<crate::early_attach::PrefetchedPage>,
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
     phase: &AtomicU8,
-) -> Result<InjectedTarget> {
+    degrade_request_gate: bool,
+) -> AttemptOutcome {
+    let bridge = match retained.filter(|bridge| !bridge.pump.is_finished()) {
+        Some(bridge) => bridge,
+        // 没有可复用的桥接（首轮，或上一轮留下的桥接泵已随页面导航/目标关闭
+        // 而结束）时回到发现阶段整轮重建。
+        None => {
+            match establish_injection(debug_port, prefetched_page, handler, scripts, phase).await {
+                Ok(bridge) => bridge,
+                Err(error) => {
+                    return AttemptOutcome::Retry {
+                        error,
+                        retained: None,
+                        request_gate_unready: false,
+                    };
+                }
+            }
+        }
+    };
+    match verify_injection(&bridge, scripts, phase, degrade_request_gate).await {
+        Ok(injection_statuses) => AttemptOutcome::Injected(InjectedTarget {
+            websocket_url: bridge.websocket_url,
+            pump: bridge.pump,
+            injection_statuses,
+        }),
+        Err(failure) if failure.reinstall => {
+            // 校验端明确要求重建：显式关掉这条会话，下一轮从头装桥。
+            let request_gate_unready = failure.request_gate_unready;
+            bridge.pump.close().await;
+            AttemptOutcome::Retry {
+                error: failure.error,
+                retained: None,
+                request_gate_unready,
+            }
+        }
+        Err(failure) => AttemptOutcome::Retry {
+            error: failure.error,
+            retained: Some(bridge),
+            request_gate_unready: failure.request_gate_unready,
+        },
+    }
+}
+
+async fn establish_injection(
+    debug_port: u16,
+    prefetched_page: Option<crate::early_attach::PrefetchedPage>,
+    handler: BridgeHandler,
+    scripts: &PreparedInjectionScripts,
+    phase: &AtomicU8,
+) -> Result<EstablishedInjection> {
     phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
-    let targets = list_targets(debug_port)
-        .await
-        .context("枚举 Codex CDP 页面失败")?;
-    phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
-    let target = pick_injectable_codex_page_target(&targets).with_context(|| {
-        format!(
-            "没有找到可注入的 Codex renderer；CDP targets={}",
-            summarize_cdp_targets(&targets)
-        )
-    })?;
+    // 握手窗口内已锁定目标（可能带暂停态）：两个发现阶段视作已过，直接建连。
+    let (target, mut hold) = match prefetched_page {
+        Some(crate::early_attach::PrefetchedPage::Paused { target, hold }) => {
+            phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+            (target, Some(hold))
+        }
+        Some(crate::early_attach::PrefetchedPage::Ready { target }) => {
+            phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+            (target, None)
+        }
+        None => {
+            let targets = list_targets(debug_port)
+                .await
+                .context("枚举 Codex CDP 页面失败")?;
+            phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+            (
+                pick_injectable_codex_page_target(&targets).with_context(|| {
+                    format!(
+                        "没有找到可注入的 Codex renderer；CDP targets={}",
+                        summarize_cdp_targets(&targets)
+                    )
+                })?,
+                None,
+            )
+        }
+    };
     let websocket_url: Arc<str> = Arc::from(
         target
             .web_socket_debugger_url
@@ -702,6 +1173,48 @@ async fn inject_with_scripts(
     );
     let handler = with_lazy_loaders(handler, websocket_url.clone());
     phase.store(InjectionPhase::InstallBridge as u8, Ordering::Release);
+    // 渲染资产补丁先于 bridge：会话内部的覆盖 reload 会重建文档上下文，
+    // 先让它完成，bridge 直接装在新文档上，校验拿到的就是补丁后的资产。
+    // 补丁会话失败不阻断注入——请求入口校验会决定降级是否可接受。
+    let paused_start = hold.is_some();
+    let patch_result = crate::renderer_asset_patch::install_renderer_asset_patch(
+        &websocket_url,
+        scripts.disable_pet,
+        paused_start,
+    )
+    .await;
+    // 暂停态页面的 Fetch 拦截已经就位：放行后首个导航（index.html 与资产）
+    // 全部经过 Fetch 通道，覆盖判定拿到 bootstrap 证据而不必补装 reload。
+    // 暂停会话失效时 resume 静默失败，后续路径照常走。
+    if let Some(hold) = hold.take() {
+        hold.resume().await;
+    }
+    match patch_result {
+        Ok(patch_session) => {
+            if let Err(error) = patch_session.ensure_document_coverage().await {
+                error_log::record_failure_async(
+                    "injection_patch_coverage_failed",
+                    "ensure_document_coverage",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "websocketUrl": websocket_url.as_ref(),
+                    }),
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            error_log::record_failure_async(
+                "injection_patch_session_failed",
+                "install_renderer_asset_patch",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "websocketUrl": websocket_url.as_ref(),
+                }),
+            )
+            .await;
+        }
+    }
     let pump = install_bridge(
         &websocket_url,
         codey_runtime_core::bridge::BRIDGE_BINDING_NAME,
@@ -710,21 +1223,121 @@ async fn inject_with_scripts(
     )
     .await
     .with_context(|| format!("向 Codex renderer {} 安装 CDP bridge 失败", target.id))?;
+    Ok(EstablishedInjection {
+        target_id: target.id,
+        websocket_url,
+        pump,
+    })
+}
+
+async fn verify_injection(
+    bridge: &EstablishedInjection,
+    scripts: &PreparedInjectionScripts,
+    phase: &AtomicU8,
+    degrade_request_gate: bool,
+) -> std::result::Result<Arc<[InjectionScriptStatus]>, VerifyFailure> {
+    // 请求入口 gate 由渲染资产补丁（源码级）或会话工具（运行时遍历）安装；
+    // 两者都缺失时按页面侧裁决继续轮询，超过降级预算后放行本轮注入。校验脚本
+    // 自身在页面内有界等待，一次等待耗尽预算即等价于旧版「连续多轮不就绪」。
+    phase.store(InjectionPhase::VerifyRequestGate as u8, Ordering::Release);
+    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+        &bridge.websocket_url,
+        &request_gate_verify_script(),
+        true,
+        REQUEST_GATE_VERIFY_EVALUATE_TIMEOUT,
+    )
+    .await
+    .map_err(|error| VerifyFailure {
+        // CDP 层失败（连接断开、evaluate 自身异常）意味着这条桥已不可用。
+        reinstall: true,
+        request_gate_unready: false,
+        error: error.context("校验模型请求入口失败"),
+    })?;
+    let payload = runtime_value(&response)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VerifyFailure {
+            reinstall: true,
+            request_gate_unready: false,
+            error: anyhow::anyhow!("模型请求校验未通过：校验响应不可解析"),
+        })?;
+    let verdict: RequestGateVerdict =
+        serde_json::from_str(payload).map_err(|error| VerifyFailure {
+            reinstall: true,
+            request_gate_unready: false,
+            error: anyhow::anyhow!("模型请求校验未通过：校验结果反序列化失败（{error}）"),
+        })?;
+    if verdict.ready {
+        // 成功路径的画像与补丁会话统计一并落盘：sourceGate/moduleGate 区分源
+        // 码补丁、模块级 DI 直取与 React 遍历三条就绪路径，entryDocuments 区分
+        // 覆盖重载是否发生，是后续启动优化「省掉的是哪一段」的依据。
+        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+            "cdp.request_gate_ready",
+            serde_json::json!({
+                "targetId": bridge.target_id,
+                "waitedMs": verdict.waited_ms,
+                "polls": verdict.polls,
+                "sourceGate": verdict.source_gate,
+                "moduleGate": verdict.module_gate,
+                "patchSession": crate::renderer_asset_patch::session_stats(
+                    bridge.websocket_url.as_ref()
+                ),
+            }),
+        );
+    } else {
+        let message = verdict
+            .message
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "模型请求校验未就绪".to_string());
+        // 页内等待耗尽预算等价于「页面持续应答却长期拿不到 client」；重装裁决
+        // 永远走整轮重建，不参与降级。
+        let in_page_wait_exhausted =
+            !verdict.reinstall && verdict.waited_ms >= REQUEST_GATE_WAIT_BUDGET_MS;
+        if !verdict.reinstall && (degrade_request_gate || in_page_wait_exhausted) {
+            // 页面持续应答却长期拿不到 request client：按降级完成注入。
+            // 页面侧补丁或会话工具之后若就位，gate 仍会自行装上；当前则让
+            // CLI 包装层的 stdin 改写继续承担模型路由。
+            // 附上补丁会话的拦截统计：pausedRequests/entryDocuments 为零说明
+            // Fetch 在该构建上根本没拦到资产流，与「补丁落地但探测不到
+            // client」是两种不同故障。
+            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                "cdp.request_gate_degraded",
+                serde_json::json!({
+                    "targetId": bridge.target_id,
+                    "reinstall": verdict.reinstall,
+                    "message": message,
+                    "waitedMs": verdict.waited_ms,
+                    "polls": verdict.polls,
+                    "patchSession": crate::renderer_asset_patch::session_stats(
+                        bridge.websocket_url.as_ref()
+                    ),
+                }),
+            );
+        } else {
+            return Err(VerifyFailure {
+                reinstall: verdict.reinstall,
+                request_gate_unready: true,
+                error: anyhow::anyhow!("模型请求校验未通过：{message}"),
+            });
+        }
+    }
     phase.store(InjectionPhase::VerifyOverlay as u8, Ordering::Release);
-    ensure_settings_overlay_ready(&websocket_url)
+    ensure_settings_overlay_ready(&bridge.websocket_url)
         .await
-        .with_context(|| format!("验证 Codex renderer {} 的 Codey 浮层失败", target.id))?;
+        .map_err(|error| VerifyFailure {
+            // 浮层由加载器脚本同步生成，缺失说明注入脚本执行失败，只能重装。
+            reinstall: true,
+            error: error.context(format!(
+                "验证 Codex renderer {} 的 Codey 浮层失败",
+                bridge.target_id
+            )),
+            request_gate_unready: false,
+        })?;
     // Status probing is diagnostic-only. Keep it out of the critical startup
     // path: the bridge and overlay checks above prove injection is usable, and
     // the existing refresh_injection_statuses command fills in the real state
     // once the UI asks for it.
     phase.store(InjectionPhase::ReadStatuses as u8, Ordering::Release);
-    let injection_statuses = scripts.statuses_with_error("启动后复核注入状态");
-    Ok(InjectedTarget {
-        websocket_url,
-        pump,
-        injection_statuses,
-    })
+    Ok(scripts.statuses_with_error("启动后复核注入状态"))
 }
 
 impl PreparedInjectionScripts {
@@ -1564,6 +2177,130 @@ assert.equal(nextPage.window.attempts, 1);
         assert_eq!(CDP_INJECTION_TIMEOUT, Duration::from_secs(30));
     }
 
+    #[test]
+    fn request_gate_verdict_parses_poll_and_reinstall_shapes() {
+        let poll: RequestGateVerdict = serde_json::from_str(
+            r#"{"ready":false,"reinstall":false,"message":"当前 Codex 暂不支持模型请求校验"}"#,
+        )
+        .unwrap();
+        assert!(!poll.ready && !poll.reinstall);
+        assert_eq!(
+            poll.message.as_deref(),
+            Some("当前 Codex 暂不支持模型请求校验")
+        );
+        // 旧页面可能只回 ready/message，reinstall 缺省按轮询处理。
+        let legacy: RequestGateVerdict =
+            serde_json::from_str(r#"{"ready":false,"message":"x"}"#).unwrap();
+        assert!(!legacy.ready && !legacy.reinstall);
+        assert!(
+            serde_json::from_str::<RequestGateVerdict>(r#"{"ready":true}"#)
+                .unwrap()
+                .ready
+        );
+    }
+
+    #[test]
+    fn endpoint_unreachable_only_when_no_attempt_reached_the_bridge() {
+        let failure = |phase: InjectionPhase, reached_bridge_stage: u32| InjectionRetryFailure {
+            error: anyhow::anyhow!("x"),
+            detail: None,
+            final_phase: phase,
+            reached_bridge_stage,
+        };
+        // 调试端口死掉：每轮都停在发现阶段。
+        assert!(failure(InjectionPhase::DiscoverTargets, 0).debug_endpoint_unreachable());
+        assert!(failure(InjectionPhase::SelectTarget, 0).debug_endpoint_unreachable());
+        // 有一轮摸到过桥接阶段——端点当时活着，不算托管外重启。
+        assert!(!failure(InjectionPhase::DiscoverTargets, 1).debug_endpoint_unreachable());
+        // 最后一轮卡在桥接安装（端点还活着只是会话坏了）同样不适用。
+        assert!(!failure(InjectionPhase::InstallBridge, 1).debug_endpoint_unreachable());
+        assert!(!failure(InjectionPhase::VerifyRequestGate, 2).debug_endpoint_unreachable());
+    }
+
+    #[test]
+    fn request_gate_degrades_only_after_sustained_unreadiness() {
+        assert!(!should_degrade_request_gate(0, None));
+        assert!(!should_degrade_request_gate(
+            REQUEST_GATE_DEGRADE_MIN_FAILURES,
+            Some(Duration::from_millis(1))
+        ));
+        assert!(!should_degrade_request_gate(
+            REQUEST_GATE_DEGRADE_MIN_FAILURES - 1,
+            Some(REQUEST_GATE_DEGRADE_AFTER * 4)
+        ));
+        // 补丁根本没注入（reinstall）时同样计入连续不就绪：否则会一路重装到
+        // deadline，并在同一 target 上反复叠加补丁会话。
+        assert!(should_degrade_request_gate(
+            REQUEST_GATE_DEGRADE_MIN_FAILURES,
+            Some(REQUEST_GATE_DEGRADE_AFTER)
+        ));
+    }
+
+    #[test]
+    fn request_gate_verify_script_marks_missing_patch_for_reinstall() {
+        let harness = r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const script = JSON.parse(process.argv[1]);
+const run = async (patch, waitMs = 40) => {
+  // 脚本在页内自轮询：vm 里补 setTimeout，并用 __codeyRequestGateWaitMs 把
+  // 等待预算压到几十毫秒，避免测试干等真实降级预算。
+  const context = vm.createContext({ window: {}, console, setTimeout });
+  context.window.__codeyRequestGateWaitMs = waitMs;
+  context.window.__codeyModelWhitelistPatch = patch;
+  // 判定以 JSON 字符串返回（Runtime.evaluate 未开 returnByValue 时对象不回传）。
+  return JSON.parse(await vm.runInContext(script, context));
+};
+(async () => {
+  // 补丁未注入：只有整轮重装能修复。
+  for (const patch of [null, undefined, {}]) {
+    const verdict = await run(patch);
+    assert.equal(verdict.ready, false);
+    assert.equal(verdict.reinstall, true);
+  }
+  const ready = await run({ ensureRequestGate: () => Promise.resolve(true) });
+  assert.equal(ready.ready, true);
+  assert.equal(ready.polls, 1);
+  // 门禁在等待窗口内就绪：页内检出即返回，不必等宿主下一轮探测。
+  let calls = 0;
+  const lateReady = await run({
+    ensureRequestGate: () => Promise.resolve(++calls >= 2),
+  }, 5_000);
+  assert.equal(lateReady.ready, true);
+  assert.equal(lateReady.polls, 2);
+  // Codex 尚未就绪：页内等满预算后交回不就绪裁决，由宿主决定重试或降级。
+  const notReady = { ensureRequestGate: () => Promise.reject(new Error("当前 Codex 暂不支持模型请求校验")) };
+  const polled = await run(notReady);
+  assert.equal(polled.ready, false);
+  assert.equal(polled.reinstall, false);
+  assert.equal(polled.message, "当前 Codex 暂不支持模型请求校验");
+  assert.ok(polled.waitedMs >= 40);
+  // 校验等待期间补丁被脚本重放替换：旧实例的失败必须按重装处理。
+  const context = vm.createContext({ window: {}, console, setTimeout });
+  context.window.__codeyRequestGateWaitMs = 40;
+  context.window.__codeyModelWhitelistPatch = {
+    ensureRequestGate: () => Promise.reject(new Error("模型请求校验已重新加载")),
+  };
+  const pending = vm.runInContext(script, context);
+  context.window.__codeyModelWhitelistPatch = { ensureRequestGate: () => Promise.resolve(true) };
+  assert.equal(JSON.parse(await pending).reinstall, true);
+})().catch((error) => { console.error(error); process.exit(1); });
+"#;
+        let output = std::process::Command::new("node")
+            .args([
+                "-e",
+                harness,
+                &serde_json::to_string(&request_gate_verify_script()).unwrap(),
+            ])
+            .output()
+            .expect("Node should run the request-gate verify script harness");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// 按给定阶段的退避节奏推导探测时刻（毫秒），首项为立即执行的第一次探测。
     fn probe_times(phase: InjectionPhase, count: usize) -> Vec<u64> {
         let mut delay = INITIAL_RETRY_INTERVAL;
@@ -1677,8 +2414,12 @@ assert.equal(nextPage.window.attempts, 1);
         stats.record_failure(InjectionPhase::VerifyOverlay, Duration::from_millis(900));
 
         assert_eq!(stats.attempts, 5);
-        assert_eq!(stats.discovery_failures, 2);
-        assert_eq!(stats.bridge_failures, 1);
+        assert_eq!(stats.discovery_failures(), 2);
+        assert_eq!(stats.bridge_failures(), 1);
+        assert_eq!(
+            stats.phase_failures[InjectionPhase::VerifyOverlay as usize],
+            1
+        );
         assert_eq!(stats.failure_expense_ms, 930);
         assert_eq!(
             stats.last_failure_phase.map(InjectionPhase::key),
@@ -1698,6 +2439,7 @@ assert.equal(nextPage.window.attempts, 1);
             (InjectionPhase::DiscoverTargets, "discoverTargets"),
             (InjectionPhase::SelectTarget, "selectTarget"),
             (InjectionPhase::InstallBridge, "installBridge"),
+            (InjectionPhase::VerifyRequestGate, "verifyRequestGate"),
             (InjectionPhase::VerifyOverlay, "verifyOverlay"),
             (InjectionPhase::ReadStatuses, "readStatuses"),
         ] {
@@ -1743,6 +2485,49 @@ assert.equal(nextPage.window.attempts, 1);
         assert_eq!(script_summary, "CDP 命令未在单次响应预算内完成");
         assert!(!script_summary.contains("secret"));
         assert!(!script_summary.contains("private"));
+    }
+
+    #[test]
+    fn injection_error_summary_names_the_cdp_protocol_failure() {
+        // installBridge 期间的协议/连接错误必须保留方法名，不再回落到
+        // 笼统的"内部注入尝试失败"。
+        let refused = anyhow::anyhow!(
+            "向 Codex renderer page-1 安装 CDP bridge 失败: CDP command Runtime.addBinding id 3 failed: {{\"code\":-32601,\"message\":\"'Runtime.addBinding' wasn't found\"}}"
+        );
+        let closed = anyhow::anyhow!(
+            "安装 Codex 模型请求校验失败: CDP websocket closed before response for Runtime.evaluate id 9"
+        );
+        let exception = anyhow::anyhow!(
+            "安装 Codex 模型请求校验失败: Runtime.evaluate raised an exception: {{\"exceptionId\":1,\"text\":\"Uncaught\",\"exception\":{{\"type\":\"object\",\"description\":\"Error: 当前 Codex 暂不支持模型请求校验\\n    at <anonymous>:1:5\"}}}}"
+        );
+
+        assert_eq!(
+            safe_injection_error_summary(&refused),
+            "CDP 命令 Runtime.addBinding 被 Codex 拒绝：'Runtime.addBinding' wasn't found"
+        );
+        assert_eq!(
+            safe_injection_error_summary(&closed),
+            "CDP 连接被 Codex 关闭（Runtime.evaluate）"
+        );
+        assert_eq!(
+            safe_injection_error_summary(&exception),
+            "模型请求校验未通过：当前 Codex 暂不支持模型请求校验"
+        );
+    }
+
+    #[test]
+    fn injection_failure_detail_keeps_the_full_bounded_error_chain() {
+        let error = anyhow::anyhow!("inner cause").context("outer context");
+        assert_eq!(
+            injection_failure_detail(&error),
+            "outer context: inner cause"
+        );
+
+        let huge = anyhow::anyhow!("x".repeat(MAX_INJECTION_DETAIL_CHARS * 2));
+        assert_eq!(
+            injection_failure_detail(&huge).chars().count(),
+            MAX_INJECTION_DETAIL_CHARS
+        );
     }
 
     #[test]
@@ -1941,7 +2726,7 @@ assert.equal(nextPage.window.attempts, 1);
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 10);
+        assert_eq!(prepared.descriptors.len(), 11);
         let user_script = prepared
             .descriptors
             .iter()

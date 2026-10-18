@@ -7,15 +7,11 @@
     padding-left: 0;
   }
 
-  .settings-page .official-account-usage-item {
-    min-width: 0;
-    flex-wrap: wrap;
-    row-gap: 3px;
-    white-space: normal;
+  .settings-page .official-account-usage-grid {
+    grid-template-columns: 1fr;
   }
 
-  .settings-page .official-account-usage-reset {
-    flex-basis: 100%;
+  .settings-page .official-account-usage-cell-foot {
     white-space: normal;
   }
 }
@@ -137,12 +133,24 @@
 }
 
 @media (max-width: 520px) {
-  .route-protocol-options {
+  .route-option-grid-row {
     grid-template-columns: 1fr;
   }
 
-  .route-option-item + .route-option-item {
+  .route-option-grid-row .route-option-col + .route-option-col {
     border-left: 0;
     border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
+  }
+
+  .route-option-item {
+    padding: 8px 10px;
+  }
+
+  .route-option-item .route-field-hint {
+    padding-left: 0;
+  }
+
+  .route-option-subpanel {
+    margin-left: 0;
   }
 }

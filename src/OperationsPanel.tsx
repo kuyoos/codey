@@ -27,7 +27,6 @@ import { Disclosure } from "@heroui/react";
 import { Badge, Button } from "./components/ui";
 import {
   buildEnabledOptimizationFeatures,
-  canRepairMainProcessInjection,
   summarizeInjectionScripts,
   type EnabledOptimizationFeature as PresentationOptimizationFeature,
 } from "./runtimeStatusPresentation";
@@ -82,13 +81,7 @@ type OperationsPanelProps = {
   onRepairPluginMarketplace: () => void;
   onPrepareComputerUse: () => void;
   computerUseNotice?: Notice | null;
-  onRepairMainProcessInjection: () => void;
-  onRepairCodexConfig?: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
-  injectionRepairing?: boolean;
-  onRestart?: () => void;
-  showRestartAction?: boolean;
-  restartStatusUnknown?: boolean;
 };
 
 function OperationsPanelComponent({
@@ -100,10 +93,7 @@ function OperationsPanelComponent({
   onRepairPluginMarketplace,
   onPrepareComputerUse,
   computerUseNotice,
-  onRepairMainProcessInjection,
   configRepairNotice,
-  injectionRepairing = false,
-  restartStatusUnknown = false,
 }: OperationsPanelProps) {
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
   const [expandedCardTitle, setExpandedCardTitle] = useState<string | null>(
@@ -142,40 +132,26 @@ function OperationsPanelComponent({
   const performanceError = maintenance?.performanceStatus === "error";
   const startupNeedsAttention = maintenance?.performanceStatus === "degraded";
   const startupInjectionMode = maintenance?.startupInjectionMode ?? "";
-  const injectionRepairAvailable = canRepairMainProcessInjection(status);
   const injectionModeCard =
     !status.running
       ? {
           label: "待启动",
           tone: "info" as const,
-          description: "Codex 启动后将在这里显示主进程补丁的注入路径。",
+          description: "Codex 启动后将在这里显示启动兼容方案的注入路径。",
         }
-      : startupInjectionMode === "node_options"
+      : startupInjectionMode === "cli"
         ? {
-            label: "--require",
+            label: "CLI 包装器",
             tone: "success" as const,
             description:
-              "主进程已通过 NODE_OPTIONS=--require 加载补丁，覆盖范围与 Inspector evaluate 相同。",
+              "CLI 包装器已确认接管 app-server 请求；页面补丁经渲染进程调试通道投递。",
           }
-        : startupInjectionMode === "inspector"
-          ? {
-              label: "Inspector",
-              tone: "success" as const,
-              description: "主进程已通过 Inspector evaluate 加载补丁。",
-            }
-          : startupInjectionMode === "cli"
-            ? {
-                label: "CLI",
-                tone: "warning" as const,
-                description:
-                  "仅 CLI 包装器确认了 app-server 参数；主进程补丁未应用。",
-              }
-            : {
-                label: "未应用",
-                tone: "warning" as const,
-                description:
-                  "本次启动未确认主进程注入方式，页面功能以检测结果为准。",
-              };
+        : {
+            label: "未确认",
+            tone: "warning" as const,
+            description:
+              "本次启动未确认 CLI 兼容入口，页面功能以检测结果为准。",
+          };
   const injectionScripts = status.injectionScripts ?? EMPTY_INJECTION_SCRIPTS;
   const enabledOptimizationFeatures = useMemo<EnabledOptimizationFeature[]>(
     () =>
@@ -581,36 +557,14 @@ function OperationsPanelComponent({
                     >
                       <div className="injection-mode-copy">
                         <div className="injection-mode-heading">
-                          <h4 id="injection-mode-title">主进程注入</h4>
+                          <h4 id="injection-mode-title">启动兼容</h4>
                           <Badge variant={injectionModeCard.tone}>
                             {injectionModeCard.label}
                           </Badge>
                         </div>
                         <p className="injection-mode-description">
-                          {injectionRepairing
-                            ? "正在退出 Codex 并修复，成功后将自动重启…"
-                            : injectionRepairAvailable
-                              ? `${injectionModeCard.description} 点击修复将退出 Codex，成功后自动重启。`
-                              : injectionModeCard.description}
+                          {injectionModeCard.description}
                         </p>
-                      </div>
-                      <div className="injection-mode-action">
-                        <Button
-                          className="injection-mode-repair"
-                          variant="outline"
-                          size="xs"
-                          disabled={isBusy || restartStatusUnknown || !injectionRepairAvailable}
-                          onClick={onRepairMainProcessInjection}
-                          aria-label="修复主进程注入"
-                          title="自动退出 Codex，修复成功后重新启动"
-                        >
-                          {injectionRepairing ? (
-                            <LoaderCircle className="animate-spin" aria-hidden="true" />
-                          ) : (
-                            <RefreshCw aria-hidden="true" />
-                          )}
-                          {injectionRepairing ? "修复中" : "修复"}
-                        </Button>
                       </div>
                     </section>
                   )}

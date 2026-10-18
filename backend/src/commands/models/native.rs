@@ -128,6 +128,7 @@ pub(crate) fn native_model_state_for_provider(
         manual_third_party_models,
         reasoning_efforts,
         Some(&requested_default),
+        &config.codex_app_path,
     )
     .map_err(|error| error.to_string())
 }

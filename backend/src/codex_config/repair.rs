@@ -232,19 +232,27 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
             subagent_roles: applied_roles,
             ..CodeyConfig::default()
         };
-        roles_repaired = reconcile_runtime_subagent_roles_at(&applied, marker)
-            .map_err(|error| {
-                safe_error(
-                    "修复运行时资源",
-                    marker,
-                    "Codey 子代理生成文件修复失败，请检查约束模板并重启 Codey",
-                    error,
-                )
-            })?
-            .repaired;
-        if reconcile_runtime_subagent_roles_at(&applied, marker)
-            .map_err(|error| safe_error("验证运行时资源", marker, "运行时资源验证失败", error))?
-            .repaired
+        roles_repaired = reconcile_runtime_subagent_roles_with_compaction(
+            &applied,
+            marker,
+            &lease.remote_compaction_models,
+        )
+        .map_err(|error| {
+            safe_error(
+                "修复运行时资源",
+                marker,
+                "Codey 子代理生成文件修复失败，请检查约束模板并重启 Codey",
+                error,
+            )
+        })?
+        .repaired;
+        if reconcile_runtime_subagent_roles_with_compaction(
+            &applied,
+            marker,
+            &lease.remote_compaction_models,
+        )
+        .map_err(|error| safe_error("验证运行时资源", marker, "运行时资源验证失败", error))?
+        .repaired
         {
             return Err(ConfigRepairFailure::new(
                 "验证运行时资源",
@@ -704,24 +712,39 @@ mod tests {
 
     #[test]
     fn config_repair_restores_generated_roles_from_active_lease() {
+        assert_config_repair_restores_role_compaction(None);
+    }
+
+    #[test]
+    fn config_repair_preserves_remote_role_compaction_without_catalog() {
+        assert_config_repair_restores_role_compaction(Some(test_runtime_router_endpoint()));
+    }
+
+    fn assert_config_repair_restores_role_compaction(local_router: Option<&RuntimeRouterEndpoint>) {
         let temp = tempfile::tempdir().unwrap();
         let (home, marker) = paths(temp.path());
         fs::create_dir_all(&home).unwrap();
         let original = "# retain user model\nmodel='user-model'\n";
         fs::write(home.join("config.toml"), original).unwrap();
+        let mut configured = crate::config::default_subagent_roles();
+        configured
+            .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
+            .unwrap()
+            .enabled = false;
         apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
                 model_contexts: None,
                 stream_max_retries: 5,
-                local_router: None,
+                local_router,
                 use_official_catalog: false,
                 default_model: None,
                 fastctx_command: None,
                 subagent_optimization: true,
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-                subagent_roles: None,
+                subagent_roles: Some(&configured),
                 marker: &marker,
                 backup_root: &temp.path().join("backups"),
             },
@@ -734,6 +757,14 @@ mod tests {
             SUBAGENT_ROLE_DEFAULT,
         );
         let original_role = fs::read(&role_path).unwrap();
+        let document = str::from_utf8(&original_role)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            document.get("model_provider").and_then(Item::as_str),
+            local_router.map(|_| local_router::ROUTER_PROVIDER_ID)
+        );
         fs::remove_file(&role_path).unwrap();
         let report = repair_at(&home, &marker, true).unwrap();
         assert!(report.repaired);
@@ -748,6 +779,18 @@ mod tests {
         assert_eq!(
             updated_lease["subagentRoles"],
             original_lease["subagentRoles"]
+        );
+        assert!(
+            updated_lease["subagentRoles"]
+                .get(crate::config::SUBAGENT_ROLE_WORKER)
+                .is_none()
+        );
+        let (policy, _) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+        let policy: serde_json::Value = serde_json::from_slice(&fs::read(policy).unwrap()).unwrap();
+        assert!(
+            policy["roles"]
+                .get(crate::config::SUBAGENT_ROLE_WORKER)
+                .is_none()
         );
         assert!(!repair_at(&home, &marker, true).unwrap().repaired);
     }

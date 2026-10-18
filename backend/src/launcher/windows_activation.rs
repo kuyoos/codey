@@ -155,6 +155,8 @@ mod tests {
         let path = directory.path().join("launch.lock");
         let lock = std::fs::File::create(&path).unwrap();
         fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        // Unix 上并发启动的子进程可能在 exec 前继承文件锁。
+        let inherited_lock = lock.try_clone().unwrap();
         let contender = std::fs::File::open(&path).unwrap();
         let (complete, activation) = oneshot::channel();
         let (reply, response) = oneshot::channel();
@@ -168,6 +170,8 @@ mod tests {
                 async { Ok(()) }
             },
             move || {
+                // 与 LaunchJournal::drop 一致，在复制的句柄仍存在时主动解锁。
+                fs2::FileExt::unlock(&lock)?;
                 drop(lock);
                 Ok(())
             },
@@ -182,6 +186,7 @@ mod tests {
         task.await.unwrap().unwrap();
         assert!(!alive.load(Ordering::Acquire));
         fs2::FileExt::try_lock_exclusive(&contender).unwrap();
+        drop(inherited_lock);
     }
 
     #[tokio::test(start_paused = true)]

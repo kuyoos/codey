@@ -42,8 +42,8 @@ pub async fn save_default_model(
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
+    let hot_reload = ModelHotReloadOutcome::queued(state, false);
     drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(hot_reload.add_to_response(json!({
         "status":"ok",
@@ -65,6 +65,7 @@ pub struct OfficialRouteModelSave {
     pub account_id: Option<String>,
     pub route_name: Option<String>,
     pub route_short_name: Option<String>,
+    pub max_concurrency: Option<u32>,
 }
 
 pub async fn save_official_route_models(
@@ -82,6 +83,7 @@ pub async fn save_official_route_models(
         account_id,
         route_name,
         route_short_name,
+        max_concurrency: requested_max_concurrency,
     } = input;
     let normalized_base_url = match requested_base_url.as_deref() {
         Some(base_url) => Some(crate::codex_provider::normalize_official_gateway_base_url(
@@ -93,7 +95,8 @@ pub async fn save_official_route_models(
     validate_requested_model_list_bounds("官方模型", &requested_models)?;
     let _config_write_guard = state.config_write_lock.lock().await;
     timings.mark("validationAndLockMs");
-    let mut config = state.config.read().await.clone();
+    let previous = state.config.read().await.clone();
+    let mut config = previous.clone();
     ensure_local_route_config_writable(&config)?;
     let route_id = route_id.trim();
     let profile_index = config
@@ -106,8 +109,21 @@ pub async fn save_official_route_models(
         return Err("当前线路不是本次登录可用的官方账号线路".to_string());
     }
     let provider_id = profile.provider_id().to_string();
+    let route_account_id = profile.official_account_id.clone();
+    let account_id = account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty());
+    if let Some(account_id) = account_id
+        && route_account_id.as_deref() != Some(account_id)
+    {
+        return Err("官方账号与要保存的线路不匹配".to_string());
+    }
     if let Some(enabled) = requested_enabled {
         config.profiles[profile_index].enabled = enabled;
+    }
+    if let Some(max_concurrency) = requested_max_concurrency {
+        config.profiles[profile_index].max_concurrency = max_concurrency;
     }
     // 参数缺席表示保持现状；空字符串表示清除代理。地址合法性由配置校验把关。
     let mut mirrored_proxy: Option<String> = None;
@@ -163,48 +179,52 @@ pub async fn save_official_route_models(
             );
         }
     };
-    // 官方线路在每次启动准备时按账号记录重新派生，因此代理还要写回该线路自己
-    // 的账号记录，否则重启后会被派生结果覆盖。失败只降级为提示，不影响已经
-    // 生效的配置。
-    let mut account_override_warning: Option<String> = None;
-    let route_account_id = config
-        .profiles
-        .iter()
-        .find(|profile| profile.id == route_id)
-        .and_then(|profile| profile.official_account_id.clone());
+    // 派生线路的运行设置同时写入账号记录。配置锁贯穿提交与回滚，防止失败
+    // 时恢复旧配置覆盖另一次保存；账号更新只合并指定字段，不覆盖新凭据。
     let mut saved_account_id = None;
-    if let Some(account_id) = account_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|account_id| !account_id.is_empty())
-    {
-        match write_official_account_route_settings(
+    let account_save = if let Some(account_id) = account_id {
+        write_official_account_route_settings(
             state,
             account_id.to_string(),
             route_name.unwrap_or_default(),
             route_short_name.unwrap_or_default(),
             requested_upstream_proxy.clone().unwrap_or_default(),
             requested_base_url.clone().unwrap_or_default(),
+            requested_max_concurrency,
         )
         .await
-        {
-            Ok(account_id) => saved_account_id = Some(account_id),
-            Err(error) => return Err(error),
-        }
-    } else if let Some(upstream_proxy) = mirrored_proxy
+        .map(|account_id| saved_account_id = Some(account_id))
+    } else if (mirrored_proxy.is_some()
+        || normalized_base_url.is_some()
+        || requested_max_concurrency.is_some())
         && let Some(account_id) = route_account_id
-        && let Err(error) = persist_official_account_proxy(state, account_id, upstream_proxy).await
     {
-        account_override_warning = Some(format!("线路代理未能写入官方账号记录：{error}"));
+        persist_official_account_runtime_settings(
+            state,
+            account_id,
+            mirrored_proxy,
+            normalized_base_url,
+            requested_max_concurrency,
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    if let Err(error) = account_save {
+        let error = match save_config_to_store(state, previous).await {
+            Ok(_) => error,
+            Err(rollback_error) => format!("{error}；恢复保存前配置失败：{rollback_error}"),
+        };
+        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
     *state.config.write().await = config.clone();
+    let queued_hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(_config_write_guard);
     timings.mark("saveConfigMs");
-    let (mut response, subagent_hot_reload) = if saved_account_id.is_some() {
+    let (response, subagent_hot_reload) = if saved_account_id.is_some() {
         let refresh = refresh_official_route_after_account_change(state).await?;
         timings.mark("modelDeliveryMs");
-        let config = state.config.read().await.clone();
-        let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+        let subagent_hot_reload = SubagentHotReloadOutcome::default();
         timings.mark("subagentReloadMs");
         let mut response = refresh;
         if let Some(object) = response.as_object_mut() {
@@ -216,9 +236,9 @@ pub async fn save_official_route_models(
         }
         (response, subagent_hot_reload)
     } else {
-        let hot_reload = hot_reload_runtime_models(state).await;
+        let hot_reload = queued_hot_reload;
         timings.mark("modelDeliveryMs");
-        let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+        let subagent_hot_reload = SubagentHotReloadOutcome::default();
         timings.mark("subagentReloadMs");
         let restart_required = runtime_config_requires_restart(state, &config).await;
         (
@@ -232,11 +252,6 @@ pub async fn save_official_route_models(
             subagent_hot_reload,
         )
     };
-    if let Some(warning) = account_override_warning
-        && let Some(object) = response.as_object_mut()
-    {
-        object.insert("warning".to_string(), Value::String(warning));
-    }
     Ok(add_subagent_hot_reload_to_response(
         response,
         subagent_hot_reload,
@@ -274,31 +289,20 @@ pub(crate) fn ordered_official_selection(
     Ok(selected)
 }
 
-/// Keeps the official-account store in step with the proxy edited on the
-/// official route card.
-async fn persist_official_account_proxy(
+/// 模型设置命令未携带完整账号表单时，只合并明确提供的线路运行设置。
+async fn persist_official_account_runtime_settings(
     state: &Arc<AppState>,
     account_id: String,
-    upstream_proxy: String,
+    upstream_proxy: Option<String>,
+    base_url: Option<Option<String>>,
+    max_concurrency: Option<u32>,
 ) -> Result<(), String> {
     let store = state.official_accounts();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let Some(record) = store.get(&account_id)? else {
-            return Ok(());
-        };
-        let upstream_proxy = upstream_proxy.trim();
-        let upstream_proxy = (!upstream_proxy.is_empty()).then(|| upstream_proxy.to_string());
-        store.update_route_settings(
-            &record.id,
-            record.route_name.clone(),
-            record.route_short_name.clone(),
-            upstream_proxy,
-            record.base_url.clone(),
-        )?;
-        Ok(())
+        store.update_route_runtime_settings(&account_id, upstream_proxy, base_url, max_concurrency)
     })
     .await
-    .map_err(|error| format!("保存官方账号线路代理任务异常退出：{error}"))?
+    .map_err(|error| format!("保存官方账号线路运行设置任务异常退出：{error}"))?
     .map_err(|error| format!("{error:#}"))
 }
 
@@ -353,6 +357,7 @@ pub(crate) fn current_model_state_at(
             .unwrap_or_default(),
         Some(&reasoning_efforts),
         requested_default_model.as_deref(),
+        &config.codex_app_path,
     )
     .map_err(|error| error.to_string())
 }

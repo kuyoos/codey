@@ -13,10 +13,9 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, client_platform,
-    config_requires_restart_with_route_status, make_bridge_handler,
-    prepare_routes_for_current_launch, provider_route_restart_required_for_runtime,
-    sync_provider_models_for_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart_with_route_status,
+    current_update_platform, make_bridge_handler, prepare_routes_for_current_launch,
+    provider_route_restart_required_for_runtime, sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
@@ -26,6 +25,27 @@ use crate::launcher::{
 
 const CODEX_APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30);
 
+fn remote_compaction_status_value(
+    config: &crate::config::CodeyConfig,
+    applied: Option<&crate::config::CodeyConfig>,
+) -> Value {
+    let configured = config.local_router_enabled && config.runtime_supports_remote_compaction();
+    let active = applied
+        .filter(|applied| applied.local_router_enabled)
+        .map(|applied| applied.runtime_supports_remote_compaction());
+    json!({
+        "configured": configured,
+        "active": active,
+        "configuredMode": if config.local_router_enabled { config.remote_compaction_mode() } else { "local" },
+        "activeMode": applied.filter(|applied| applied.local_router_enabled).map(|applied| applied.remote_compaction_mode()),
+        "restartRequired": applied.is_some_and(|applied| {
+            applied.local_router_enabled != config.local_router_enabled
+                || super::models::remote_compaction_transport_requires_restart(applied, config)
+        }),
+        "blockingRoutes": config.remote_compaction_blockers(),
+    })
+}
+
 mod injection_repair;
 pub(super) use injection_repair::schedule_main_process_injection_repair;
 
@@ -33,8 +53,9 @@ pub(super) struct CodexAppVersionCache {
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
     version: String,
-    lookup_started_at: Instant,
-    checked_at: Instant,
+    checked_at: Option<Instant>,
+    generation: u64,
+    refreshing: bool,
 }
 
 fn runtime_feature_status_value(
@@ -116,6 +137,10 @@ pub(super) async fn runtime_status_with_options(
         .as_ref()
         .is_some_and(|runtime| runtime.applied_config.subagent_optimization);
     let configured_notification_channel_count = config.webhook.enabled_channel_count();
+    let remote_compaction = remote_compaction_status_value(
+        &config,
+        runtime.as_ref().map(|runtime| &runtime.applied_config),
+    );
     let trace_log_write_protection_active = state
         .trace_log_write_protection_active
         .load(Ordering::Acquire);
@@ -133,6 +158,7 @@ pub(super) async fn runtime_status_with_options(
         0
     };
     let mut status = json!({
+        "configApply": super::config_apply::status(state),
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "clientPlatform": client_platform(),
@@ -141,6 +167,7 @@ pub(super) async fn runtime_status_with_options(
         "officialAccountAvailable": official_account_available,
         "officialAccountStatus": official_account_status,
         "restartRequired": restart_required,
+        "remoteCompaction": remote_compaction,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
     });
     if let (Some(status), Some(feature_status)) = (
@@ -193,61 +220,96 @@ pub(super) async fn runtime_status_with_options(
 }
 
 async fn codex_app_version_for_status(
-    state: &AppState,
+    state: &Arc<AppState>,
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
 ) -> String {
-    let lookup_started_at = Instant::now();
+    cached_codex_app_version(
+        state,
+        runtime_app_path,
+        configured_app_path,
+        Arc::new(|runtime_path: Option<PathBuf>, configured_path: String| {
+            error_log::refresh_codex_app_version(runtime_path.as_deref(), Some(&configured_path))
+                .unwrap_or_default()
+        }),
+    )
+    .await
+}
+
+type VersionLookup = dyn Fn(Option<PathBuf>, String) -> String + Send + Sync;
+
+async fn cached_codex_app_version(
+    state: &Arc<AppState>,
+    runtime_app_path: Option<PathBuf>,
+    configured_app_path: String,
+    lookup: Arc<VersionLookup>,
+) -> String {
+    let mut cache = state.codex_app_version_cache.lock().await;
+    let cached = cache.get_or_insert_with(|| CodexAppVersionCache {
+        runtime_app_path: runtime_app_path.clone(),
+        configured_app_path: configured_app_path.clone(),
+        version: String::new(),
+        checked_at: None,
+        generation: 0,
+        refreshing: false,
+    });
+    if cached.runtime_app_path != runtime_app_path
+        || cached.configured_app_path != configured_app_path
     {
-        let cache = state.codex_app_version_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.runtime_app_path == runtime_app_path
-            && cached.configured_app_path == configured_app_path
-            && lookup_started_at.saturating_duration_since(cached.checked_at)
-                < CODEX_APP_VERSION_CACHE_TTL
-        {
-            return cached.version.clone();
+        cached.runtime_app_path = runtime_app_path;
+        cached.configured_app_path = configured_app_path;
+        cached.version.clear();
+        cached.checked_at = None;
+        cached.generation = cached.generation.wrapping_add(1);
+    }
+    if !cached.refreshing
+        && cached
+            .checked_at
+            .is_none_or(|checked| checked.elapsed() >= CODEX_APP_VERSION_CACHE_TTL)
+        && !state.is_shutting_down()
+    {
+        cached.refreshing = true;
+        tokio::spawn(refresh_codex_app_version_cache(Arc::clone(state), lookup));
+    }
+    cached.version.clone()
+}
+
+async fn refresh_codex_app_version_cache(state: Arc<AppState>, lookup: Arc<VersionLookup>) {
+    // 一个后台任务串行探测；路径连续变化时只保留最新请求，避免慢卷扫描堆积。
+    loop {
+        let (runtime_path, configured_path, generation) = {
+            let mut cache = state.codex_app_version_cache.lock().await;
+            let Some(cached) = cache.as_mut() else { return };
+            if state.is_shutting_down() {
+                cached.refreshing = false;
+                return;
+            }
+            (
+                cached.runtime_app_path.clone(),
+                cached.configured_app_path.clone(),
+                cached.generation,
+            )
+        };
+        let lookup = Arc::clone(&lookup);
+        let shutdown_state = Arc::clone(&state);
+        let version = tokio::task::spawn_blocking(move || {
+            if shutdown_state.is_shutting_down() {
+                return String::new();
+            }
+            lookup(runtime_path, configured_path)
+        })
+        .await
+        .unwrap_or_default();
+        let mut cache = state.codex_app_version_cache.lock().await;
+        let Some(cached) = cache.as_mut() else { return };
+        if cached.generation == generation {
+            cached.version = version;
+            // 未找到版本或任务失败也缓存，避免状态轮询反复扫描磁盘。
+            cached.checked_at = Some(Instant::now());
+            cached.refreshing = false;
+            return;
         }
     }
-
-    // App bundle discovery performs blocking filesystem work. Do not keep the
-    // async cache mutex locked while it runs: concurrent status requests should
-    // remain independent even when the application lives on a slow volume.
-    let checked_runtime_app_path = runtime_app_path.clone();
-    let checked_configured_app_path = configured_app_path.clone();
-    let version = tokio::task::spawn_blocking(move || {
-        error_log::refresh_codex_app_version(
-            checked_runtime_app_path.as_deref(),
-            Some(&checked_configured_app_path),
-        )
-        .unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default();
-
-    let mut cache = state.codex_app_version_cache.lock().await;
-    if let Some(cached) = cache.as_ref()
-        && cached.runtime_app_path == runtime_app_path
-        && cached.configured_app_path == configured_app_path
-        && cached.lookup_started_at >= lookup_started_at
-    {
-        // Another request completed the same lookup while this one was doing
-        // filesystem work. Reuse the newer result instead of replacing it.
-        return cached.version.clone();
-    }
-    if cache
-        .as_ref()
-        .is_none_or(|cached| cached.lookup_started_at < lookup_started_at)
-    {
-        *cache = Some(CodexAppVersionCache {
-            runtime_app_path,
-            configured_app_path,
-            version: version.clone(),
-            lookup_started_at,
-            checked_at: Instant::now(),
-        });
-    }
-    version
 }
 
 fn ensure_runtime_can_start(state: &AppState) -> Result<(), String> {
@@ -359,6 +421,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> anyhow::Result<Valu
         &config,
         handler,
         &state.trace_log_write_protection_active,
+        state.trace_log_guard_state.clone(),
         state.crashpad_pending_stats.clone(),
         Arc::clone(&state.account_usage_cache),
     )
@@ -390,6 +453,8 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> anyhow::Result<Valu
         codex_exit,
         runtime_generation,
     ));
+    *state.startup_error.write().await = None;
+    super::config_apply::confirm_launch(state, &config).await;
     Ok(json!({"status":"running"}))
 }
 
@@ -629,6 +694,9 @@ pub async fn begin_shutdown(state: &Arc<AppState>) {
 }
 
 #[cfg(test)]
+mod version_cache_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, atomic::Ordering};
     use std::time::Duration;
@@ -641,6 +709,48 @@ mod tests {
     };
     use crate::commands::{AppShutdownReason, AppState};
     use crate::config::{CodeyConfig, ProviderProfile};
+
+    #[test]
+    fn remote_compaction_status_separates_saved_and_running_capabilities() {
+        use super::remote_compaction_status_value;
+        use serde_json::json;
+
+        let mut route = ProviderProfile::new("Relay");
+        route.id = "relay".into();
+        route.base_url = "https://relay.example/v1".into();
+        let local = CodeyConfig {
+            local_router_enabled: true,
+            profiles: vec![route],
+            ..CodeyConfig::default()
+        };
+        let mut remote = local.clone();
+        remote.profiles[0].supports_remote_compaction = true;
+        let mut unmanaged = remote.clone();
+        unmanaged.local_router_enabled = false;
+        for (saved, applied, configured, active, restart) in [
+            (&remote, None, true, json!(null), false),
+            // 统一 Provider 后，线路原生压缩能力变化由网关热切换，不再要求重启。
+            (&remote, Some(&local), true, json!(false), false),
+            (&local, Some(&remote), false, json!(true), false),
+            (&remote, Some(&remote), true, json!(true), false),
+            (&local, Some(&local), false, json!(false), false),
+            (&unmanaged, Some(&remote), false, json!(true), true),
+            (&remote, Some(&unmanaged), true, json!(null), true),
+            (&unmanaged, Some(&unmanaged), false, json!(null), false),
+        ] {
+            let value = remote_compaction_status_value(saved, applied);
+            assert_eq!(value["configured"], configured);
+            assert_eq!(value["active"], active);
+            assert_eq!(value["restartRequired"], restart);
+        }
+        let value = remote_compaction_status_value(&local, Some(&remote));
+        assert_eq!(
+            value["blockingRoutes"],
+            json!([{
+                "routeId": "relay", "routeName": "Relay", "reason": "未开启远程压缩"
+            }])
+        );
+    }
 
     #[test]
     fn runtime_feature_status_has_a_stable_public_json_contract() {

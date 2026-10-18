@@ -19,7 +19,7 @@ test("user FastCtx blocks embedded tools across the backend and settings", async
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/App.types.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
-    readFile(new URL("backend/src/config.rs", root), "utf8"),
+    readFile(new URL("backend/src/config/types.rs", root), "utf8"),
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/commands/runtime.rs", root), "utf8"),
     loadTypeScriptModule(new URL("src/runtimeStatusPresentation.ts", root)),

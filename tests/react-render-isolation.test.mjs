@@ -35,6 +35,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(notice, /export const NoticeToast = memo\(/);
   assert.match(confirmation, /useSyncExternalStore\(/);
   assert.match(confirmation, /export const ConfirmationDialogHost = memo\(/);
+  assert.doesNotMatch(app, /async function checkForUpdates\(/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onAnalyzeDiagnosticStorage=\{handleAnalyzeDiagnosticStorage\}/);
   assert.match(app, /onToggleDraftModel=\{toggleDraftModel\}/);
@@ -63,7 +64,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /OpenAI Chat Completions/);
   assert.match(sections, /Anthropic Messages/);
   assert.doesNotMatch(sections, /route-auth-mode-label/);
-  assert.equal(sections.match(/<Select\s/g)?.length, 2);
+  assert.equal(sections.match(/<Select\s/g)?.length, 3);
   assert.equal(sections.match(/<ModelCombobox\s/g)?.length, 2);
   assert.doesNotMatch(sections, /<select/);
   assert.match(sections, /visibleProfiles\.map\(\(profile\) =>/);
@@ -74,8 +75,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /checked=\{config\.localRouterEnabled\}/);
   assert.match(sections, /const routeConfigReadOnly = !config\.localRouterEnabled/);
   assert.match(sections, /checked=\{checked\}/);
-  assert.match(sections, /<OfficialAccountsPanel\s/);
-  assert.doesNotMatch(sections, /isOfficial && [^\n]*<OfficialAccountsPanel/);
+  assert.doesNotMatch(sections, /<OfficialAccountsPanel/);
   assert.doesNotMatch(sections, /provider-model-usage-toggle/);
   assert.match(sections, /<DialogTitle>/);
   assert.match(sections, /config\.localRouterEnabled && \(/);

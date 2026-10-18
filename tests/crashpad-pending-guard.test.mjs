@@ -18,7 +18,7 @@ test("Crashpad pending protection is bounded, allowlisted, and surfaced with Tra
       new URL("../backend/src/crashpad_pending_guard.rs", import.meta.url),
       "utf8",
     ),
-    readFile(new URL("../backend/src/config.rs", import.meta.url), "utf8"),
+    readFile(new URL("../backend/src/config/types.rs", import.meta.url), "utf8"),
     readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8"),
     readFile(new URL("../backend/src/commands.rs", import.meta.url), "utf8"),
     readFile(

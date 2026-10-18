@@ -42,6 +42,20 @@ enum MouseButtonKind: String {
     }
 }
 
+// Injectable delivery keeps failure-path tests from posting input to the desktop.
+struct InputEventDelivery {
+    var mouseEvent: (CGEventSource?, CGEventType, CGPoint, CGMouseButton) -> CGEvent? = {
+        CGEvent(mouseEventSource: $0, mouseType: $1, mouseCursorPosition: $2, mouseButton: $3)
+    }
+    var keyboardEvent: (CGKeyCode, Bool) -> CGEvent? = {
+        CGEvent(keyboardEventSource: nil, virtualKey: $0, keyDown: $1)
+    }
+    var post: (CGEvent, pid_t?) -> Void = { event, pid in
+        if let pid { event.postToPid(pid) } else { event.post(tap: .cghidEventTap) }
+    }
+    var pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+}
+
 enum InputSimulation {
     static let maxKeyboardUnicodeChunkLength = 64
 
@@ -55,27 +69,29 @@ enum InputSimulation {
         Thread.sleep(forTimeInterval: 0.25)
     }
 
-    static func clickGlobally(at point: CGPoint, button: MouseButtonKind, clickCount: Int) throws {
+    static func clickGlobally(at point: CGPoint, button: MouseButtonKind, clickCount: Int, delivery: InputEventDelivery = InputEventDelivery()) throws {
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw ComputerUseError.message("Failed to create HID event source.")
         }
 
         for _ in 0..<max(clickCount, 1) {
-            try postMouseEvent(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount)
-            try postMouseEvent(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount)
-            try postMouseEvent(type: button.upEvent, source: source, point: point, button: button.cgButton, clickState: clickCount)
+            try postMouseEvent(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, delivery: delivery)
+            let release = try makeMouseEvent(type: button.upEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, delivery: delivery)
+            try postMouseEvent(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, delivery: delivery)
+            postMouseEvent(release, pid: nil, delivery: delivery)
         }
     }
 
-    static func clickTargeted(at point: CGPoint, button: MouseButtonKind, clickCount: Int, pid: pid_t) throws {
+    static func clickTargeted(at point: CGPoint, button: MouseButtonKind, clickCount: Int, pid: pid_t, delivery: InputEventDelivery = InputEventDelivery()) throws {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             throw ComputerUseError.message("Failed to create app-post event source.")
         }
 
         for _ in 0..<max(clickCount, 1) {
-            try postMouseEventToPid(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
-            try postMouseEventToPid(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
-            try postMouseEventToPid(type: button.upEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
+            try postMouseEventToPid(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid, delivery: delivery)
+            let release = try makeMouseEvent(type: button.upEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, delivery: delivery)
+            try postMouseEventToPid(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid, delivery: delivery)
+            postMouseEvent(release, pid: pid, delivery: delivery)
         }
     }
 
@@ -119,13 +135,15 @@ enum InputSimulation {
         Thread.sleep(forTimeInterval: 0.1)
     }
 
-    static func dragTargeted(from start: CGPoint, to end: CGPoint, pid: pid_t) throws {
+    static func dragTargeted(from start: CGPoint, to end: CGPoint, pid: pid_t, delivery: InputEventDelivery = InputEventDelivery()) throws {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             throw ComputerUseError.message("Failed to create targeted event source.")
         }
 
-        try postMouseEventToPid(type: .mouseMoved, source: source, point: start, button: .left, clickState: 1, pid: pid)
-        try postMouseEventToPid(type: .leftMouseDown, source: source, point: start, button: .left, clickState: 1, pid: pid)
+        try postMouseEventToPid(type: .mouseMoved, source: source, point: start, button: .left, clickState: 1, pid: pid, delivery: delivery)
+        let release = try makeMouseEvent(type: .leftMouseUp, source: source, point: start, button: .left, clickState: 1, delivery: delivery)
+        try postMouseEventToPid(type: .leftMouseDown, source: source, point: start, button: .left, clickState: 1, pid: pid, delivery: delivery)
+        defer { postMouseEvent(release, pid: pid, delivery: delivery) }
 
         for step in 1...10 {
             let progress = CGFloat(step) / 10
@@ -133,21 +151,22 @@ enum InputSimulation {
                 x: start.x + ((end.x - start.x) * progress),
                 y: start.y + ((end.y - start.y) * progress)
             )
-            try postMouseEventToPid(type: .leftMouseDragged, source: source, point: point, button: .left, clickState: 1, pid: pid)
+            try postMouseEventToPid(type: .leftMouseDragged, source: source, point: point, button: .left, clickState: 1, pid: pid, delivery: delivery)
+            release.location = point
         }
-
-        try postMouseEventToPid(type: .leftMouseUp, source: source, point: end, button: .left, clickState: 1, pid: pid)
     }
 
-    static func dragGlobally(from start: CGPoint, to end: CGPoint) throws {
+    static func dragGlobally(from start: CGPoint, to end: CGPoint, delivery: InputEventDelivery = InputEventDelivery()) throws {
         // A nil (default) event source posted to the HID tap, with per-step deltas and
         // no timestamp override. This is what lets macOS recognize the synthetic
         // sequence as a real window-server drag on current releases.
         let gesture = dragGestureEventNumber()
-        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1)
-        try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
+        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1, delivery: delivery)
+        let release = try makeMouseEvent(type: .leftMouseUp, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, delivery: delivery)
+        try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, delivery: delivery)
+        defer { postMouseEvent(release, pid: nil, delivery: delivery) }
         // Clear the OS drag threshold before motion, or the gesture reads as a click.
-        Thread.sleep(forTimeInterval: 0.05)
+        delivery.pause(0.05)
 
         var previous = start
         let steps = dragStepCount(from: start, to: end)
@@ -158,11 +177,10 @@ enum InputSimulation {
                 y: start.y + ((end.y - start.y) * progress)
             )
             let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
-            try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture)
+            try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture, delivery: delivery)
             previous = point
+            release.location = point
         }
-
-        try postMouseEvent(type: .leftMouseUp, source: nil, point: end, button: .left, clickState: 1, eventNumber: gesture)
     }
 
     static func typeText(_ text: String, pid: pid_t) throws {
@@ -210,52 +228,63 @@ enum InputSimulation {
         return chunks
     }
 
-    static func pressKey(_ specification: String, pid: pid_t) throws {
+    static func pressKey(_ specification: String, pid: pid_t, delivery: InputEventDelivery = InputEventDelivery()) throws {
         let parsed = try KeyPressParser.parse(specification)
         var activeFlags: CGEventFlags = []
+        var events: [CGEvent] = []
 
         for modifier in parsed.modifiers {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: true) else {
+            guard let event = delivery.keyboardEvent(modifier.keyCode, true) else {
                 throw ComputerUseError.message("Failed to create modifier key down event.")
             }
 
             activeFlags.insert(modifier.flag)
             event.flags = activeFlags
-            event.postToPid(pid)
+            events.append(event)
         }
 
-        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: false) else {
+        guard let keyDown = delivery.keyboardEvent(parsed.keyCode, true),
+              let keyUp = delivery.keyboardEvent(parsed.keyCode, false) else {
             throw ComputerUseError.message("Failed to create key event.")
         }
 
         keyDown.flags = activeFlags
         keyUp.flags = activeFlags
-        keyDown.postToPid(pid)
-        keyUp.postToPid(pid)
+        events.append(contentsOf: [keyDown, keyUp])
 
         for modifier in parsed.modifiers.reversed() {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: false) else {
+            guard let event = delivery.keyboardEvent(modifier.keyCode, false) else {
                 throw ComputerUseError.message("Failed to create modifier key up event.")
             }
 
             event.flags = activeFlags
-            event.postToPid(pid)
+            events.append(event)
             activeFlags.remove(modifier.flag)
         }
 
-        Thread.sleep(forTimeInterval: 0.1)
+        // Prepare every matching release before sending any key down event.
+        for event in events { delivery.post(event, pid) }
+        delivery.pause(0.1)
     }
 
-    private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil) throws {
-        guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
+    private static func makeMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, delivery: InputEventDelivery) throws -> CGEvent {
+        guard let event = delivery.mouseEvent(source, type, point, button) else {
             throw ComputerUseError.message("Failed to create mouse event \(type.rawValue).")
         }
 
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         applyDragMotionFields(to: event, delta: delta, eventNumber: eventNumber)
-        event.post(tap: .cghidEventTap)
-        Thread.sleep(forTimeInterval: 0.03)
+        return event
+    }
+
+    private static func postMouseEvent(_ event: CGEvent, pid: pid_t?, delivery: InputEventDelivery) {
+        delivery.post(event, pid)
+        delivery.pause(0.03)
+    }
+
+    private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, delivery: InputEventDelivery) throws {
+        let event = try makeMouseEvent(type: type, source: source, point: point, button: button, clickState: clickState, delta: delta, eventNumber: eventNumber, delivery: delivery)
+        postMouseEvent(event, pid: nil, delivery: delivery)
     }
 
     /// A synthetic macOS drag registers only when each dragged event carries the
@@ -300,14 +329,9 @@ enum InputSimulation {
         return min(max(Int((distance / 4).rounded(.up)), 10), 60)
     }
 
-    private static func postMouseEventToPid(type: CGEventType, source: CGEventSource, point: CGPoint, button: CGMouseButton, clickState: Int, pid: pid_t) throws {
-        guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
-            throw ComputerUseError.message("Failed to create mouse event \(type.rawValue).")
-        }
-
-        event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
-        event.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.03)
+    private static func postMouseEventToPid(type: CGEventType, source: CGEventSource, point: CGPoint, button: CGMouseButton, clickState: Int, pid: pid_t, delivery: InputEventDelivery) throws {
+        let event = try makeMouseEvent(type: type, source: source, point: point, button: button, clickState: clickState, delivery: delivery)
+        postMouseEvent(event, pid: pid, delivery: delivery)
     }
 
     private static func raiseAppWindowViaAccessibility(pid: pid_t) -> Bool {

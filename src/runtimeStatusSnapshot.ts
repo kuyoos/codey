@@ -1,4 +1,5 @@
 import type { RuntimeStatus } from "./App.types";
+import { reconcileConfigApply } from "./configApply";
 
 function valuesEqual(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
@@ -43,6 +44,12 @@ export function reconcileRuntimeStatus(
   if (valuesEqual(current, next)) return current;
 
   const reconciled = { ...next };
+  const configApply = reconcileConfigApply(current.configApply, next.configApply);
+  if (configApply !== undefined) reconciled.configApply = configApply;
+  if (current.configApply && next.configApply && (next.configApply.revision < current.configApply.revision ||
+    (next.configApply.revision === current.configApply.revision && current.configApply.state !== "pending" && next.configApply.state === "pending"))) {
+    reconciled.restartRequired = current.restartRequired;
+  }
   if (next.maintenance !== undefined) {
     reconciled.maintenance = reuseEqualValue(
       current.maintenance,

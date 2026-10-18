@@ -293,7 +293,13 @@ impl SharedUpstream {
                     }
                 };
                 let source = source.unwrap_or_else(|| Box::new(std::io::stdin()));
-                let upstream = shared::start(server_stdin, server_stdout, source, local_router);
+                let upstream = shared::start(
+                    server_stdin,
+                    server_stdout,
+                    source,
+                    local_router,
+                    home.clone(),
+                );
                 runtime.block_on(serve_shared(home, http_port, overrides, upstream));
             });
         if let Err(error) = spawned {

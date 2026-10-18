@@ -5,8 +5,30 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+
+// Metadata normally appears at the start of a rollout. Bound malformed histories
+// without limiting the size of a valid session after its metadata was found.
+const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ROLLOUT_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ROLLOUT_SCAN_BYTES: usize = 512 * 1024 * 1024;
+const MAX_ROLLOUT_SCAN_ENTRIES: usize = 250_000;
+const MAX_ROLLOUT_SCAN_DEPTH: usize = 64;
+
+struct RolloutScanBudget {
+    remaining_entries: usize,
+    remaining_bytes: usize,
+}
+
+impl Default for RolloutScanBudget {
+    fn default() -> Self {
+        Self {
+            remaining_entries: MAX_ROLLOUT_SCAN_ENTRIES,
+            remaining_bytes: MAX_ROLLOUT_SCAN_BYTES,
+        }
+    }
+}
 
 pub fn delete_local_from_paths(
     db_paths: impl IntoIterator<Item = PathBuf>,
@@ -449,8 +471,16 @@ fn codex_thread_rollout_paths(
     {
         let mut discovered = Vec::new();
         let mut discovered_set = HashSet::new();
+        let mut budget = RolloutScanBudget::default();
         for root in [home.join("sessions"), home.join("archived_sessions")] {
-            collect_matching_rollout_paths(&root, thread_id, &mut discovered, &mut discovered_set)?;
+            collect_matching_rollout_paths(
+                &root,
+                thread_id,
+                &mut discovered,
+                &mut discovered_set,
+                &mut budget,
+                0,
+            )?;
         }
         entry.insert(discovered);
     }
@@ -471,7 +501,15 @@ fn collect_matching_rollout_paths(
     thread_id: &str,
     paths: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
+    budget: &mut RolloutScanBudget,
+    depth: usize,
 ) -> anyhow::Result<()> {
+    if depth > MAX_ROLLOUT_SCAN_DEPTH {
+        anyhow::bail!(
+            "rollout scan incomplete: directory depth limit exceeded at {}",
+            root.display()
+        );
+    }
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -483,13 +521,16 @@ fn collect_matching_rollout_paths(
     let entries = fs::read_dir(root)?;
     for entry in entries {
         let entry = entry?;
+        budget.remaining_entries = budget.remaining_entries.checked_sub(1).ok_or_else(|| {
+            anyhow::anyhow!("rollout scan incomplete: directory entry limit exceeded")
+        })?;
         let file_type = entry.file_type()?;
         let path = entry.path();
         if file_type.is_dir() {
-            collect_matching_rollout_paths(&path, thread_id, paths, seen)?;
+            collect_matching_rollout_paths(&path, thread_id, paths, seen, budget, depth + 1)?;
         } else if file_type.is_file()
             && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-            && rollout_matches_thread_id(&path, thread_id)?
+            && rollout_matches_thread_id(&path, thread_id, budget)?
         {
             add_rollout_path(paths, seen, path);
         }
@@ -497,10 +538,37 @@ fn collect_matching_rollout_paths(
     Ok(())
 }
 
-fn rollout_matches_thread_id(path: &Path, thread_id: &str) -> anyhow::Result<bool> {
-    for line in BufReader::new(File::open(path)?).lines() {
-        let line = line?;
-        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+fn rollout_matches_thread_id(
+    path: &Path,
+    thread_id: &str,
+    budget: &mut RolloutScanBudget,
+) -> anyhow::Result<bool> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    let mut remaining_file_bytes = MAX_ROLLOUT_METADATA_BYTES;
+    loop {
+        line.clear();
+        let limit = MAX_ROLLOUT_LINE_BYTES
+            .min(remaining_file_bytes)
+            .min(budget.remaining_bytes);
+        // Read one extra byte to distinguish EOF at the limit from an incomplete scan.
+        let count = reader
+            .by_ref()
+            .take((limit + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if count == 0 {
+            return Ok(false);
+        }
+        if count > limit {
+            anyhow::bail!(
+                "rollout scan incomplete: metadata byte limit exceeded at {}",
+                path.display()
+            );
+        }
+        remaining_file_bytes -= count;
+        budget.remaining_bytes -= count;
+        let line = std::str::from_utf8(&line)?;
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let Some(metadata) = event
@@ -513,7 +581,6 @@ fn rollout_matches_thread_id(path: &Path, thread_id: &str) -> anyhow::Result<boo
             .iter()
             .any(|key| metadata.get(*key).and_then(Value::as_str) == Some(thread_id)));
     }
-    Ok(false)
 }
 
 fn sql_value_to_json(value: ValueRef<'_>) -> Value {
@@ -532,6 +599,102 @@ fn sql_value_to_json(value: ValueRef<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_rollout_line_keeps_database_rows_and_discovery_uncached() {
+        let home = tempfile::tempdir().unwrap();
+        let path = rollout(home.path(), "oversized.jsonl", "thread");
+        File::create(&path)
+            .unwrap()
+            .set_len((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
+            .unwrap();
+        let db_path = home.path().join("state.db");
+        let db = Connection::open(&db_path).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, rollout_path TEXT); INSERT INTO threads VALUES ('thread', 'Thread', NULL);").unwrap();
+        let mut cache = HashMap::new();
+        let result = delete_local_permanently(
+            &db_path,
+            &SessionRef::new("thread", "Thread").unwrap(),
+            &mut cache,
+        );
+        assert_eq!(result.status, DeleteStatus::Failed);
+        assert!(result.message.contains("scan incomplete"));
+        assert!(cache.is_empty());
+        assert!(path.exists());
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM threads", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rollout_scan_enforces_entry_depth_and_shared_byte_budgets() {
+        let home = tempfile::tempdir().unwrap();
+        let path = rollout(home.path(), "first.jsonl", "thread");
+        rollout(home.path(), "second.jsonl", "other");
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+        let mut budget = RolloutScanBudget {
+            remaining_entries: 1,
+            ..Default::default()
+        };
+        let error = collect_matching_rollout_paths(
+            &home.path().join("sessions"),
+            "thread",
+            &mut paths,
+            &mut seen,
+            &mut budget,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("entry limit"));
+
+        let mut budget = RolloutScanBudget {
+            remaining_bytes: fs::metadata(&path).unwrap().len() as usize,
+            ..Default::default()
+        };
+        assert!(rollout_matches_thread_id(&path, "thread", &mut budget).unwrap());
+        assert!(
+            rollout_matches_thread_id(&path, "thread", &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("scan incomplete")
+        );
+
+        let nested = tempfile::tempdir().unwrap();
+        let mut deepest = nested.path().to_path_buf();
+        for _ in 0..=MAX_ROLLOUT_SCAN_DEPTH {
+            deepest.push("d");
+        }
+        fs::create_dir_all(&deepest).unwrap();
+        let error = collect_matching_rollout_paths(
+            nested.path(),
+            "thread",
+            &mut paths,
+            &mut seen,
+            &mut RolloutScanBudget::default(),
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("depth limit"));
+    }
+
+    #[test]
+    fn large_rollouts_are_identified_before_reading_the_history_body() {
+        let home = tempfile::tempdir().unwrap();
+        let path = rollout(home.path(), "large.jsonl", "thread");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((MAX_ROLLOUT_SCAN_BYTES + 1) as u64)
+            .unwrap();
+        let mut budget = RolloutScanBudget::default();
+        assert!(rollout_matches_thread_id(&path, "thread", &mut budget).unwrap());
+        assert!(budget.remaining_bytes > MAX_ROLLOUT_SCAN_BYTES - 1024);
+    }
 
     fn rollout(home: &Path, name: &str, id: &str) -> PathBuf {
         let path = home.join("sessions").join(name);

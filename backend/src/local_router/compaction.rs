@@ -6,6 +6,170 @@ use super::*;
 // 与空闲期限，避免把耗时较长的压缩在请求总期限处截断。
 pub(crate) const COMPACTION_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 
+pub(crate) const CODEY_SUMMARY_PREFIX: &str = "codey-summary-v1:";
+
+pub(crate) async fn write_gateway_compaction_http_error<D: ResponsesDownstream + ?Sized>(
+    downstream: &mut D,
+    body: &[u8],
+    route: &RouteTarget,
+) -> Result<()> {
+    let context_error = serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| is_context_length_error(&value));
+    downstream
+        .write_error(
+            if context_error { 400 } else { 502 },
+            if context_error {
+                CONTEXT_LENGTH_EXCEEDED
+            } else {
+                "invalid_compaction_response"
+            },
+            if context_error {
+                "压缩摘要所需的历史超过上游上下文长度限制"
+            } else {
+                "远程压缩摘要未能完成：上游返回错误响应"
+            }
+            .into(),
+            Some(route),
+        )
+        .await
+}
+
+pub(crate) fn codey_summary_message(item: &Value) -> Result<Option<Value>> {
+    if item["type"] != "compaction" {
+        return Ok(None);
+    }
+    let Some(encoded) = item["encrypted_content"]
+        .as_str()
+        .and_then(|text| text.strip_prefix(CODEY_SUMMARY_PREFIX))
+    else {
+        return Ok(None);
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("Codey 压缩摘要编码无效")?;
+    let text = String::from_utf8(bytes).context("Codey 压缩摘要不是有效 UTF-8")?;
+    anyhow::ensure!(!text.trim().is_empty(), "Codey 压缩摘要为空");
+    // 摘要沿用本地压缩的形态，作为普通 user 消息放回历史：developer 会变成
+    // system，历史里没有其它消息时 Anthropic 转换会因缺少 messages 失败。
+    Ok(Some(
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]}),
+    ))
+}
+
+pub(crate) fn restore_codey_compaction_summaries(body: &mut Value) -> Result<bool> {
+    let mut changed = false;
+    if let Some(input) = body.get_mut("input") {
+        match input {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(message) = codey_summary_message(item)? {
+                        *item = message;
+                        changed = true;
+                    }
+                }
+            }
+            item => {
+                if let Some(message) = codey_summary_message(item)? {
+                    *item = message;
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
+pub(crate) fn gateway_compaction_model_metadata<'a>(
+    metadata: &'a BTreeMap<String, serde_json::Map<String, Value>>,
+    provider: &str,
+    upstream: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    // 以实际解析出的线路为准，避免原始模型名命中同名官方模型的预算。
+    let canonical = crate::model_id::model_alias(provider, upstream);
+    metadata
+        .iter()
+        .find(|(slug, _)| crate::model_id::equal(slug, &canonical))
+        .map(|(_, value)| value)
+}
+
+/// 摘要只占后续窗口的一小部分；另一半输出预算留给模型推理。
+/// 没有目录声明时使用有限的回退预算，不推测模型的上下文容量。
+pub(crate) fn gateway_compaction_output_budget(
+    body: &Value,
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> Result<u64> {
+    let mut budget = 16_384;
+    if let Some(metadata) = metadata {
+        if let Some(window) = metadata
+            .get("context_window")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            let percent = metadata
+                .get("effective_context_window_percent")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(100);
+            budget = budget.min(window.saturating_mul(percent) / 100 / 8);
+        }
+        if let Some(limit) = metadata
+            .get("auto_compact_token_limit")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            budget = budget.min(limit / 4);
+        }
+    }
+    for field in ["max_output_tokens", "max_tokens"] {
+        if let Some(value) = body.get(field) {
+            if value.is_null() {
+                continue;
+            }
+            let limit = value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .with_context(|| format!("{field} 必须为正整数"))?;
+            budget = budget.min(limit);
+        }
+    }
+    anyhow::ensure!(budget > 0, "模型上下文预算不足以生成压缩摘要");
+    Ok(budget)
+}
+
+pub(crate) fn prepare_gateway_compaction(body: &mut Value, output_budget: u64) -> Result<()> {
+    let input = body.get_mut("input").context("压缩请求缺少 input")?;
+    if let Some(text) = input.as_str() {
+        *input = json!({"role":"user","content":[{"type":"input_text","text":text}]});
+    }
+    if !input.is_array() {
+        *input = json!([input.clone()]);
+    }
+    let items = input.as_array_mut().expect("normalized input");
+    if items
+        .last()
+        .is_some_and(|item| item["type"] == "compaction_trigger")
+    {
+        items.pop();
+    }
+    anyhow::ensure!(
+        !items
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger"),
+        "压缩触发项必须位于历史末尾"
+    );
+    // 用 user 角色追加总结指令，三种协议都能转换，也不会被当成助手历史。
+    items.push(json!({"role":"user","content":[{"type":"input_text","text":format!("请只输出供下一轮助手继续工作的结构化交接摘要。保留系统指令、用户目标与约束、已完成工作与验证结果、关键事实和文件位置、未完成任务与下一步、需要保留的工具结果。清楚区分已确认事实和假设，不调用工具，不执行新任务。精简重复叙述，摘要目标不超过 {} token，在预算内完整交接，优先保留约束与未完成事项。", (output_budget / 2).max(1))}]}));
+    let object = body.as_object_mut().context("压缩请求必须为对象")?;
+    for field in ["tools", "tool_choice", "parallel_tool_calls"] {
+        object.remove(field);
+    }
+    object.insert("stream".into(), json!(true));
+    object.remove("max_tokens");
+    object.insert("max_output_tokens".into(), json!(output_budget));
+    Ok(())
+}
+
 // Codex 运行时的协作任务载荷使用 Fernet 令牌：版本字节、时间戳、初始向量、
 // 按 16 字节分组且至少一组的密文、HMAC。Codey 不持有解密密钥，只能在发送
 // 前做结构校验。
@@ -34,14 +198,77 @@ pub(crate) fn is_compaction_request(body: &Value, kind: ResponsesRequestKind) ->
             .any(|item| item["type"] == "compaction_trigger")
 }
 
+/// 只转换明确选择兼容端点的压缩请求。调用前须先恢复 WebSocket 增量历史。
+pub(crate) fn adapt_compaction_trigger_to_compact(body: &mut Value) -> Result<()> {
+    for field in ["conversation", "prompt"] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            anyhow::bail!("兼容压缩端点无法保留 {field} 引用，请使用原生 Responses 压缩");
+        }
+    }
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("兼容压缩要求 input 为完整历史数组"))?;
+    let trigger = items
+        .last()
+        .filter(|item| item["type"] == "compaction_trigger")
+        .ok_or_else(|| anyhow::anyhow!("兼容压缩要求 compaction_trigger 位于历史末尾"))?;
+    if trigger.as_object().is_none_or(|object| object.len() != 1)
+        || items[..items.len() - 1]
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger")
+    {
+        anyhow::bail!("兼容压缩只支持单个不带额外参数的 compaction_trigger");
+    }
+    // compact 接口接收整个历史窗口，保留其中所有消息、工具结果和加密项。
+    body["input"].as_array_mut().expect("validated input").pop();
+    body.as_object_mut()
+        .expect("validated compaction request")
+        .retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "model"
+                    | "input"
+                    | "instructions"
+                    | "previous_response_id"
+                    | "prompt_cache_key"
+                    | "prompt_cache_options"
+                    | "prompt_cache_retention"
+                    | "service_tier"
+            )
+        });
+    Ok(())
+}
+
+pub(crate) enum CompactionResponseFormat {
+    Responses,
+    Compact,
+    CompactToResponses,
+}
+
 pub(crate) fn validate_portable_context(body: &Value) -> Result<()> {
+    validate_portable_context_items(input_items(body), false)
+}
+
+fn validate_portable_context_items(items: &[Value], allow_trigger: bool) -> Result<()> {
     let is_compaction = |item: &Value| {
         matches!(
             item.get("type").and_then(Value::as_str),
             Some("compaction" | "compaction_trigger")
         )
     };
-    for item in input_items(body) {
+    for (index, item) in items.iter().enumerate() {
+        // 末尾的无参数触发项是当前压缩操作，不携带旧线路的加密历史。
+        if allow_trigger
+            && index + 1 == items.len()
+            && item["type"] == "compaction_trigger"
+            && item.as_object().is_some_and(|object| object.len() == 1)
+        {
+            continue;
+        }
+        if codey_summary_message(item)?.is_some() {
+            continue;
+        }
         let content = item.get("content");
         if is_compaction(item)
             || content.is_some_and(|content| {
@@ -60,7 +287,7 @@ pub(crate) fn validate_portable_context(body: &Value) -> Result<()> {
 }
 
 pub(crate) fn validate_cross_route_context(body: &Value) -> Result<()> {
-    validate_portable_context(body)?;
+    validate_portable_context_items(input_items(body), true)?;
     fn contains_item_reference(value: &Value) -> bool {
         if value.get("type").and_then(Value::as_str) == Some("item_reference") {
             return true;
@@ -82,7 +309,8 @@ pub(crate) fn normalize_native_responses_context(
     body: &mut Value,
     discard_opaque_reasoning: bool,
 ) -> bool {
-    let mut changed = normalize_encrypted_agent_payloads(body);
+    let mut changed = restore_codey_compaction_summaries(body).unwrap_or(false);
+    changed |= normalize_encrypted_agent_payloads(body);
     // 同一线路必须原样回传 reasoning，包括第三方 thinking 模式需要的明文内容。
     // 换线路时只去掉上一供应商的密文，可见摘要改成官方可接受的 summary。
     if discard_opaque_reasoning {
@@ -1639,6 +1867,7 @@ struct CompactionAccumulator {
     response: Option<Value>,
     output: BTreeMap<u64, Value>,
     output_count: u64,
+    ordinary_response: bool,
 }
 impl SseFrameAccumulator for CompactionAccumulator {
     const PROTOCOL_LABEL: &'static str = "Responses compaction";
@@ -1690,7 +1919,9 @@ impl SseFrameAccumulator for CompactionAccumulator {
                 if response.get("status").is_none() {
                     response["status"] = json!("completed");
                 }
-                validate_compaction_result(&response, true)?;
+                if !self.ordinary_response {
+                    validate_compaction_result(&response, true)?;
+                }
                 self.response = Some(response);
             }
             Some("response.failed" | "response.incomplete" | "error") => {
@@ -1705,13 +1936,91 @@ impl SseFrameAccumulator for CompactionAccumulator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
+    downstream: &mut D,
+    response: reqwest::Response,
+    bridge: ProtocolBridge,
+    model: &str,
+    stream: bool,
+    route: &RouteTarget,
+    tool_bridge: &ResponsesToolBridge,
+    portable_attempt: Option<&mut PortableAttempt>,
+) -> Result<()> {
+    let probe = downstream.request_log_probe().cloned();
+    let result = await_upstream(downstream, async {
+        let mut prepared = prepare_upstream_response(response, "读取压缩摘要响应失败", probe.as_ref()).await?;
+        let value = match bridge {
+            ProtocolBridge::ResponsesToChatCompletions => read_chat_completions_as_responses(&mut prepared, model, tool_bridge, probe.as_ref()).await?,
+            ProtocolBridge::ResponsesToAnthropicMessages => read_anthropic_messages_as_responses(&mut prepared, model, tool_bridge, probe.as_ref()).await?,
+            _ if prepared.is_sse => {
+                let mut accumulator = CompactionAccumulator { ordinary_response: true, ..Default::default() };
+                collect_sse_frames(&mut prepared, &mut accumulator, probe.as_ref()).await?;
+                accumulator.response.context("压缩摘要未返回完成事件")?
+            }
+            _ => {
+                let bytes = read_bounded_prepared_upstream_body(&mut prepared, MAX_UPSTREAM_RESPONSE_BYTES, "读取压缩摘要响应失败", probe.as_ref()).await?;
+                serde_json::from_slice::<Value>(&bytes).context("压缩摘要返回无效 JSON")?
+            }
+        };
+        check_context_length_error(&value)?;
+        anyhow::ensure!(value.get("error").is_none_or(Value::is_null), "压缩摘要上游返回错误");
+        anyhow::ensure!(!matches!(value["status"].as_str(), Some("failed" | "incomplete" | "in_progress")), "压缩摘要上游响应未完成");
+        let text = value["output"].as_array().into_iter().flatten()
+            .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "output_text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>().join("\n");
+        anyhow::ensure!(!text.trim().is_empty(), "上游未返回可用的压缩摘要");
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text.as_bytes());
+        let value = json!({"id":format!("resp_codey_{}", uuid::Uuid::new_v4()), "object":"response", "status":"completed", "model":model,
+            "output":[{"type":"compaction","id":format!("cmp_codey_{}", uuid::Uuid::new_v4()),"encrypted_content":format!("{CODEY_SUMMARY_PREFIX}{encoded}")}]});
+        validate_compaction_result(&value, true)?;
+        Ok(value)
+    }).await?;
+    match result {
+        Ok(value) => {
+            if stream {
+                write_responses_response_as_events(downstream, &value).await?;
+            } else {
+                downstream.write_json(200, &value).await?;
+            }
+            if let Some(attempt) = portable_attempt {
+                attempt.complete();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let (status, code) = if error.is::<ContextLengthExceeded>() {
+                (400, CONTEXT_LENGTH_EXCEEDED)
+            } else if is_upstream_timeout_error(&error) {
+                (504, "compaction_timeout")
+            } else {
+                (502, "invalid_compaction_response")
+            };
+            let detail = sanitize_upstream_error_text(&format!("{error:#}"), route, 512)
+                .unwrap_or_else(|| "上游未返回可用的压缩摘要".into());
+            downstream
+                .write_error(
+                    status,
+                    code,
+                    format!("远程压缩摘要未能完成：{detail}"),
+                    Some(route),
+                )
+                .await
+        }
+    }
+}
+
 pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
     downstream: &mut D,
     response: reqwest::Response,
-    v2: bool,
+    format: CompactionResponseFormat,
     stream: bool,
     route: &RouteTarget,
 ) -> Result<()> {
+    let v2 = matches!(format, CompactionResponseFormat::Responses);
     let probe = downstream.request_log_probe().cloned();
     let result = await_upstream(downstream, async {
         let mut prepared =
@@ -1733,8 +2042,14 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
                 probe.as_ref(),
             )
             .await?;
-            let value: Value = serde_json::from_slice(&bytes).context("远程压缩返回无效 JSON")?;
+            let mut value: Value =
+                serde_json::from_slice(&bytes).context("远程压缩返回无效 JSON")?;
             validate_compaction_result(&value, v2)?;
+            if matches!(format, CompactionResponseFormat::CompactToResponses) {
+                // 先校验旧接口的完整结果，再补 Responses 终态；output 与密文原样保留。
+                value["object"] = json!("response");
+                value["status"] = json!("completed");
+            }
             Ok(value)
         }
     })

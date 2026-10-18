@@ -171,16 +171,16 @@ enum AppDiscovery {
         let isRegularApp: Bool
     }
 
-    private static func resolvedRunningApp(in descriptors: [RunningAppDescriptor], matching query: String) -> RunningAppDescriptor? {
+    static func resolvedRunningApp(in descriptors: [RunningAppDescriptor], matching query: String) -> RunningAppDescriptor? {
+        let allowed = descriptors.filter { descriptor in
+            !AppSafetyPolicy.isBlocked(bundleIdentifier: descriptor.bundleIdentifier)
+        }
         if isBundleIdentifierQuery(query) {
-            return descriptors.first(where: { descriptor in
+            return allowed.first(where: { descriptor in
                 descriptor.bundleIdentifier?.caseInsensitiveCompare(query) == .orderedSame
             })
         }
 
-        let allowed = descriptors.filter { descriptor in
-            !AppSafetyPolicy.isBlocked(bundleIdentifier: descriptor.bundleIdentifier)
-        }
         let candidates = allowed.map { descriptor in
             ResolutionCandidate(
                 name: descriptor.name,
@@ -544,7 +544,7 @@ enum AppDiscovery {
 }
 
 enum AppSafetyPolicy {
-    private static let blockedBundleIdentifiers: Set<String> = [
+    private static let blockedBundleIdentifiers = Set([
         "com.1password.1password",
         "com.1password.safari",
         "com.bitwarden.desktop",
@@ -553,14 +553,14 @@ enum AppSafetyPolicy {
         "com.nordsec.nordpass",
         "me.proton.pass.electron",
         "me.proton.pass.catalyst",
-    ]
+    ].map { $0.lowercased() })
 
     static func isBlocked(bundleIdentifier: String?) -> Bool {
         guard let bundleIdentifier else {
             return false
         }
 
-        return blockedBundleIdentifiers.contains(bundleIdentifier)
+        return blockedBundleIdentifiers.contains(bundleIdentifier.lowercased())
     }
 
     static func permissionDenied(bundleIdentifier: String) -> ComputerUseError {

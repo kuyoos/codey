@@ -11,6 +11,84 @@ struct DeliveryAttempt {
     reply: oneshot::Sender<Value>,
 }
 
+#[tokio::test]
+async fn background_apply_coalesces_queued_saves_and_ignores_old_results() {
+    use crate::commands::config_apply;
+    let mut renderer = Renderer::start().await;
+    let initial = config_with_models(&["old"]);
+    let state = state_with_runtime(&initial, &renderer).await;
+    let lifecycle = state.runtime_operation.lock().await;
+    for name in ["middle", "latest"] {
+        let _commit = state.config_write_lock.lock().await;
+        *state.config.write().await = config_with_models(&[name]);
+        config_apply::enqueue(&state, false);
+    }
+    drop(lifecycle);
+    let first = renderer.next().await;
+    assert_models(&first.catalog, &["latest"]);
+    let newest = {
+        let _commit = state.config_write_lock.lock().await;
+        *state.config.write().await = config_with_models(&["newest"]);
+        config_apply::enqueue(&state, false)
+    };
+    first.reply.send(json!({"ok": true})).unwrap();
+    let second = renderer.next().await;
+    assert_models(&second.catalog, &["newest"]);
+    assert_eq!(config_apply::status(&state), newest);
+    second
+        .reply
+        .send(json!({"ok": false, "error": "test renderer rejected update"}))
+        .unwrap();
+    let rollback = renderer.next().await;
+    assert_models(&rollback.catalog, &["latest"]);
+    rollback.reply.send(json!({"ok": true})).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let result = config_apply::status(&state);
+            if result["state"] != "pending" {
+                assert_eq!(result["revision"], newest["revision"]);
+                assert_eq!(result["state"], "failed");
+                assert!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("test renderer rejected")
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn background_apply_skips_renderer_for_unchanged_catalog() {
+    use crate::commands::config_apply;
+    let mut renderer = Renderer::start().await;
+    let initial = config_with_models(&["old"]);
+    let state = state_with_runtime(&initial, &renderer).await;
+    {
+        let _commit = state.config_write_lock.lock().await;
+        state.config.write().await.user_scripts = vec!["// requires restart".into()];
+        config_apply::enqueue(&state, false);
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let result = config_apply::status(&state);
+            if result["state"] != "pending" {
+                assert_eq!(result["state"], "restart_required");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(renderer.attempts.try_recv().is_err());
+}
+
 struct Renderer {
     url: String,
     attempts: mpsc::UnboundedReceiver<DeliveryAttempt>,

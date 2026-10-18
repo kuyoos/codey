@@ -1,6 +1,8 @@
-import type { Notice } from "./App.types";
+import type { ConfigApplyStatus, Notice } from "./App.types";
+import { configApplyNotice } from "./configApply";
 
 export type ModelRuntimeUpdate = {
+  configApply?: ConfigApplyStatus | null;
   restartRequired?: boolean;
   modelHotReloaded?: boolean;
   modelHotReloadDeferred?: boolean;
@@ -51,6 +53,7 @@ export function customContextRestoredNote(result: {
 }
 
 function savedModelNotice(result: ModelRuntimeUpdate, summary: string): Notice {
+  if (result.configApply) return configApplyNotice(result.configApply);
   if (result.modelHotReloadError) {
     return {
       tone: "info",

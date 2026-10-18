@@ -2,46 +2,13 @@ import assert from "node:assert/strict";
 
 import { readSource } from "./read-source.mjs";
 
-// Renders backend/src/codex_startup_patch.js the way the launcher does before
-// injecting it, substituting only the placeholders a test asks for so the
-// remaining ones stay visible to source assertions.
-export async function loadStartupPatchTemplate({
-  disablePet = false,
-  miscModel = null,
-  requireAppServerRuntimeOverrides = false,
-  runtimeConfigOverrides = null,
-  subagentGateActive = null,
-  errorLoggerExecutable = null,
-} = {}) {
-  const template = await readSource("backend/src/codex_startup_patch.js");
-  assert.ok(template, "startup patch template should be readable");
-  let expression = template
-    .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
-    .replaceAll(
-      '"__CODEY_MISC_MODEL_ID__"',
-      JSON.stringify(miscModel),
-    )
-    .replaceAll(
-      "__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__",
-      requireAppServerRuntimeOverrides ? "true" : "false",
-    );
-  if (runtimeConfigOverrides != null) {
-    const gateActive = subagentGateActive
-      ?? runtimeConfigOverrides.includes("features.hooks=true");
-    expression = expression
-      .replaceAll(
-        '"__CODEY_RUNTIME_CONFIG_OVERRIDES__"',
-        JSON.stringify(runtimeConfigOverrides),
-      )
-      .replaceAll("__SUBAGENT_GATE_ACTIVE__", gateActive ? "true" : "false");
-  }
-  if (errorLoggerExecutable != null) {
-    expression = expression.replaceAll(
-      '"__CODEY_ERROR_LOGGER_EXECUTABLE__"',
-      JSON.stringify(errorLoggerExecutable),
-    );
-  }
-  return expression;
+// Loads backend/src/renderer_asset_patch.js with the same options prelude the
+// CDP document script uses (see renderer_asset_patch_document_script), so tests
+// can eval the result the way the page receives it.
+export async function loadStartupPatchTemplate({ disablePet = false } = {}) {
+  const template = await readSource("backend/src/renderer_asset_patch.js");
+  assert.ok(template, "renderer asset patch template should be readable");
+  return `globalThis.__CODEY_RENDERER_PATCH_OPTIONS__ = ${JSON.stringify({ disablePet })};\n${template}`;
 }
 
 // Slices spawn_codex in backend/src/launcher/process.rs into its per-platform

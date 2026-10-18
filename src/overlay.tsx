@@ -81,7 +81,6 @@ function RequestLogPage() {
       catalog={catalog}
       container={null}
       opened
-      onClose={() => undefined}
       standalone
     />
   );

@@ -15,9 +15,7 @@ use super::{
 use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::codex_provider;
-use crate::config::{
-    CodeyConfig, OFFICIAL_ROUTE_SHORT_NAME, ProviderProfile, validate_provider_profiles,
-};
+use crate::config::{CodeyConfig, ProviderProfile, validate_provider_profiles};
 use crate::error_log;
 use crate::local_router;
 use crate::model_catalog;
@@ -223,8 +221,15 @@ pub(super) async fn invoke(
                     optional_argument::<String>(args, "routeName"),
                     optional_argument::<String>(args, "routeShortName"),
                     optional_argument::<String>(args, "baseUrl"),
+                    optional_argument::<u32>(args, "maxConcurrency"),
                 ) {
-                    (Ok(account_id), Ok(route_name), Ok(route_short_name), Ok(base_url)) => {
+                    (
+                        Ok(account_id),
+                        Ok(route_name),
+                        Ok(route_short_name),
+                        Ok(base_url),
+                        Ok(max_concurrency),
+                    ) => {
                         save_official_route_models(
                             state,
                             OfficialRouteModelSave {
@@ -238,14 +243,16 @@ pub(super) async fn invoke(
                                 account_id,
                                 route_name,
                                 route_short_name,
+                                max_concurrency,
                             },
                         )
                         .await
                     }
-                    (Err(error), _, _, _)
-                    | (_, Err(error), _, _)
-                    | (_, _, Err(error), _)
-                    | (_, _, _, Err(error)) => Err(error),
+                    (Err(error), _, _, _, _)
+                    | (_, Err(error), _, _, _)
+                    | (_, _, Err(error), _, _)
+                    | (_, _, _, Err(error), _)
+                    | (_, _, _, _, Err(error)) => Err(error),
                 }
             }
             (Err(error), _, _, _, _, _, _)

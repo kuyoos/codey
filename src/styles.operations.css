@@ -326,11 +326,6 @@
   margin-left: auto;
 }
 
-.injection-mode-repair {
-  min-width: 72px;
-  background: var(--codey-surface, #ffffff);
-}
-
 @media (max-width: 540px) {
   .injection-mode-panel {
     flex-wrap: wrap;

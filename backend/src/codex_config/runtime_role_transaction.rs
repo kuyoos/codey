@@ -11,7 +11,11 @@ struct RuntimeAgentFileSnapshot {
     contents: Option<Vec<u8>>,
 }
 
-pub(super) fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &Path) -> Result<()> {
+pub(super) fn refresh_runtime_subagent_roles_at(
+    config: &CodeyConfig,
+    marker: &Path,
+    remote_compaction_models: Option<&HashSet<String>>,
+) -> Result<()> {
     anyhow::ensure!(
         config.subagent_optimization,
         "当前 Codey 配置未启用子代理协作优化"
@@ -44,6 +48,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &P
         &constraints_dir,
         &registration_roles,
         fastctx_instructions.as_deref(),
+        remote_compaction_models,
     )
     .context("预检 Codey 子代理运行时配置失败；未写入运行时配置")?;
     let expected_hashes = runtime_agent_plan_hashes(&plans);
@@ -70,6 +75,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &P
             &constraints_dir,
             &registration_roles,
             fastctx_instructions.as_deref(),
+            remote_compaction_models,
         )?;
         verify_runtime_agent_files(&registrations, registration_roles.len())?;
         state.subagent_model.clone_from(&config.subagent_model);
@@ -83,6 +89,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &P
         state.runtime_home.clone_from(&runtime_home);
         state.runtime_agent_schema_version = RUNTIME_AGENT_SCHEMA_VERSION;
         state.runtime_agent_hashes.clone_from(&expected_hashes);
+        state.remote_compaction_models = remote_compaction_models.cloned().unwrap_or_default();
         write_lease(marker, &state)?;
         crate::subagent_gate::commit_runtime_subagent_policy(
             &runtime_home,

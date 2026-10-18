@@ -9,6 +9,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod config_apply;
 mod config_repair;
 mod diagnostics;
 mod extensions;
@@ -23,7 +24,8 @@ mod wechat_claw;
 
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
-    build_codex_executable, normalize_codex_app_path, resolve_codex_app_dir_with_saved,
+    build_codex_executable, normalize_codex_app_path_checked,
+    resolve_codex_app_dir_with_saved_checked,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -40,7 +42,7 @@ use models::{
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state_async, current_provider_status_async, hot_reload_runtime_models,
+    current_model_state_async, current_provider_status_async,
     native_web_search_capability_requires_restart, official_route_snapshots_for_runtime,
     reconcile_subagent_models_for_mode, runtime_renderer_model_catalog,
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
@@ -110,7 +112,7 @@ pub struct AppState {
     pub config: RwLock<CodeyConfig>,
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
-    plugin_route_reload_lock: Mutex<()>,
+    config_apply: BlockingMutex<config_apply::ApplyQueue>,
     model_delivery_lock: Mutex<()>,
     /// Captured when the state is created on the Codey runtime. Plugin route
     /// changes arrive on plugin threads, which cannot see that runtime via
@@ -129,6 +131,8 @@ pub struct AppState {
     /// startup waits overlap.
     official_account_probe_prewarm: Mutex<Option<OfficialAccountProbePrewarm>>,
     official_account_logins: Mutex<crate::official_accounts::LoginSessions>,
+    /// SIWC 授权会话与 Codex 登录共用同一回调端口，两边同时只允许一条进行。
+    official_siwc_logins: Mutex<crate::official_accounts::SiwcLoginSessions>,
     /// 令牌刷新按账号串行执行。多个请求同时轮换同一个 refresh token 会让
     /// 先写回的凭据立刻失效。
     official_account_refresh_lock: Mutex<()>,
@@ -137,6 +141,9 @@ pub struct AppState {
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
     trace_log_write_protection_active: AtomicBool,
+    trace_log_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
+    #[cfg(test)]
+    slow_apply_test: slow_apply_tests::TestHooks,
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
     /// Kept apart from `startup_error`, which each launch overwrites and hot
@@ -238,7 +245,7 @@ impl Default for AppState {
             config: RwLock::new(config),
             config_write_lock: Mutex::new(()),
             provider_model_sync_lock: Mutex::new(()),
-            plugin_route_reload_lock: Mutex::new(()),
+            config_apply: BlockingMutex::new(config_apply::ApplyQueue::default()),
             model_delivery_lock: Mutex::new(()),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             http_client: reqwest::Client::builder()
@@ -252,12 +259,16 @@ impl Default for AppState {
             wechat_claw_login_http_client: std::sync::OnceLock::new(),
             official_account_probe_prewarm: Mutex::new(None),
             official_account_logins: Mutex::new(crate::official_accounts::LoginSessions::default()),
+            official_siwc_logins: Mutex::new(crate::official_accounts::SiwcLoginSessions::default()),
             official_account_refresh_lock: Mutex::new(()),
             account_usage_cache: Arc::new(Mutex::new(account_usage::AccountUsageCaches::default())),
             runtime: Mutex::new(None),
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_write_protection_active: AtomicBool::new(false),
+            trace_log_guard_state: Arc::new(trace_log_guard::TraceLogGuardState::default()),
+            #[cfg(test)]
+            slow_apply_test: slow_apply_tests::TestHooks::default(),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             config_load_error,
@@ -420,6 +431,43 @@ impl AppState {
             "/session/wake-watcher" => {
                 self.session_scan_wake.notify_one();
                 json!({"status":"ok"})
+            }
+            "/session/portable-compaction/prepare"
+            | "/session/portable-compaction/status"
+            | "/session/portable-compaction/cancel"
+            | "/session/portable-compaction/confirm" => {
+                let runtime = self.runtime.lock().await.clone();
+                let operation = path.rsplit('/').next().unwrap_or_default().to_owned();
+                blocking_value("准备会话摘要", move || {
+                    runtime
+                        .ok_or_else(|| anyhow::anyhow!("Codex 尚未启动"))
+                        .and_then(|runtime| runtime.portable_compaction(&operation, &payload))
+                })
+                .await
+            }
+            "/session/stats" => {
+                let session_id = bridge_string(&payload, "sessionId");
+                if session_id.is_empty() {
+                    return json!({"status":"ok", "stats": null});
+                }
+                let runtime = self.runtime.lock().await.clone();
+                let runtime_stats =
+                    runtime.and_then(|runtime| runtime.conversation_stats_snapshot(&session_id));
+                let stats = crate::conversation_stats::snapshot_with_history(
+                    codex_home().to_path_buf(),
+                    session_id,
+                    runtime_stats,
+                )
+                .await;
+                json!({"status":"ok", "stats": stats})
+            }
+            "/session/model" => {
+                let thread_id = bridge_string(&payload, "threadId");
+                let home = codex_home();
+                blocking_value("读取会话模型", move || {
+                    crate::session_model::read(home, &thread_id)
+                })
+                .await
             }
             "/session/titles" => cache_session_titles(self, &payload).await,
             "/session/timestamps" => {
@@ -755,16 +803,36 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
     let accounts = state.official_accounts();
     let probe = match state.take_official_account_probe_prewarm().await {
         Some(task) => task,
-        None => tokio::task::spawn_blocking(move || {
-            crate::codex_provider::OfficialAccountLaunch::resolve(&home, &accounts)
-        }),
+        None => {
+            let home = home.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::codex_provider::OfficialAccountLaunch::resolve(&home, &accounts)
+            })
+        }
     };
     let official_launch = probe
         .await
         .map_err(|error| format!("解析默认官方账号的任务异常退出：{error}"))?
         .map_err(|error| format!("解析默认官方账号失败：{error:#}"))?;
 
+    commit_official_launch_routes(state, official_launch, home).await
+}
+
+async fn commit_official_launch_routes(
+    state: &Arc<AppState>,
+    official_launch: crate::codex_provider::OfficialAccountLaunch,
+    home: PathBuf,
+) -> Result<(), String> {
     let _config_write_guard = state.config_write_lock.lock().await;
+    let current_accounts = state.official_accounts();
+    let official_launch = tokio::task::spawn_blocking(move || {
+        let mut official_launch = official_launch;
+        official_launch.reconcile_current_accounts(&home, &current_accounts)?;
+        Ok::<_, anyhow::Error>(official_launch)
+    })
+    .await
+    .map_err(|error| format!("校验官方账号线路任务异常退出：{error}"))?
+    .map_err(|error| format!("校验官方账号线路失败：{error:#}"))?;
     let previous = state.config.read().await.clone();
     if !previous.local_router_enabled {
         let next = read_only_config_for_official_probe(previous, official_launch.status);
@@ -1125,14 +1193,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(format!("模型候选查询参数无效：{error}")),
             }
         }
-        "query_route_request_log_quota_usage" => {
-            match serde_json::from_value::<crate::route_request_log::RouteRequestLogQuotaQuery>(
-                args.clone(),
-            ) {
-                Ok(query) => query_route_request_log_quota_usage(state, query).await,
-                Err(error) => Err(format!("额度用量查询参数无效：{error}")),
-            }
-        }
         "query_route_request_log_stats" => {
             match serde_json::from_value::<RouteRequestLogQuery>(args.clone()) {
                 Ok(query) => query_route_request_log_stats(state, query).await,
@@ -1141,10 +1201,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         }
         "clear_route_request_logs" => clear_route_request_logs(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
-        "clear_diagnostic_storage"
-        | "repair_codex_overlays"
-        | "repair_codex_config"
-        | "repair_main_process_injection" => diagnostics::invoke(state, command, &args).await,
+        "clear_diagnostic_storage" | "repair_codex_config" | "repair_main_process_injection" => {
+            diagnostics::invoke(state, command, &args).await
+        }
         "test_notification_channel" => {
             match argument::<NotificationChannelConfig>(&args, "channel") {
                 Ok(channel) => test_notification_channel(state, channel).await,
@@ -1162,6 +1221,10 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "import_official_account_credential"
         | "set_default_official_account"
         | "remove_official_account"
+        | "start_official_account_siwc"
+        | "poll_official_account_siwc"
+        | "cancel_official_account_siwc"
+        | "remove_official_account_siwc"
         | "save_official_account_route_settings" => {
             official_accounts::invoke(state, command, &args).await
         }
@@ -1190,7 +1253,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
         "prepare_computer_use" => prepare_computer_use().await,
-        "list_codey_plugins"
+        "get_codey_plugin_host_info"
+        | "validate_codey_plugin_config"
+        | "list_codey_plugins"
         | "get_codey_plugin_config_file"
         | "select_codey_plugin_package"
         | "inspect_codey_plugin"
@@ -1323,28 +1388,6 @@ pub async fn query_route_request_logs(
     .map_err(|error| format!("请求日志查询任务异常退出：{error}"))?
     .map_err(|error| format!("查询请求日志失败：{error:#}"))?;
     serde_json::to_value(page).map_err(|error| format!("请求日志查询结果序列化失败：{error}"))
-}
-
-async fn query_route_request_log_quota_usage(
-    state: &Arc<AppState>,
-    query: crate::route_request_log::RouteRequestLogQuotaQuery,
-) -> Result<Value, String> {
-    let backend = state.config.read().await.route_request_log.backend;
-    let root = codey_runtime_core::paths::default_app_state_dir();
-    let usage = tokio::task::spawn_blocking(move || {
-        crate::route_request_log::query_route_request_log_quota_usage(&root, backend, query)
-    })
-    .await
-    .map_err(|error| format!("额度用量查询任务异常退出：{error}"))?
-    .map_err(|error| format!("查询额度用量失败：{error:#}"))?;
-    let mut value =
-        serde_json::to_value(usage).map_err(|error| format!("额度用量序列化失败：{error}"))?;
-    let runtime = state.runtime.lock().await.clone();
-    if let Some(runtime) = runtime {
-        value["recordingHealth"] = serde_json::to_value(runtime.request_log_health().await)
-            .map_err(|error| format!("请求日志状态序列化失败：{error}"))?;
-    }
-    Ok(value)
 }
 
 async fn query_route_request_log_stats(
@@ -1529,9 +1572,12 @@ fn validate_codex_app_path(path: &str) -> Result<PathBuf, String> {
         return Err("请先选择 Codex 桌面应用所在目录".to_string());
     }
 
-    let app_dir = normalize_codex_app_path(Path::new(selected)).ok_or_else(|| {
-        "所选目录不是可启动的 Codex 桌面应用。请选择包含 ChatGPT.exe 或 Codex.exe 的目录，不要选择 codex.exe 命令行程序或第三方 Codex 启动器".to_string()
-    })?;
+    let app_dir = normalize_codex_app_path_checked(Path::new(selected))
+        .and_then(|app_dir| {
+            codey_runtime_core::app_paths::validate_codex_app_dir(&app_dir)?;
+            Ok(app_dir)
+        })
+        .map_err(|error| format!("{error:#}"))?;
     let executable = build_codex_executable(&app_dir);
     if !executable.is_file() {
         return Err(format!(
@@ -1551,13 +1597,21 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         // The launcher needs a startable executable, not merely a normalizable
         // path: a stale or third-party directory must be reselected here instead
         // of surfacing later as a bare spawn failure.
-        resolve_codex_app_dir_with_saved(configured_path.as_deref(), None)
-            .filter(|app_dir| build_codex_executable(app_dir).is_file())
+        resolve_codex_app_dir_with_saved_checked(configured_path.as_deref(), None).and_then(|app| {
+            if let Some(path) = &app {
+                codey_runtime_core::app_paths::validate_codex_app_dir(path)?;
+            }
+            Ok(app)
+        })
     })
     .await
     .map_err(|error| format!("检测 Codex 桌面应用目录的任务异常退出：{error}"))?;
-    if resolved.is_some() {
+    if matches!(&resolved, Ok(Some(_))) {
         return Ok(());
+    }
+    let diagnostic = resolved.err().map(|error| format!("{error:#}"));
+    if let Some(error) = &diagnostic {
+        eprintln!("定位 Codex 桌面应用失败：{error}");
     }
 
     let Some(selected) = select_codex_app_directory().await? else {
@@ -1566,7 +1620,10 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         } else {
             CODEX_APP_PATH_INVALID_ERROR
         };
-        return Err(format!("{error}；已取消选择安装目录"));
+        return Err(format!(
+            "{}；已取消选择安装目录",
+            diagnostic.as_deref().unwrap_or(error)
+        ));
     };
     let app_dir = validate_codex_app_path(&selected.to_string_lossy())?;
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -1658,12 +1715,15 @@ async fn save_codey_config_input(
 ) -> Result<Value, String> {
     let saved = {
         let _config_write_guard = state.config_write_lock.lock().await;
-        save_codey_config_locked(state, config_input).await
+        let mut saved = save_codey_config_locked(state, config_input).await?;
+        saved.config_apply = config_apply::enqueue(state, saved.reconcile_subagent_config);
+        Ok::<_, String>(saved)
     }?;
     finish_codey_config_save(state, saved).await
 }
 
 struct SavedCodeyConfig {
+    config_apply: Value,
     config: CodeyConfig,
     reconcile_subagent_config: bool,
     fast_context_tools_status: FastContextToolsStatus,
@@ -1816,6 +1876,11 @@ async fn save_codey_config_locked(
     config.protect_crashpad_pending = config_input.protect_crashpad_pending;
     config.slim_codex_pet = config_input.slim_codex_pet;
     config.gpu_launch_mode = config_input.gpu_launch_mode;
+    let codex_launch_proxy = config_input.codex_launch_proxy.trim();
+    if !codex_launch_proxy.is_empty() {
+        crate::config::validate_codex_launch_proxy(codex_launch_proxy)?;
+    }
+    config.codex_launch_proxy = codex_launch_proxy.to_string();
     let fast_context_tools_status = current_fast_context_tools_status();
     config.fast_context_tools = embedded_fast_context_tools_enabled(
         config_input.fast_context_tools,
@@ -1902,63 +1967,13 @@ async fn save_codey_config_locked(
     let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
-    let _diagnostic_operation = if trace_guard_changed {
-        Some(state.diagnostic_storage_operation.lock().await)
-    } else {
-        None
-    };
-    let trace_guard_report = if trace_guard_changed {
-        let home = codex_home().to_path_buf();
-        let disable_writes = config.disable_trace_log_writes;
-        match configure_trace_log_guard(home.clone(), disable_writes).await {
-            Ok(report) => Some(report),
-            Err(error) => {
-                let error =
-                    rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
-                state
-                    .trace_log_write_protection_active
-                    .store(false, Ordering::Release);
-                error_log::record_failure(
-                    "patch_failed",
-                    "configure_trace_log_guard",
-                    error.clone(),
-                    json!({
-                        "disabled": disable_writes,
-                        "source": "save_codey_config",
-                    }),
-                );
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
-    let config = match save_config_to_store(state, config).await {
-        Ok(config) => config,
-        Err(error) => {
-            if trace_guard_changed {
-                let error = rollback_trace_log_guard(
-                    codex_home().to_path_buf(),
-                    previous.disable_trace_log_writes,
-                    error,
-                )
-                .await;
-                state
-                    .trace_log_write_protection_active
-                    .store(false, Ordering::Release);
-                return Err(error);
-            }
-            return Err(error);
-        }
-    };
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
-    if let Some(report) = trace_guard_report {
-        state.trace_log_write_protection_active.store(
-            report.protection_active(config.disable_trace_log_writes),
-            Ordering::Release,
-        );
+    if trace_guard_changed {
+        config_apply::request_trace_apply(state);
     }
     Ok(SavedCodeyConfig {
+        config_apply: Value::Null,
         config,
         reconcile_subagent_config,
         fast_context_tools_status,
@@ -1985,18 +2000,32 @@ pub(crate) fn install_plugin_route_handler(state: Arc<AppState>) {
                 .map_err(|error| error.to_string())
         })
     }));
+    let weak = Arc::downgrade(&state);
+    crate::official_accounts::set_siwc_invalidated_listener(Some(Arc::new(move |account_id| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let Some(runtime) = state.runtime_handle.clone() else {
+            return;
+        };
+        runtime.spawn(async move {
+            official_accounts::refresh_official_routes_after_invalid_account(
+                &state,
+                "siwc_invalidation",
+                &account_id,
+            )
+            .await;
+        });
+    })));
     let state = Arc::clone(&state);
     crate::codey_plugins::set_route_handler(Arc::new(move |plugin_id, change| {
-        let (route_id, changed) = apply_plugin_route_change(&state, plugin_id, change)?;
-        if changed {
-            schedule_plugin_route_hot_reload(&state);
-        }
+        let (route_id, _) = apply_plugin_route_change(&state, plugin_id, change)?;
         Ok(route_id)
     }));
 }
 
 fn apply_plugin_route_change(
-    state: &AppState,
+    state: &Arc<AppState>,
     plugin_id: &str,
     change: crate::codey_plugins::RouteChange,
 ) -> Result<(Option<String>, bool), String> {
@@ -2029,45 +2058,8 @@ fn apply_plugin_route_change(
         .persist(next)
         .map_err(|error| format!("{error:#}"))?;
     *state.config.blocking_write() = stored;
+    config_apply::enqueue(state, true);
     Ok((route_id, true))
-}
-
-/// Plugin routes change on plugin-management threads rather than inside a
-/// save command, so the running router and Codex model list are updated
-/// afterwards. Reloads run one at a time and read the config inside the lock,
-/// so a burst of changes settles on the latest one.
-fn schedule_plugin_route_hot_reload(state: &Arc<AppState>) {
-    let Some(runtime) = state.runtime_handle.clone() else {
-        record_plugin_route_hot_reload_failure(
-            "插件线路已保存，但没有可用的 Codey 运行时来热更新，重启 Codex 后生效".to_string(),
-        );
-        return;
-    };
-    let state = Arc::clone(state);
-    runtime.spawn(async move {
-        let _serial = state.plugin_route_reload_lock.lock().await;
-        if let Some(error) = hot_reload_runtime_models(&state).await.error {
-            record_plugin_route_hot_reload_failure(error);
-        }
-        let config = state.config.read().await.clone();
-        if config.subagent_optimization {
-            let outcome = hot_reload_runtime_subagent_config(&state, &config).await;
-            if outcome.requires_restart()
-                && let Some(error) = outcome.error()
-            {
-                record_plugin_route_hot_reload_failure(error.to_string());
-            }
-        }
-    });
-}
-
-fn record_plugin_route_hot_reload_failure(error: String) {
-    error_log::record_failure(
-        "plugin_route_hot_reload_failed",
-        "hot_reload_plugin_routes",
-        error,
-        json!({}),
-    );
 }
 
 fn merge_profile_secrets(
@@ -2112,6 +2104,14 @@ fn merge_profile_secrets(
         } else {
             profile.plugin_owner_id = None;
             profile.plugin_route_spec = None;
+        }
+        if profile.short_name.trim().is_empty()
+            && !profile.is_unconfigured_default()
+            && !previous_profile.is_some_and(|saved| {
+                saved.short_name.trim().is_empty() && saved.name.trim() == profile.name.trim()
+            })
+        {
+            return Err("请输入短名称".to_string());
         }
         profile.normalize();
         // 线路名上限与渲染层一致。旧配置里已经超限的名称只要这次没有改动就
@@ -2182,61 +2182,32 @@ fn embedded_fast_context_tools_enabled(requested: bool, status: &FastContextTool
 async fn configure_trace_log_guard(
     home: PathBuf,
     disable_writes: bool,
+    guard: Arc<trace_log_guard::TraceLogGuardState>,
 ) -> Result<trace_log_guard::TraceLogGuardReport, String> {
-    tokio::task::spawn_blocking(move || trace_log_guard::configure(&home, disable_writes))
+    tokio::task::spawn_blocking(move || guard.configure(&home, disable_writes))
         .await
         .map_err(|error| format!("Trace 日志保护切换任务异常退出：{error}"))?
         .map_err(|error| error.to_string())
-}
-
-async fn rollback_trace_log_guard(
-    home: PathBuf,
-    previous_disable_writes: bool,
-    primary_error: String,
-) -> String {
-    match configure_trace_log_guard(home, previous_disable_writes).await {
-        Ok(_) => primary_error,
-        Err(rollback_error) => {
-            error_log::record_failure(
-                "restore_failed",
-                "rollback_trace_log_guard",
-                rollback_error.clone(),
-                json!({
-                    "disabled": previous_disable_writes,
-                    "source": "save_codey_config",
-                }),
-            );
-            format!("{primary_error}；回滚 Trace 日志保护也失败：{rollback_error}")
-        }
-    }
 }
 
 async fn finish_codey_config_save(
     state: &Arc<AppState>,
     saved: SavedCodeyConfig,
 ) -> Result<Value, String> {
-    sync_waiting_webhook_watcher(state).await;
-    sync_wechat_claw_service(state).await;
-    if let Some(runtime) = state.runtime.lock().await.clone() {
-        runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
-    }
-    schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
     let model_state = current_model_state_async(&saved.config).await?;
-    let model_hot_reload = hot_reload_runtime_models(state).await;
-    let route_request_log_hot_reload = hot_reload_runtime_request_log(state, &saved.config).await;
-    let subagent_hot_reload = if saved.reconcile_subagent_config {
-        hot_reload_runtime_subagent_config(state, &saved.config).await
-    } else {
-        SubagentHotReloadOutcome::default()
+    let restart_required = runtime_config_requires_restart(state, &saved.config).await;
+    let provider_status = current_provider_status_async(&saved.config).await?;
+    let model_hot_reload = models::ModelHotReloadOutcome {
+        config_apply: Some(saved.config_apply),
+        ..Default::default()
     };
-    let restart_required = subagent_hot_reload.requires_restart()
-        || runtime_config_requires_restart(state, &saved.config).await;
-    let subagent_config_hot_reloaded = subagent_hot_reload.reloaded();
-    let subagent_config_repaired = subagent_hot_reload.repaired();
+    let route_request_log_hot_reload = RouteRequestLogHotReloadOutcome::default();
+    let subagent_hot_reload = SubagentHotReloadOutcome::default();
+    let subagent_config_hot_reloaded = false;
+    let subagent_config_repaired = false;
     let subagent_config_health = subagent_hot_reload.health();
     let subagent_config_repair_reasons = subagent_hot_reload.repair_reasons();
     let subagent_config_hot_reload_error = subagent_hot_reload.error();
-    let provider_status = current_provider_status_async(&saved.config).await?;
     let public_config = redacted_config(&saved.config);
     Ok(model_hot_reload.add_to_response(json!({
         "status":"ok",
@@ -2311,12 +2282,11 @@ impl RouteRequestLogHotReloadOutcome {
     }
 }
 
-async fn hot_reload_runtime_request_log(
+async fn hot_reload_runtime_request_log_locked(
     state: &Arc<AppState>,
     config: &CodeyConfig,
 ) -> RouteRequestLogHotReloadOutcome {
     let desired = config.route_request_log.clone();
-    let _runtime_operation = state.runtime_operation.lock().await;
     let _config_commit_guard = state.config_write_lock.lock().await;
     let current_config = state.config.read().await.clone();
     if current_config.route_request_log != desired
@@ -2348,7 +2318,37 @@ async fn hot_reload_runtime_request_log(
         );
     }
 
-    match runtime.reconfigure_request_log(&desired).await {
+    drop(_config_commit_guard);
+    #[cfg(test)]
+    if let Some(gate) = &state.slow_apply_test.request_log {
+        gate.wait().await;
+    }
+    let result = runtime.reconfigure_request_log(&desired).await;
+    let _config_commit_guard = state.config_write_lock.lock().await;
+    let latest = state.config.read().await;
+    let same_runtime = state
+        .runtime
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &runtime));
+    if latest.route_request_log != desired
+        || latest.local_router_enabled != config.local_router_enabled
+        || !subagent_hot_reload_commit_is_current(
+            state.is_shutting_down(),
+            state.restart_in_progress.load(Ordering::Acquire),
+            runtime_generation,
+            state.runtime_generation.load(Ordering::Acquire),
+            same_runtime,
+            true,
+            state.startup_error.read().await.is_some(),
+        )
+    {
+        return RouteRequestLogHotReloadOutcome::superseded(
+            "请求日志热更新期间配置或运行时已变化；等待最新配置应用",
+        );
+    }
+    match result {
         Ok(Some(RouteRequestLogReconfigure::Unchanged)) => RouteRequestLogHotReloadOutcome {
             status: RouteRequestLogHotReloadStatus::Unchanged,
             error: None,
@@ -2556,14 +2556,26 @@ pub(super) async fn hot_reload_runtime_subagent_config(
     state: &Arc<AppState>,
     config: &CodeyConfig,
 ) -> SubagentHotReloadOutcome {
+    let _runtime_operation = state.runtime_operation.lock().await;
+    let outcome = hot_reload_runtime_subagent_config_locked(state, config).await;
+    if outcome.status == SubagentHotReloadStatus::Superseded {
+        let _commit = state.config_write_lock.lock().await;
+        config_apply::enqueue(state, true);
+    }
+    outcome
+}
+
+async fn hot_reload_runtime_subagent_config_locked(
+    state: &Arc<AppState>,
+    config: &CodeyConfig,
+) -> SubagentHotReloadOutcome {
     let desired_config = RuntimeSubagentConfig::from_config(config);
 
     // All code that needs both locks follows the lifecycle -> config order.
     // Restart already holds the lifecycle lock while launch may synchronize and
     // persist provider state, so taking the config lock first here would allow a
-    // save/restart lock inversion. Holding both locks across reconciliation still
-    // prevents an older save from committing role files after a newer config.
-    let _runtime_operation = state.runtime_operation.lock().await;
+    // save/restart lock inversion. Release the config lock during disk work;
+    // the lifecycle lock serializes deliveries and the queue follows newer saves.
     let _config_commit_guard = state.config_write_lock.lock().await;
     let current_config = state.config.read().await.clone();
     let config_matches = current_config.subagent_optimization
@@ -2607,16 +2619,26 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };
-    let result =
-        tokio::task::spawn_blocking(move || reconcile_runtime_subagent_roles(&runtime_config))
-            .await
-            .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
-            .and_then(std::convert::identity);
+    drop(_config_commit_guard);
+    #[cfg(test)]
+    let reconcile_override = state.slow_apply_test.subagents.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(reconcile) = reconcile_override {
+            return reconcile(&runtime_config);
+        }
+        reconcile_runtime_subagent_roles(&runtime_config)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
+    .and_then(std::convert::identity);
     match result {
         Ok(report) => {
-            if !report.repaired && !applied_config_changed {
-                return SubagentHotReloadOutcome::unchanged();
-            }
+            let _config_commit_guard = state.config_write_lock.lock().await;
+            let latest_config = state.config.read().await.clone();
+            let config_matches = latest_config.subagent_optimization
+                && RuntimeSubagentConfig::from_config(&latest_config) == desired_config
+                && latest_config.fast_context_tools == config.fast_context_tools;
             let current_runtime = state.runtime.lock().await.clone();
             let same_runtime = current_runtime
                 .as_ref()
@@ -2632,9 +2654,12 @@ pub(super) async fn hot_reload_runtime_subagent_config(
                 config_matches,
                 has_startup_error,
             ) {
-                return SubagentHotReloadOutcome::failed(
-                    "Codex 运行时在子代理配置热更新期间发生变化；需要重启以重新建立可信运行配置",
+                return SubagentHotReloadOutcome::superseded(
+                    "子代理热更新期间配置或运行时已变化；等待最新配置应用",
                 );
+            }
+            if !report.repaired && !applied_config_changed {
+                return SubagentHotReloadOutcome::unchanged();
             }
             runtime.mark_subagent_config_applied(&current_config).await;
             SubagentHotReloadOutcome::applied(
@@ -2666,6 +2691,9 @@ pub(super) async fn hot_reload_runtime_subagent_config(
 
 #[cfg(test)]
 mod subagent_hot_reload_commit_tests;
+
+#[cfg(test)]
+mod slow_apply_tests;
 
 fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     let mut public = config.clone();
@@ -3014,6 +3042,7 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.stream_max_retries != current.stream_max_retries
         || applied.slim_codex_pet != current.slim_codex_pet
         || applied.gpu_launch_mode != current.gpu_launch_mode
+        || applied.codex_launch_proxy != current.codex_launch_proxy
         || applied.fast_context_tools != current.fast_context_tools
         || applied.subagent_optimization != current.subagent_optimization
         || !applied

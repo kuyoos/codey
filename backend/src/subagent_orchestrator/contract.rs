@@ -1,7 +1,7 @@
 //! Native `agents.spawn_agent` task-capsule validation.
 //!
-//! Workspace paths are recorded metadata. Codex remains the filesystem
-//! authority.
+//! The workspace path is normalized for identity binding between the parent
+//! and child attempts. Codex remains the filesystem authority.
 
 use std::fs;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use crate::subagent::api::TraceContext;
-use crate::subagent::rules::{RoleAccess, RolePolicy, RuleSet};
+use crate::subagent::rules::RuleSet;
 
 use super::identity::consistent_string_field;
 
@@ -22,7 +22,6 @@ pub(super) struct TaskCapsule {
 pub(super) struct PreparedContract {
     pub(super) capsule: TaskCapsule,
     pub(super) role: String,
-    pub(super) policy: RolePolicy,
     pub(super) workspace_root: Option<String>,
     pub(super) trace: TraceContext,
     pub(super) capabilities: Vec<String>,
@@ -50,33 +49,29 @@ pub(super) fn prepare_task_capsule(
         return Err(contract_error("message 为空"));
     }
     validate_task_id(task_name)?;
-    let policy = rule_set
+    rule_set
         .role_policy(role)
         .ok_or_else(|| contract_error(&format!("未知或不允许的 agent_type `{role}`")))?;
     let workspace_root = hook_workspace_root
-        .map(normalize_coordination_path)
+        .map(normalize_workspace_path)
         .transpose()
         .map_err(|error| contract_error(&format!("工作目录无效：{error}")))?;
-    if policy.access == RoleAccess::Write && workspace_root.is_none() {
-        return Err(contract_error("写入角色缺少可信工作目录"));
+    if workspace_root.is_none() {
+        return Err(contract_error("子代理缺少可信工作目录"));
     }
-    let mut capabilities = match policy.access {
-        RoleAccess::ReadOnly => vec!["files.read".to_string()],
-        RoleAccess::Write => vec![
-            "command.execute".to_string(),
-            "files.read".to_string(),
-            "workspace.write".to_string(),
-        ],
-    };
-    if policy.visual {
-        capabilities.push("visual.inspect".to_string());
-    }
+    // All roles share capabilities. Only trusted native workspace metadata
+    // establishes the workspace identity; task text cannot change it.
+    let capabilities = vec![
+        "command.execute".to_string(),
+        "files.read".to_string(),
+        "workspace.write".to_string(),
+        "visual.inspect".to_string(),
+    ];
     Ok(PreparedContract {
         capsule: TaskCapsule {
             id: task_name.to_string(),
         },
         role: role.to_string(),
-        policy,
         workspace_root,
         trace: TraceContext::new(None),
         capabilities,
@@ -110,11 +105,11 @@ pub(super) fn validate_task_id(value: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Canonicalize existing ancestors when possible so recorded workspace paths
-/// stay stable across obvious aliases. These paths are metadata, not a file
-/// ACL: metadata/canonicalization failures fall back to the lexical absolute
-/// path, while the Codex executor remains the only filesystem authority.
-pub(super) fn normalize_coordination_path(value: &str) -> std::result::Result<String, String> {
+/// Canonicalize existing ancestors when possible so workspace identity matches
+/// for obvious path aliases. Metadata/canonicalization failures fall back to
+/// the lexical absolute path, while the Codex executor remains the only
+/// filesystem authority.
+pub(super) fn normalize_workspace_path(value: &str) -> std::result::Result<String, String> {
     let lexical = normalize_absolute_path(value)?;
     let path = PathBuf::from(&lexical);
     if !path.is_absolute() {

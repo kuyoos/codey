@@ -194,7 +194,7 @@ impl NativeSseTerminal {
 }
 
 pub(crate) struct ResponsesSseRewriter<'a> {
-    xai_fix: Option<&'a XaiResponseFix>,
+    response_fix: Option<&'a NativeResponseFix>,
     normalize_failures: bool,
     retry_advice: Option<&'a ResponseRetryAdvice>,
     buffer: Vec<u8>,
@@ -205,12 +205,12 @@ pub(crate) struct ResponsesSseRewriter<'a> {
 
 impl<'a> ResponsesSseRewriter<'a> {
     pub(crate) fn new(
-        xai_fix: Option<&'a XaiResponseFix>,
+        response_fix: Option<&'a NativeResponseFix>,
         normalize_failures: bool,
         retry_advice: Option<&'a ResponseRetryAdvice>,
     ) -> Self {
         Self {
-            xai_fix,
+            response_fix,
             normalize_failures,
             retry_advice,
             buffer: Vec::new(),
@@ -229,8 +229,9 @@ impl<'a> ResponsesSseRewriter<'a> {
         self.buffer.extend_from_slice(chunk);
         let mut output = Vec::new();
         while let Some(frame) = take_next_sse_frame(&self.buffer, &mut self.cursor) {
-            output.extend(
-                self.rewrite_frame(frame, &self.buffer[self.forwarded..self.cursor.consumed]),
+            // 正常事件直接复制到本次输出，避免为每帧创建临时 Vec。
+            output.extend_from_slice(
+                &self.rewrite_frame(frame, &self.buffer[self.forwarded..self.cursor.consumed]),
             );
             self.forwarded = self.cursor.consumed;
         }
@@ -244,26 +245,28 @@ impl<'a> ResponsesSseRewriter<'a> {
 
     pub(crate) fn finish(&mut self) -> Vec<u8> {
         let buffer = std::mem::take(&mut self.buffer);
-        let output = self.rewrite_frame(&buffer[self.cursor.consumed..], &buffer[self.forwarded..]);
+        let output = self
+            .rewrite_frame(&buffer[self.cursor.consumed..], &buffer[self.forwarded..])
+            .into_owned();
         self.cursor = SseCursor::default();
         self.forwarded = 0;
         output
     }
 
-    fn rewrite_frame(&self, frame: &[u8], original: &[u8]) -> Vec<u8> {
+    fn rewrite_frame<'b>(&self, frame: &[u8], original: &'b [u8]) -> Cow<'b, [u8]> {
         #[derive(serde::Deserialize)]
         struct EventKind<'a> {
             #[serde(rename = "type", borrow)]
             kind: Cow<'a, str>,
         }
-        let passthrough = || original.to_vec();
+        let passthrough = || Cow::Borrowed(original);
         let Ok(Some(data)) = sse_frame_data(frame) else {
             return passthrough();
         };
         if data.trim() == "[DONE]" {
             return passthrough();
         }
-        if self.xai_fix.is_none() {
+        if self.response_fix.is_none() {
             if !self.normalize_failures {
                 return passthrough();
             }
@@ -279,7 +282,7 @@ impl<'a> ResponsesSseRewriter<'a> {
         };
         let mut changed =
             self.normalize_failures && normalize_response_failure(&mut event, self.retry_advice);
-        if let Some(fix) = self.xai_fix {
+        if let Some(fix) = self.response_fix {
             changed |= fix.apply(&mut event);
         }
         let Ok(text) = std::str::from_utf8(frame) else {
@@ -328,7 +331,7 @@ impl<'a> ResponsesSseRewriter<'a> {
             }
         }
         output.extend_from_slice(newline);
-        output
+        Cow::Owned(output)
     }
 }
 
@@ -432,6 +435,10 @@ pub(crate) fn current_unix_timestamp() -> i64 {
 }
 
 #[cfg(test)]
+#[path = "sse_perf_tests.rs"]
+mod perf_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -519,7 +526,7 @@ mod tests {
             1,
         );
         assert_eq!(rewrite_chunks(wrong_header.as_bytes(), 1, true), output);
-        let fix = XaiResponseFix::default();
+        let fix = NativeResponseFix::from(XaiResponseFix::default());
         let mut rewriter = ResponsesSseRewriter::new(Some(&fix), true, None);
         let event = rewritten_event(&rewriter.push(input).unwrap());
         assert_eq!(event["response"]["error"]["code"], "invalid_prompt");

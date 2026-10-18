@@ -34,8 +34,6 @@ impl CodeyRuntime {
             process_id: None,
             #[cfg(unix)]
             process_group_id: None,
-            #[cfg(target_os = "macos")]
-            inspector_argument: None,
             watchdog_shutdown: Mutex::new(None),
             watchdog_task: Mutex::new(None),
             exit_watchdog_shutdown: Mutex::new(None),

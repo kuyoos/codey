@@ -133,8 +133,12 @@ pub(crate) async fn sync_native_current_provider_models(
         None => None,
     };
     if let Some(entries) = official_account_models.as_deref() {
-        model_catalog::merge_account_runtime_models(codex_home(), entries)
-            .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
+        model_catalog::merge_account_runtime_models(
+            codex_home(),
+            entries,
+            &previous.codex_app_path,
+        )
+        .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
     }
     let visible_fetched_models = if let Some(entries) = official_account_models.as_ref() {
         regular_route_models(

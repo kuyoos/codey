@@ -1,0 +1,83 @@
+use std::time::Instant;
+
+use super::{
+    FirstByteSource, QueuedEntry, RequestInputState, RequestProtocol, RequestStatus,
+    RequestTokenUsage, RouteRequestLogEntry, SCHEMA_VERSION, UpstreamTransport,
+};
+
+pub(super) fn sample_entry(request_id: &str) -> RouteRequestLogEntry {
+    RouteRequestLogEntry {
+        requested_service_tier: None,
+        service_tier: None,
+        schema_version: SCHEMA_VERSION,
+        request_id: request_id.to_string(),
+        trace_id: request_id.to_string(),
+        timestamp_unix_ms: 1,
+        provider: Some("provider-a".to_string()),
+        provider_name: Some("Provider A".to_string()),
+        official_account_id: None,
+        requested_model: "alias/model".to_string(),
+        model: Some("model".to_string()),
+        upstream_response_model: None,
+        reasoning_effort: Some("high".to_string()),
+        thinking_budget_tokens: None,
+        ttft_ms: Some(12),
+        router_pre_upstream_ms: Some(4),
+        upstream_first_byte_ms: Some(12),
+        downstream_first_content_ms: Some(14),
+        upstream_header_ms: Some(3),
+        total_duration_ms: 45,
+        queue_delay_ms: 0,
+        concurrency_wait_ms: None,
+        output_tokens_per_second: None,
+        token_usage: RequestTokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: Some(2),
+            cache_creation_input_tokens: None,
+            reasoning_output_tokens: Some(1),
+            total_tokens: Some(15),
+        },
+        usage_reported: true,
+        usage_unavailable_reason: None,
+        request_protocol: RequestProtocol::Sse,
+        upstream_transport: Some(UpstreamTransport::HttpSse),
+        request_kind: "responses".to_string(),
+        status: RequestStatus::Succeeded,
+        status_code: Some(200),
+        upstream_status_code: Some(200),
+        error_code: None,
+        upstream_error_summary: None,
+        completion_reason: Some("completed".to_string()),
+        fallback_count: 0,
+        fallback_reason: None,
+        upstream_authority: Some("api.example.com".to_string()),
+        upstream_request_headers: Some("authorization: [REDACTED]\nx-test: value".to_string()),
+        upstream_response_headers: Some(
+            "x-codex-turn-state: routed\nset-cookie: [REDACTED]".to_string(),
+        ),
+        upstream_request_id: Some("upstream-id".to_string()),
+        upstream_protocol: Some("OpenAI Responses".to_string()),
+        protocol_bridge: Some("Responses passthrough".to_string()),
+        request_input_state: Some(RequestInputState::Array),
+        request_input_items: Some(4),
+        request_has_previous_response_id: Some(false),
+        request_bytes: Some(1_024),
+        upstream_input_state: Some(RequestInputState::Array),
+        upstream_input_items: Some(4),
+        upstream_has_previous_response_id: Some(false),
+        upstream_bytes: Some(1_130),
+        first_byte_source: Some(FirstByteSource::UpstreamHttpBody),
+        client_fingerprint: None,
+        subagent: false,
+        codex_session_id: Some("thread-sample".to_string()),
+        codex_session_is_parent: false,
+    }
+}
+
+pub(super) fn queued(entry: RouteRequestLogEntry) -> QueuedEntry {
+    QueuedEntry {
+        entry,
+        enqueued_at: Instant::now(),
+    }
+}

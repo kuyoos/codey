@@ -77,13 +77,14 @@ pub(crate) fn start(
     server_stdout: ChildStdout,
     source: Box<dyn Read + Send>,
     local_router: bool,
+    home: std::path::PathBuf,
 ) -> Arc<SharedLink> {
     let (outgoing, lines) = sync_channel::<Vec<u8>>(OUTGOING_CAPACITY);
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let pending = Arc::new(Mutex::new(HashMap::new()));
     spawn_writer(lines, server_stdin);
     spawn_relay(source, outgoing.clone());
-    spawn_reader(server_stdout, Arc::clone(&pending), events.clone());
+    spawn_reader(server_stdout, Arc::clone(&pending), events.clone(), home);
     Arc::new(SharedLink {
         outgoing,
         pending,
@@ -145,6 +146,7 @@ fn spawn_reader(
     stdout: ChildStdout,
     pending: Arc<Mutex<HashMap<String, Reply>>>,
     events: broadcast::Sender<Event>,
+    home: std::path::PathBuf,
 ) {
     spawn_named("codey-gateway-stdout", move || {
         let mut reader = BufReader::new(stdout);
@@ -156,6 +158,8 @@ fn spawn_reader(
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
+            // 共享模式没有独立输出观察器，由网关在转发桌面数据流时保存会话设置。
+            crate::codex_startup_patch::remember_app_server_settings(&line, &home);
             if let Ok(value) = serde_json::from_slice::<Value>(&line) {
                 if let Some(id) = value.get("id").and_then(Value::as_str)
                     && let Some(reply) = pending.lock().expect("待响应请求表不可用").remove(id)

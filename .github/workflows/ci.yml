@@ -16,6 +16,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # .cargo/config.toml redirects intermediate artifacts to ~/.cargo/build,
+  # which rust-cache does not cache; keep them under target/ in CI.
+  CARGO_BUILD_BUILD_DIR: target
 
 jobs:
   quality:
@@ -135,10 +138,6 @@ jobs:
         run: cargo test --workspace --locked
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
-
-      - name: Compile native overlay helper and test identity guards
-        shell: powershell
-        run: ./tests/overlay-recovery-native.ps1
 
       - name: Lint Windows workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
