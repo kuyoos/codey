@@ -13,8 +13,9 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart_with_route_status,
-    current_update_platform, make_bridge_handler, prepare_routes_for_current_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, client_platform,
+    config_requires_restart_with_route_status, make_bridge_handler,
+    prepare_routes_for_current_launch,
     provider_route_restart_required_for_runtime, sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
