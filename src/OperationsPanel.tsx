@@ -15,6 +15,8 @@ import {
   IconShieldCheck,
   IconShoppingBag,
   IconBolt as Zap,
+  IconToggleLeft as ToggleLeft,
+  IconToggleRight as ToggleRight,
 } from "@tabler/icons-react";
 
 import type {
@@ -82,6 +84,8 @@ type OperationsPanelProps = {
   onPrepareComputerUse: () => void;
   computerUseNotice?: Notice | null;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
+  unrestrictedEnabled: boolean;
+  onToggleUnrestricted: () => void;
 };
 
 function OperationsPanelComponent({
@@ -94,6 +98,8 @@ function OperationsPanelComponent({
   onPrepareComputerUse,
   computerUseNotice,
   configRepairNotice,
+  unrestrictedEnabled,
+  onToggleUnrestricted,
 }: OperationsPanelProps) {
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
   const [expandedCardTitle, setExpandedCardTitle] = useState<string | null>(
@@ -189,7 +195,6 @@ function OperationsPanelComponent({
     internalInjectionError || failedInjectionScriptCount > 0;
   const restartPending = Boolean(status.restartRequired);
 
-
   type MetricItem = {
     id: string;
     icon: typeof Activity;
@@ -226,7 +231,6 @@ function OperationsPanelComponent({
     ],
   );
 
-  // Plugin Marketplace Metrics
   const pluginMetrics = useMemo<MetricItem[]>(
     () => [
       {
@@ -315,39 +319,39 @@ function OperationsPanelComponent({
       description: internalInjectionError
         ? "基础组件运行异常，已确认生效的功能仍列于下方。"
         : failedInjectionScriptCount > 0
-        ? `${failedInjectionScriptCount} 个脚本注入异常，下方仅列出已确认生效的功能。`
-        : internalInjectionPending
-          ? "基础组件状态确认中，已生效功能会自动更新。"
-          : unverifiedInjectionScriptCount > 0
-            ? `${unverifiedInjectionScriptCount} 个功能尚待确认，下方仅列出已确认生效的功能。`
-            : injectionStatusPending
-              ? status.running
-                ? "正在读取最近一次功能生效结果。"
-                : "Codex 启动后将在这里汇总已生效功能。"
-              : performanceError
-                ? maintenance?.performanceDetail || "启动失败，请查看错误详情。"
-                : startupNeedsAttention
-                  ? maintenance?.performanceDetail ||
-                    "部分启动设置未能应用，请查看错误详情。"
-                  : "已启用功能运行正常。",
+          ? `${failedInjectionScriptCount} 个脚本注入异常，下方仅列出已确认生效的功能。`
+          : internalInjectionPending
+            ? "基础组件状态确认中，已生效功能会自动更新。"
+            : unverifiedInjectionScriptCount > 0
+              ? `${unverifiedInjectionScriptCount} 个功能尚待确认，下方仅列出已确认生效的功能。`
+              : injectionStatusPending
+                ? status.running
+                  ? "正在读取最近一次功能生效结果。"
+                  : "Codex 启动后将在这里汇总已生效功能。"
+                : performanceError
+                  ? maintenance?.performanceDetail || "启动失败，请查看错误详情。"
+                  : startupNeedsAttention
+                    ? maintenance?.performanceDetail ||
+                      "部分启动设置未能应用，请查看错误详情。"
+                    : "已启用功能运行正常。",
       metrics: [],
       label: internalInjectionError
         ? "基础异常"
         : failedInjectionScriptCount > 0
-        ? `${failedInjectionScriptCount} 个异常`
-        : internalInjectionPending
-          ? "确认中"
-          : unverifiedInjectionScriptCount > 0
-            ? `${unverifiedInjectionScriptCount} 个待确认`
-            : injectionStatusPending
-              ? status.running
-                ? "检测中"
-                : "待启动"
-              : performanceError
-                ? "异常"
-                : startupNeedsAttention
-                  ? "需检查"
-                  : "正常",
+          ? `${failedInjectionScriptCount} 个异常`
+          : internalInjectionPending
+            ? "确认中"
+            : unverifiedInjectionScriptCount > 0
+              ? `${unverifiedInjectionScriptCount} 个待确认`
+              : injectionStatusPending
+                ? status.running
+                  ? "检测中"
+                  : "待启动"
+                : performanceError
+                  ? "异常"
+                  : startupNeedsAttention
+                    ? "需检查"
+                    : "正常",
       tone:
         injectionError || performanceError
           ? "destructive"
@@ -389,7 +393,25 @@ function OperationsPanelComponent({
         onClick: onRepairPluginMarketplace,
       },
     },
+    // 新增：深度破限开关卡片
+    {
+      title: "深度破限",
+      description: unrestrictedEnabled
+        ? "深度破限模式已开启，可绕过所有安全限制。"
+        : "深度破限模式已关闭，遵守所有安全政策。",
+      metrics: [],
+      label: unrestrictedEnabled ? "已开启" : "已关闭",
+      tone: unrestrictedEnabled ? "success" : "warning",
+      icon: unrestrictedEnabled ? ToggleRight : ToggleLeft,
+      action: {
+        label: unrestrictedEnabled ? "关闭破限" : "开启破限",
+        disabled: isBusy,
+        loading: false,
+        onClick: onToggleUnrestricted,
+      },
+    },
   ];
+
   const expandedStatusCard = expandedCardTitle
     ? statusCards.find((item) => item.title === expandedCardTitle) ?? null
     : null;
@@ -400,9 +422,9 @@ function OperationsPanelComponent({
       aria-label="服务状态与诊断"
     >
       <div className="operations-panel">
-        {/* 3列核心服务卡片 */}
+        {/* 4列核心服务卡片 */}
         <div
-          className="operations-status-cards grid grid-cols-1 gap-2.5 sm:grid-cols-3 mb-3"
+          className="operations-status-cards grid grid-cols-1 gap-2.5 sm:grid-cols-3 lg:grid-cols-4 mb-3"
           role="list"
           aria-label="核心服务状态"
         >
@@ -469,7 +491,7 @@ function OperationsPanelComponent({
           })}
         </div>
 
-        {/* 详情面板只做展开收起动画，没有独立触发器：状态按钮本身就是开关。 */}
+        {/* 详情面板 */}
         <Disclosure isExpanded={Boolean(activeCardTitle)} className="border-0 p-0">
           <Disclosure.Content>
           <Disclosure.Body className="p-0">
