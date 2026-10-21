@@ -129,6 +129,28 @@ pub(crate) fn validate_outbound_proxy_url(value: &str, label: &str) -> Result<()
     Ok(())
 }
 
+/// 用户自定义的附加开发指令。这些文本会以 `-c developer_instructions=...`
+/// 的形式进入 Codex 命令行，因此必须能安全地序列化为 TOML 字符串：换行和引号
+/// 由序列化层处理，但 NUL 等控制字符会让命令行参数在部分平台上截断，直接拒绝。
+pub(crate) fn validate_custom_instructions(value: &str) -> Result<(), String> {
+    if value.len() > MAX_CUSTOM_INSTRUCTIONS_BYTES {
+        return Err(format!(
+            "自定义附加指令最多 {MAX_CUSTOM_INSTRUCTIONS_BYTES} 字节",
+        ));
+    }
+    if value.chars().any(|character| {
+        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+    }) {
+        return Err("自定义附加指令不能包含除换行和制表符外的控制字符".into());
+    }
+    Ok(())
+}
+
+/// 统一换行并去掉首尾空白。内部保留用户的空行，因为那通常是刻意的段落分隔。
+fn normalize_custom_instructions(value: &str) -> String {
+    value.replace("\r\n", "\n").trim().to_string()
+}
+
 /// Codex 启动代理地址。除线路上游代理的通用要求外，这里叠加更严的约束：
 /// 只允许协议、地址、端口和认证信息；SOCKS 地址必须显式端口，其
 /// RFC 1929 凭据限长 255 字节。凭据不会交给 Chromium 命令行，启动时由
@@ -270,6 +292,7 @@ impl CodeyConfig {
         }
         self.webhook.normalize();
         self.prompt_optimization.normalize();
+        self.custom_instructions = normalize_custom_instructions(&self.custom_instructions);
         self.codex_launch_proxy = self.codex_launch_proxy.trim().to_string();
         self
     }

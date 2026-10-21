@@ -110,6 +110,11 @@ pub const MAX_ROUTE_SHORT_NAME_CHARS: usize = 4;
 /// 旧配置里超过上限的名称仍然可以加载，但保存时的改动会被拒绝。
 pub const MAX_ROUTE_NAME_CHARS: usize = 15;
 
+/// Upper bound for the user-provided custom developer instructions. The text is
+/// forwarded verbatim on the Codex command line, so a runaway paste would
+/// otherwise overflow the platform's argument limit at launch.
+pub const MAX_CUSTOM_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+
 /// 官方账号默认线路名按添加顺序编号，第一个账号是「官方账号1」。
 pub fn default_official_route_name(index: usize) -> String {
     format!("{OFFICIAL_ROUTE_NAME_PREFIX}{index}")
@@ -704,6 +709,11 @@ pub struct CodeyConfig {
     /// renderer. Opt-in so the native warning remains visible by default.
     #[serde(default)]
     pub hide_full_access_warning: bool,
+    /// Additional developer instructions appended to Codex's runtime
+    /// `developer_instructions`. Delivered as a launch-scoped `-c` override so
+    /// the user's own `config.toml` is never rewritten.
+    #[serde(default)]
+    pub custom_instructions: String,
     /// Shows the current ChatGPT account rate-limit windows in the Codex
     /// header. The renderer only activates this for an official login route.
     #[serde(default = "default_true")]
@@ -806,6 +816,7 @@ impl Default for CodeyConfig {
             misc_model: String::new(),
             initial_route_import_completed: false,
             hide_full_access_warning: false,
+            custom_instructions: String::new(),
             show_account_usage_in_header: true,
             official_account_available_this_launch: false,
             official_account_status_this_launch: LaunchOfficialAccountStatus::Unauthenticated,

@@ -969,6 +969,7 @@ async fn prepare_codex_startup_state(
     let subagent_model = runtime_roles_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
     let subagent_roles = runtime_roles_config.subagent_roles.clone();
+    let custom_instructions = config.custom_instructions.clone();
     let runtime_config = tokio::task::spawn_blocking(move || {
         apply_runtime_router_config(
             &runtime_config_home,
@@ -983,6 +984,7 @@ async fn prepare_codex_startup_state(
                 subagent_model: &subagent_model,
                 subagent_reasoning_effort: &subagent_reasoning_effort,
                 subagent_roles: Some(&subagent_roles),
+                custom_instructions: &custom_instructions,
                 stream_max_retries,
             },
         )
@@ -1808,6 +1810,7 @@ async fn prepare_native_runtime_state(
                 subagent_model: &native_subagent_config.subagent_model,
                 subagent_reasoning_effort: &native_subagent_config.subagent_reasoning_effort,
                 subagent_roles: Some(&native_subagent_config.subagent_roles),
+                custom_instructions: &native_subagent_config.custom_instructions,
                 stream_max_retries,
             },
         )

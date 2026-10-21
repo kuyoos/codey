@@ -745,6 +745,7 @@ mod tests {
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: Some(&configured),
+                custom_instructions: "",
                 marker: &marker,
                 backup_root: &temp.path().join("backups"),
             },

@@ -225,6 +225,7 @@ pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub subagent_model: &'a str,
     pub subagent_reasoning_effort: &'a str,
     pub subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
+    pub custom_instructions: &'a str,
     pub stream_max_retries: u32,
 }
 
@@ -255,6 +256,7 @@ struct RouterApplyOptions<'a> {
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
     subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
+    custom_instructions: &'a str,
     marker: &'a Path,
     backup_root: &'a Path,
 }
@@ -316,6 +318,7 @@ pub(crate) fn apply_runtime_router_config(
             subagent_model: options.subagent_model,
             subagent_reasoning_effort: options.subagent_reasoning_effort,
             subagent_roles: options.subagent_roles,
+            custom_instructions: options.custom_instructions,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -398,6 +401,7 @@ fn apply_isolated_runtime_router_config(
         subagent_model,
         subagent_reasoning_effort,
         subagent_roles,
+        custom_instructions,
         marker,
         backup_root,
     } = options;
@@ -527,6 +531,7 @@ fn apply_isolated_runtime_router_config(
         root_instructions.as_deref(),
         fastctx_instructions.as_deref(),
         collaboration_hint.as_deref(),
+        custom_instructions,
     )?;
 
     let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some();
@@ -581,6 +586,7 @@ fn apply_isolated_runtime_router_config(
         fastctx_namespace,
         local_router.map(|_| local_router::ROUTER_PROVIDER_ID),
         &hook_trust_entries,
+        custom_instructions,
         stream_max_retries,
     )?;
 
@@ -712,6 +718,7 @@ fn apply_isolated_test_runtime_config(
             subagent_model,
             subagent_reasoning_effort,
             subagent_roles,
+            custom_instructions: "",
             marker,
             backup_root,
         },
@@ -966,6 +973,7 @@ fn apply_isolated_prompt_sources(
     root_instructions: Option<&str>,
     fastctx_instructions: Option<&str>,
     collaboration_hint: Option<&str>,
+    custom_instructions: &str,
 ) -> Result<()> {
     remove_guidance_from_table(
         document.as_table_mut(),
@@ -990,6 +998,17 @@ fn apply_isolated_prompt_sources(
             document.as_table_mut(),
             "developer_instructions",
             instructions,
+            "developer_instructions",
+        )?;
+    }
+    // 用户自定义指令来自 Codey 自己的配置，从不写入用户的 config.toml，因此
+    // 这里只追加、不做历史版本移除；清空设置时下一次启动自然不再附加。
+    // 放在最后是为了让用户文本紧邻 Codex 原有指令之后，排在 Codey 生成内容之后。
+    if !custom_instructions.trim().is_empty() {
+        append_table_constraint_text(
+            document.as_table_mut(),
+            "developer_instructions",
+            custom_instructions,
             "developer_instructions",
         )?;
     }
@@ -2520,6 +2539,7 @@ fn build_isolated_runtime_overrides(
     fastctx_namespace: Option<&str>,
     provider_id: Option<&str>,
     hook_trust_entries: &[RuntimeHookTrustEntry],
+    custom_instructions: &str,
     stream_max_retries: u32,
 ) -> Result<Vec<String>> {
     let mut overrides = Vec::new();
@@ -2688,7 +2708,10 @@ fn build_isolated_runtime_overrides(
         )?;
     }
 
-    if fastctx_namespace.is_some() || root_instructions.is_some() {
+    if fastctx_namespace.is_some()
+        || root_instructions.is_some()
+        || !custom_instructions.trim().is_empty()
+    {
         push_document_override(
             &mut overrides,
             effective,

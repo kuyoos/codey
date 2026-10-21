@@ -1938,6 +1938,9 @@ async fn save_codey_config_locked(
         config.misc_model = config_input.misc_model;
     }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
+    let custom_instructions = config_input.custom_instructions.trim();
+    crate::config::validate_custom_instructions(custom_instructions)?;
+    config.custom_instructions = custom_instructions.to_string();
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
     validate_official_account_config_change(&previous, &config)?;
@@ -3041,6 +3044,7 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.user_scripts != current.user_scripts
         || applied.stream_max_retries != current.stream_max_retries
         || applied.slim_codex_pet != current.slim_codex_pet
+        || applied.custom_instructions != current.custom_instructions
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.codex_launch_proxy != current.codex_launch_proxy
         || applied.fast_context_tools != current.fast_context_tools

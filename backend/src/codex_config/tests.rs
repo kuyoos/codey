@@ -95,6 +95,128 @@ fn codex_home_is_resolved_once_per_process() {
 }
 
 #[test]
+fn custom_instructions_reach_the_runtime_override_without_touching_config_toml() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = "model = \"user-model\"\n";
+    fs::write(home.join("config.toml"), original_config).unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        supports_websockets: false,
+        supports_remote_compaction: false,
+        requires_openai_auth: true,
+    };
+    let custom = "Always answer in 简体中文。\n\nPrefer `file:line` citations.";
+
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            remote_compaction_models: None,
+            model_contexts: None,
+            stream_max_retries: 5,
+            local_router: Some(&endpoint),
+            use_official_catalog: false,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            custom_instructions: custom,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+
+    // 用户的 config.toml 必须原样保留：自定义指令只走启动期覆盖。
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original_config
+    );
+    let override_entry = applied
+        .runtime_config_overrides
+        .iter()
+        .find(|entry| entry.starts_with("developer_instructions="))
+        .expect("developer_instructions override");
+    // 覆盖项是 TOML 字符串字面量，多行文本与控制字符由序列化层转义。
+    let parsed: toml_edit::Value = override_entry
+        .split_once('=')
+        .map(|(_, raw)| raw.trim().parse().unwrap())
+        .expect("override carries a TOML value");
+    let text = parsed.as_str().expect("override value is a string");
+    assert!(text.contains("Always answer in 简体中文。"));
+    assert!(text.contains("Prefer `file:line` citations."));
+}
+
+#[test]
+fn empty_custom_instructions_add_no_developer_instructions_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        supports_websockets: false,
+        supports_remote_compaction: false,
+        requires_openai_auth: true,
+    };
+
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            remote_compaction_models: None,
+            model_contexts: None,
+            stream_max_retries: 5,
+            local_router: Some(&endpoint),
+            use_official_catalog: false,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            custom_instructions: "  \n\t ",
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry.starts_with("developer_instructions=")),
+        "空白自定义指令不应产生覆盖项"
+    );
+}
+
+#[test]
+fn custom_instructions_append_after_codey_generated_guidance() {
+    let mut document = parse_document("").unwrap();
+    apply_isolated_prompt_sources(
+        &mut document,
+        Some("CODEY ROOT GUIDANCE"),
+        None,
+        None,
+        "USER CUSTOM GUIDANCE",
+    )
+    .unwrap();
+    let root = document["developer_instructions"].as_str().unwrap();
+    let codey_index = root.find("CODEY ROOT GUIDANCE").expect("codey guidance");
+    let custom_index = root.find("USER CUSTOM GUIDANCE").expect("custom guidance");
+    // 用户文本排在 Codey 生成内容之后，避免被后追加的约束挤到前面。
+    assert!(codey_index < custom_index);
+}
+
+#[test]
 fn runtime_input_guard_detects_concurrent_file_changes() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
@@ -695,6 +817,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -859,6 +982,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -911,6 +1035,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1259,6 +1384,7 @@ enabled = true
         Some(&sources[0]),
         Some(&sources[1]),
         Some(&sources[2]),
+        "",
     )
     .unwrap();
     let first = document_string(&document).unwrap();
@@ -1293,6 +1419,7 @@ enabled = true
         Some(&sources[0]),
         Some(&sources[1]),
         Some(&sources[2]),
+        "",
     )
     .unwrap();
     assert_eq!(document_string(&document).unwrap(), first);
@@ -1529,6 +1656,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1574,6 +1702,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1635,6 +1764,7 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: None,
+                custom_instructions: "",
                 marker: &marker,
                 backup_root: &backup_root,
             },
@@ -1713,6 +1843,7 @@ fn context_budget_startup_applies_and_recovers_global_conflicts() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backups,
         },
@@ -1785,6 +1916,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: None,
+                custom_instructions: "",
                 marker: &marker,
                 backup_root: &backup_root,
             },
@@ -1832,6 +1964,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1889,6 +2022,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
                     subagent_model: DEFAULT_SUBAGENT_MODEL,
                     subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                     subagent_roles: None,
+                    custom_instructions: "",
                     marker: &marker,
                     backup_root: &backup_root,
                 },
@@ -1942,6 +2076,7 @@ wire_api = "responses"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -2112,6 +2247,7 @@ service_tier = "flex"
                     subagent_model: DEFAULT_SUBAGENT_MODEL,
                     subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                     subagent_roles: None,
+                    custom_instructions: "",
                     marker: &marker,
                     backup_root: &backup_root,
                 },
@@ -3341,6 +3477,7 @@ experimental_bearer_token = "upstream-secret-token"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -3477,6 +3614,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -3517,6 +3655,7 @@ fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backups,
         },
@@ -3570,6 +3709,7 @@ wire_api = "responses"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            custom_instructions: "",
             marker: &marker,
             backup_root: &backup_root,
         },
