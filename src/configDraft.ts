@@ -1,7 +1,7 @@
 import type { Config, Profile } from "./App.types";
 
 function equal(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return left === right || JSON.stringify(left) === JSON.stringify(right);
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -9,6 +9,7 @@ function object(value: unknown): value is Record<string, unknown> {
 }
 
 function mergeValue(base: unknown, draft: unknown, incoming: unknown): unknown {
+  if (base === draft) return incoming;
   if (equal(base, draft)) return incoming;
   if (!object(base) || !object(draft) || !object(incoming)) return draft;
   const merged: Record<string, unknown> = {};

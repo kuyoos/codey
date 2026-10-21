@@ -1,101 +1,763 @@
 .request-log-workspace {
-  gap: 10px;
-  padding: 16px 24px 12px;
+  gap: 14px;
+  padding: 18px 24px 14px;
   overflow: hidden;
-  background: var(--codey-surface, #fff);
+  background: var(--codey-surface-sunken, #f2f2f5);
   color: var(--codey-text, #242629);
   font-size: 13px;
 }
-.request-log-header, .request-log-heading, .request-log-actions,
-.request-log-overview-heading, .request-log-results-heading {
+.request-log-overview-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-shrink: 0;
 }
-.request-log-heading { justify-content: flex-start; flex-wrap: wrap; gap: 10px; }
-.request-log-eyebrow { margin: 0 0 2px; color: var(--codey-muted, #73767d); font-size: 10px; letter-spacing: .08em; }
-.request-log-heading h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.03em; line-height: 1.25; }
-.request-log-actions { gap: 8px; }
-.request-log-filters { flex-shrink: 0; padding: 8px 12px; border: 1px solid var(--codey-border, #e7e8eb); border-radius: 8px; background: var(--codey-surface-muted, #fafafb); }
-.request-log-filter-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* 筛选与概览直接落在画布上，不再叠加边框卡片，减少层层嵌套的盒感。 */
+.request-log-filters { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+.request-log-filter-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; }
+/* 记录状态与页面操作收进筛选行右端，不再单独占用页头。 */
+.request-log-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; }
 .request-log-search { display: flex; gap: 6px; align-items: center; flex: 1 1 280px; min-width: 240px; max-width: 480px; }
-.request-log-filter-controls { font-size: 12px; }
-.request-log-overview {
-  flex-shrink: 0;
-  padding: 8px 12px;
-  border: 1px solid var(--codey-border, #e7e8eb);
-  border-radius: 8px;
-  background: var(--codey-surface-muted, #fafafb);
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+
+.request-log-overview { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+.request-log-overview-heading { min-height: 26px; padding: 0 2px; }
+
+/* 统一的白色卡片语言：画布上的唯一层级。 */
+.request-log-results, .request-log-metric, .request-log-analytics {
+  background: var(--codey-surface, #fff);
+  border: 1px solid var(--codey-border, rgba(0, 0, 0, .08));
+  border-radius: 10px;
+  box-shadow: 0 1px 2px rgba(var(--codey-ink-rgb, 0, 0, 0), .035);
 }
-.request-log-overview-heading { min-height: 26px; }
-.request-log-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.request-log-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 8px; }
+@media (max-width: 1280px) {
+  .request-log-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  .request-log-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .request-log-metric {
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 2px;
-  padding: 6px 12px;
-  background: var(--codey-surface, #ffffff);
-  border: 1px solid var(--codey-border, #e7e8eb);
-  border-radius: 6px;
+  padding: 8px 12px;
   min-width: 0;
 }
-.request-log-results { border: 1px solid var(--codey-border, #e7e8eb); border-radius: 8px; min-height: 220px; }
-.request-log-results-heading { padding: 8px 14px; border-bottom: 1px solid var(--codey-border, #e7e8eb); }
-.request-log-results-heading strong { font-weight: 600; }
-.request-log-results-heading strong span { margin-left: 7px; border-radius: 5px; padding: 1px 6px; background: var(--codey-surface-sunken, #f0f1f3); color: var(--codey-muted, #666b73); font-size: 11px; font-weight: 500; }
-.request-log-results-heading > span { color: var(--codey-muted, #73767d); font-size: 11px; }
-.request-log-table { font-size: 12px; }
-.request-log-table th { position: sticky; top: 0; z-index: 1; background: var(--codey-surface-muted, #fafafb); color: var(--codey-muted, #666b73); font-size: 11px; font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--codey-border, #e7e8eb); text-align: left; }
-.request-log-table td { padding: 8px 12px; border-bottom: 1px solid var(--codey-border, #eff0f2); vertical-align: top; }
-.request-log-table tbody tr { cursor: pointer; }
-.request-log-table tbody tr[data-focus-visible="true"] { outline: 2px solid var(--codey-blue, #3170c9); outline-offset: -2px; }
-.request-log-workspace button:focus-visible { outline: 2px solid var(--codey-blue, #3170c9); outline-offset: 3px; }
-.request-log-table [class*="text-[10px]"] { font-size: 11px; }
-.request-log-table [class*="text-[var(--codey-subtle,#8e8e93)]"] { color: var(--codey-subtle, #747982); }
+.request-log-analytics { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.request-log-analytics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.request-log-analytics-section { min-width: 0; display: flex; flex-direction: column; }
+.request-log-analytics-title { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 0 2px 6px; }
+.request-log-analytics-scroll { max-height: 144px; overflow: auto; border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), .06); border-radius: 6px; }
+/* 统计表：HeroUI Table 覆写密度——小字号、紧凑行距、表头吸顶。 */
+.request-log-analytics-table { font-size: 11px; }
+.request-log-analytics-thead { position: sticky; top: 0; z-index: 1; }
+.request-log-analytics-th {
+  height: auto;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-align: left;
+}
+.request-log-analytics-th::after { content: none; }
+.request-log-analytics-td { padding: 4px 10px; }
+
+.request-log-results { min-height: 220px; }
+
+/* 筛选范围内的记录总数：收在筛选行右端的元数据区，读数安静但始终可见。 */
+.request-log-total {
+  font-size: 11px;
+  color: var(--codey-muted, #6e6e73);
+  white-space: nowrap;
+}
+.request-log-total strong {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--codey-text, #1d1d1f);
+}
+
+/* 分段状态筛选：与列表判定 pill 共用色点词汇。 */
+.request-log-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--codey-surface-sunken, #f1f2f4);
+  border: 1px solid var(--codey-border, rgba(0, 0, 0, .08));
+}
+.request-log-segment {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 3px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  color: var(--codey-muted, #6e6e73);
+  transition: background-color .12s ease, color .12s ease, box-shadow .12s ease;
+}
+.request-log-segment:hover { color: var(--codey-text, #1d1d1f); }
+.request-log-segment.is-active {
+  background: var(--codey-surface, #fff);
+  color: var(--codey-text, #1d1d1f);
+  box-shadow: 0 1px 2px rgba(var(--codey-ink-rgb, 0, 0, 0), .12);
+}
+.request-log-segment:focus-visible { outline: 2px solid var(--codey-blue, #007aff); outline-offset: 1px; }
+
+/* 判定色点：在分段控件里按 tone 类取色，在 pill 里跟随 pill 的文字色。 */
+.request-log-result-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  background: currentColor;
+}
+.request-log-result-dot.is-success { color: var(--codey-green, #34c759); }
+.request-log-result-dot.is-danger { color: var(--codey-red, #ff3b30); }
+.request-log-result-dot.is-warning { color: var(--codey-amber, #ff9500); }
+.request-log-result-dot.is-muted { color: var(--codey-muted, #6e6e73); }
+
+.request-log-filter-facets { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* 生效筛选 chips：每条 chip 可单独移除，避免逐个回退下拉框。 */
+.request-log-chips { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; }
+.request-log-chip {
+  gap: 4px;
+  max-width: 280px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 6px;
+  background: var(--codey-surface, #fff);
+  border: 1px solid var(--codey-border, rgba(0, 0, 0, .08));
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--codey-text-soft, #48484a);
+}
+.request-log-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.request-log-chips-clear {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--codey-blue, #007aff);
+  border-radius: 4px;
+}
+.request-log-chips-clear:hover { text-decoration: underline; }
+
+/* ── 请求流 ─────────────────────────────────────────────────────────────
+   HeroUI Table：ScrollContainer 承担横向滚动与容器查询，表头（thead）吸顶；
+   table-layout:fixed 取表头单元格宽度为列宽，标识列全部固定像素，耗时/
+   用量/缓存三个读数列平分剩余宽度——宽屏下供应商与模型也不会被拉成
+   大片空白。容器查询在更窄时把行折叠成三行堆叠记录。 */
+.request-log-stream {
+  --reqlog-pad: 14px;
+  --reqlog-min: 1350px;
+  container-type: inline-size;
+  container-name: reqlog;
+  min-height: 0;
+  flex: 1;
+  grid-template-rows: minmax(0, 1fr);
+}
+.request-log-stream.is-refreshing { opacity: .75; transition: opacity .15s ease; }
+.request-log-stream-scroll { min-height: 0; overflow: auto; }
+.request-log-table {
+  min-width: var(--reqlog-min);
+  table-layout: fixed;
+  font-size: 12px;
+  color: var(--codey-text, #1d1d1f);
+}
+.request-log-stream-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--codey-surface-muted, #fafafb);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--codey-muted, #6e6e73);
+  letter-spacing: .02em;
+  user-select: none;
+}
+.request-log-th {
+  height: 34px;
+  padding: 0 7px;
+  border-bottom: 1px solid var(--codey-border, #e7e8eb);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.request-log-th::after { content: none; }
+.request-log-th:first-child { padding-left: var(--reqlog-pad); }
+.request-log-th:last-child { padding-right: var(--reqlog-pad); }
+/* 数字列右对齐，指标在表格右侧收成一条整齐的读数列。 */
+.request-log-th-latency,
+.request-log-th-tokens,
+.request-log-th-cache,
+.request-log-th-chevron { text-align: right; }
+/* 徽章列居中：协议与思考强度的胶囊在窄列里对中排布。 */
+.request-log-th-protocol,
+.request-log-th-effort { text-align: center; }
+/* 列宽模板：标识列按需取固定像素；耗时/用量/缓存不设宽，三列平分
+   剩余宽度，读数仍靠右钉齐。 */
+.request-log-th-time { width: 300px; }
+.request-log-th-status { width: 120px; }
+.request-log-th-provider { width: 200px; }
+.request-log-th-protocol { width: 88px; }
+.request-log-th-model { width: 210px; }
+.request-log-th-effort { width: 100px; }
+.request-log-th-chevron { width: 30px; }
+.request-log-row {
+  height: 62px;
+  cursor: pointer;
+  transition: background-color .12s ease;
+}
+.request-log-td {
+  padding: 10px 7px;
+  height: auto;
+  background: transparent;
+  border-bottom: 1px solid var(--codey-border-subtle, rgba(0, 0, 0, .05));
+  vertical-align: middle;
+  font-size: 12px;
+  color: var(--codey-text, #1d1d1f);
+}
+.request-log-td:first-child { padding-left: var(--reqlog-pad); }
+.request-log-td:last-child { padding-right: var(--reqlog-pad); }
+.request-log-row:last-child .request-log-td { border-bottom: 0; }
+@media (hover: hover) {
+  .request-log-row:hover { background: var(--codey-surface-muted, #fafafc); }
+}
+.request-log-row.is-selected { background: var(--codey-surface-muted, #fafafc); }
+.request-log-row.is-selected .request-log-td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--codey-blue, #007aff);
+}
+.request-log-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+}
+.request-log-cell-latency,
+.request-log-cell-tokens,
+.request-log-cell-cache,
+.request-log-cell-chevron { align-items: flex-end; }
+/* 思考强度列：胶囊包裹读数居中，长预算值截断后由悬浮提示兜底。 */
+.request-log-cell-effort { align-items: center; }
+.request-log-cell-effort .request-log-meta-tag { max-width: 100%; overflow: hidden; }
+/* 偶数行淡底：宽表里的横向视线引导，悬停与选中仍覆盖其上。 */
+.request-log-row:nth-child(even) { background: var(--codey-surface-muted, #fafafc); }
+@media (hover: hover) {
+  .request-log-row:nth-child(even):hover { background: rgba(var(--codey-ink-rgb, 0, 0, 0), .05); }
+}
+.request-log-row.is-selected,
+.request-log-row.is-selected:nth-child(even) { background: rgba(var(--codey-ink-rgb, 0, 0, 0), .05); }
+
+/* 时间列：扫读时间 + 等宽 ID 子行，复制图标悬浮出现。 */
+.request-log-time-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.request-log-time {
+  font-size: 12.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--codey-text, #1d1d1f);
+  white-space: nowrap;
+}
+.request-log-id-line { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.request-log-id-label {
+  flex: none;
+  width: 2em;
+  font-size: 10px;
+  white-space: nowrap;
+  color: var(--codey-subtle, #8e8e93);
+}
+.request-log-id {
+  height: auto;
+  min-height: 0;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 4px;
+  padding: 0 2px;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--codey-subtle, #8e8e93);
+}
+.request-log-id:hover { color: var(--codey-text, #1d1d1f); }
+.request-log-id-icon { flex: none; opacity: 0; transition: opacity .12s ease; }
+.request-log-row:hover .request-log-id-icon,
+.request-log-id:focus-visible .request-log-id-icon,
+.request-log-id[data-focus-visible] .request-log-id-icon { opacity: 1; }
+@media (hover: none) {
+  .request-log-id-icon { opacity: .55; }
+}
+.request-log-none { color: var(--codey-subtle, #8e8e93); font-size: 10.5px; }
+
+/* 状态列：带色点的判定 pill，错误细节交给悬浮提示。 */
+.request-log-cell-status { align-items: flex-start; gap: 4px; }
+.request-log-result {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: default;
+}
+.request-log-result.is-success {
+  color: var(--codey-green, #047857);
+  background: color-mix(in oklch, var(--codey-green) 12%, transparent);
+  border-color: color-mix(in oklch, var(--codey-green) 30%, transparent);
+}
+.request-log-result.is-danger {
+  color: var(--codey-red, #b91c1c);
+  background: color-mix(in oklch, var(--codey-red) 11%, transparent);
+  border-color: color-mix(in oklch, var(--codey-red) 30%, transparent);
+}
+.request-log-result.is-warning {
+  color: var(--codey-amber, #b45309);
+  background: color-mix(in oklch, var(--codey-amber) 14%, transparent);
+  border-color: color-mix(in oklch, var(--codey-amber) 34%, transparent);
+}
+.request-log-result.is-muted {
+  color: var(--codey-muted, #6e6e73);
+  background: var(--codey-surface-sunken, #f1f2f4);
+  border-color: var(--codey-border, #e2e4e8);
+}
+.request-log-status-sub {
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10.5px;
+  color: var(--codey-subtle, #8e8e93);
+  white-space: nowrap;
+}
+
+/* 供应商列。 */
+.request-log-provider-main { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.request-log-provider-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--codey-text, #1d1d1f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.request-log-provider-sub {
+  font-size: 10.5px;
+  color: var(--codey-muted, #6e6e73);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 模型列：等宽主名 + 标记，副行是上游实际回报模型。 */
+.request-log-model-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.request-log-model-name {
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--codey-text, #1d1d1f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 模型名下的标记行：请求类别等元数据胶囊，收在主读数下一行。 */
+.request-log-model-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.request-log-kind-tag {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 0.5px 7px;
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: .02em;
+  line-height: 1.4;
+  white-space: nowrap;
+  border: 1px solid var(--codey-border, #e2e4e8);
+  background: var(--codey-surface-sunken, #f1f2f4);
+  color: var(--codey-muted, #61666e);
+}
+.request-log-subagent-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 4px;
+  padding: 0 4.5px;
+  height: 16px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  cursor: default;
+  color: var(--codey-purple, #7e22ce);
+  background: color-mix(in oklch, var(--codey-purple, #af52de) 12%, transparent);
+  border: 1px solid color-mix(in oklch, var(--codey-purple, #af52de) 28%, transparent);
+}
+/* 模型路由副行：映射后的发送模型用蓝箭头，上游回报的模型用琥珀箭头。 */
+.request-log-model-route {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10.5px;
+}
+.request-log-model-route.is-mapped { color: var(--codey-blue, #007aff); }
+.request-log-model-route.is-returned { color: var(--codey-amber, #b45309); }
+/* 回报模型只是同型快照变体（差个日期后缀）时用中性色，警示色留给真正换型。 */
+.request-log-model-route.is-variant { color: var(--codey-muted, #6e6e73); }
+
+/* 耗时列：左缘竖条上端随首字档、下端随总耗时档，纵向扫读即可分辨健康度；
+   读数是标签-读数两行网格（首字/总耗时/速度），按阈值分档着色。 */
+.request-log-latency-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  cursor: help;
+}
+.request-log-latency-bar {
+  width: 3px;
+  border-radius: 2px;
+  background: linear-gradient(to bottom,
+    var(--bar-top, var(--codey-subtle)) 0%, var(--bar-top, var(--codey-subtle)) 40%,
+    var(--bar-bottom, var(--codey-subtle)) 60%, var(--bar-bottom, var(--codey-subtle)) 100%);
+}
+.request-log-latency-grid {
+  display: grid;
+  /* 固定两列宽让每行的读数块同宽，竖条在纵向对齐成一条线。 */
+  grid-template-columns: 34px 78px;
+  column-gap: 7px;
+  row-gap: 3px;
+  justify-content: end;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+.request-log-latency-label {
+  align-self: center;
+  font-size: 9px;
+  color: var(--codey-subtle, #8e8e93);
+}
+.request-log-latency-value {
+  justify-self: end;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.request-log-sev-good { color: var(--codey-green, #047857); }
+.request-log-sev-warn { color: var(--codey-amber, #b45309); }
+/* 琥珀与红之间取一档中间色，让相邻两档可区分。 */
+.request-log-sev-slow { color: color-mix(in oklch, var(--codey-amber) 55%, var(--codey-red)); }
+.request-log-sev-critical { color: var(--codey-red, #b91c1c); }
+.request-log-sev-none { color: var(--codey-subtle, #8e8e93); }
+
+/* Token 列：新鲜输入与输出是第一行读数，缓存读写与思考量收进副行。 */
+.request-log-token-grid {
+  display: grid;
+  cursor: help;
+  grid-template-columns: auto auto;
+  column-gap: 9px;
+  row-gap: 3px;
+  justify-content: end;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+.request-log-token-in {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  justify-self: end;
+  color: var(--codey-green, #047857);
+}
+.request-log-token-out {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  justify-self: end;
+  color: var(--codey-blue, #007aff);
+}
+.request-log-token-extra {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--codey-muted, #6e6e73);
+  white-space: nowrap;
+}
+.request-log-token-extra > span { display: inline-flex; align-items: center; gap: 2px; white-space: nowrap; }
+.request-log-tokens-reasoning { color: var(--codey-amber, #b45309); }
+.request-log-usage-none { font-size: 10.5px; color: var(--codey-subtle, #8e8e93); cursor: help; white-space: nowrap; }
+
+/* 单元格悬浮明细：标签-读数两列，总量行前置一条分隔线。 */
+.request-log-cell-detail {
+  display: grid;
+  gap: 4px;
+  min-width: 196px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.request-log-cell-detail-title {
+  font-weight: 600;
+  color: var(--codey-text, #1d1d1f);
+  margin-bottom: 2px;
+}
+.request-log-cell-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--codey-text-soft, #48484a);
+  white-space: nowrap;
+}
+.request-log-cell-detail-value {
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--codey-text, #1d1d1f);
+}
+.request-log-cell-detail-total {
+  border-top: 1px solid var(--codey-border, #e7e8eb);
+  padding-top: 5px;
+  margin-top: 2px;
+}
+
+/* 缓存列：读取缓存与命中率上下两行对齐，按命中率混色。 */
+.request-log-cell-cache { align-items: flex-end; gap: 3px; }
+.request-log-cache-grid {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  cursor: help;
+}
+.request-log-cache-read {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--codey-text, #1d1d1f);
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.request-log-cache-read svg {
+  color: var(--codey-muted, #6e6e73);
+  flex-shrink: 0;
+}
+.request-log-cache-pill {
+  --cache-hue: color-mix(in oklch, var(--codey-green) var(--cache-rate, 0%), var(--codey-amber));
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px;
+  border-radius: 6px;
+  line-height: 1.35;
+  white-space: nowrap;
+  cursor: default;
+  color: var(--cache-hue);
+  background: color-mix(in oklch, var(--cache-hue) 13%, transparent);
+  border: 1px solid color-mix(in oklch, var(--cache-hue) 30%, transparent);
+}
+.request-log-cache-pill.is-empty { --cache-hue: var(--codey-subtle, #8e8e93); cursor: help; }
+.request-log-cache-dot { width: 6px; height: 6px; border-radius: 2px; background: var(--cache-hue); flex-shrink: 0; }
+
+.request-log-chevron { color: var(--codey-subtle, #8e8e93); justify-self: end; flex-shrink: 0; }
+
+/* 窄容器下的堆叠记录：表格退化为块级，单元格用 display:contents 拆开，
+   伪元素换行使每条记录稳定成三行——模型与判定、供应商与用量、时间与耗时。 */
+@container reqlog (max-width: 780px) {
+  .request-log-stream-header { display: none; }
+  .request-log-table { display: block; min-width: 0; }
+  .request-log-stream-body { display: block; min-width: 0; }
+  .request-log-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 5px;
+    min-width: 100%;
+    height: auto;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--codey-border-subtle, rgba(0, 0, 0, .05));
+  }
+  .request-log-td { display: contents; }
+  .request-log-row.is-selected { box-shadow: inset 3px 0 0 0 var(--codey-blue, #007aff); }
+  .request-log-row.is-selected .request-log-td:first-child { box-shadow: none; }
+  .request-log-cell { flex-direction: row; align-items: baseline; gap: 6px; }
+  .request-log-cell-time,
+  .request-log-cell-model,
+  .request-log-cell-tokens { display: contents; }
+
+  /* 第一行：模型与思考档位为主，判定靠右。 */
+  .request-log-model-main { order: 10; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  .request-log-model-tags { order: 12; }
+  .request-log-cell-effort { order: 14; }
+  .request-log-cell-effort:has(> .request-log-none) { display: none; }
+  .request-log-model-route { display: none; }
+  .request-log-cell-status { order: 15; margin-left: auto; }
+  .request-log-cell-model::after { content: ""; order: 18; flex: 0 0 100%; height: 0; }
+
+  /* 第二行：供应商占满余量，Token 两行读数靠右。 */
+  .request-log-cell-provider { order: 30; flex: 1 1 0; min-width: 0; align-items: baseline; }
+  .request-log-provider-main { min-width: 0; }
+  .request-log-cell-tokens > * { order: 40; margin-left: auto; }
+  .request-log-cell-tokens::after { content: ""; order: 45; flex: 0 0 100%; height: 0; }
+
+  /* 第三行：时间、协议与耗时块收进一行安静的元数据。 */
+  .request-log-time-row { order: 50; }
+  .request-log-time { font-size: 11px; font-weight: 400; color: var(--codey-muted, #6e6e73); }
+  .request-log-id-line { display: none; }
+  .request-log-cell-protocol { order: 52; }
+  .request-log-cell-latency { order: 55; margin-left: auto; }
+
+  /* 折叠掉次要的列与装饰，细节都在详情抽屉里。 */
+  .request-log-cell-cache,
+  .request-log-cell-chevron,
+  .request-log-status-sub { display: none; }
+}
+
 .request-log-protocol {
   display: inline-flex;
   align-items: center;
-  font-weight: 500;
-  border-radius: 4px;
-  padding: 1px 6px;
-  font-size: 11px;
-  line-height: 1.25;
+  justify-content: center;
+  min-width: 36px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  line-height: 1;
+  white-space: nowrap;
   border: 1px solid transparent;
+  box-shadow: 0 1px 2px rgba(var(--codey-ink-rgb, 0, 0, 0), .02);
 }
 .request-log-protocol-http {
-  background: var(--codey-blue-soft, #eff6ff);
-  color: var(--codey-blue, #1d4ed8);
-  border-color: var(--codey-blue-border, #bfdbfe);
+  background: color-mix(in oklch, var(--codey-blue, #007aff) 10%, transparent);
+  color: var(--codey-blue, #007aff);
+  border-color: color-mix(in oklch, var(--codey-blue, #007aff) 26%, transparent);
 }
 .request-log-protocol-sse {
-  background: var(--codey-green-soft, #ecfdf5);
+  background: color-mix(in oklch, var(--codey-green, #34c759) 10%, transparent);
   color: var(--codey-green, #047857);
-  border-color: var(--codey-green-border, #a7f3d0);
+  border-color: color-mix(in oklch, var(--codey-green, #34c759) 26%, transparent);
 }
 .request-log-protocol-ws {
-  background: var(--codey-purple-soft, #faf5ff);
+  background: color-mix(in oklch, var(--codey-purple, #af52de) 10%, transparent);
   color: var(--codey-purple, #7e22ce);
-  border-color: var(--codey-purple-border, #e9d5ff);
+  border-color: color-mix(in oklch, var(--codey-purple, #af52de) 26%, transparent);
 }
 .request-log-protocol-grpc {
-  background: var(--codey-amber-soft, #fff7ed);
-  color: var(--codey-amber, #c2410c);
-  border-color: var(--codey-amber-border, #fed7aa);
+  background: color-mix(in oklch, var(--codey-amber, #ff9500) 10%, transparent);
+  color: var(--codey-amber, #b45309);
+  border-color: color-mix(in oklch, var(--codey-amber, #ff9500) 26%, transparent);
 }
 .request-log-protocol-default {
   background: var(--codey-surface-sunken, #f1f2f4);
   color: var(--codey-muted, #61666e);
   border-color: var(--codey-border, #e2e4e8);
 }
+/* 思考强度胶囊：灯泡图标点明语义，档位色落在图标、文字与描边上；
+   底色比标记行其他胶囊再淡一点，靠色彩浓度分级而非标签大小。 */
+.request-log-meta-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 0.5px 8px 0.5px 6px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  line-height: 1.5;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.request-log-effort-low {
+  background: var(--codey-surface-sunken, #f1f2f4);
+  color: var(--codey-muted, #61666e);
+  border-color: var(--codey-border, #e2e4e8);
+}
+.request-log-effort-medium {
+  background: color-mix(in oklch, var(--codey-blue, #1d4ed8) 10%, transparent);
+  color: var(--codey-blue, #1d4ed8);
+  border-color: color-mix(in oklch, var(--codey-blue, #1d4ed8) 30%, transparent);
+}
+.request-log-effort-high {
+  background: color-mix(in oklch, var(--codey-purple, #7e22ce) 11%, transparent);
+  color: var(--codey-purple, #7e22ce);
+  border-color: color-mix(in oklch, var(--codey-purple, #7e22ce) 32%, transparent);
+}
+.request-log-effort-max {
+  background: color-mix(in oklch, var(--codey-amber, #c2410c) 12%, transparent);
+  color: var(--codey-amber, #c2410c);
+  border-color: color-mix(in oklch, var(--codey-amber, #c2410c) 34%, transparent);
+}
+.request-log-parent-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+  background: var(--codey-surface-sunken, #f1f2f4);
+  color: var(--codey-text-soft, #48484a);
+  border: 1px solid var(--codey-border, #e2e4e8);
+}
+.request-log-parent-tag svg { opacity: .72; }
+.request-log-official-tag {
+  flex-shrink: 0;
+  border-radius: 4px;
+  background: var(--codey-blue-soft, #eaf3ff);
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--codey-blue, #007aff);
+}
+
 .request-log-pagination {
   padding: 8px 14px;
   background: var(--codey-surface, #fff);
+  border-radius: 0 0 10px 10px;
 }
 .request-log-pagination .pagination {
   width: auto;
@@ -133,22 +795,16 @@
   .request-log-workspace { padding-inline: 36px; }
 }
 @media (max-width: 900px) {
-  .request-log-workspace { padding: 12px 14px 10px; gap: 8px; }
-  .request-log-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .request-log-workspace { padding: 14px 14px 10px; gap: 10px; }
+  .request-log-analytics-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 600px) {
   .request-log-workspace { overflow: auto; }
-  .request-log-header { align-items: flex-start; flex-direction: column; gap: 10px; }
-  .request-log-heading { width: 100%; justify-content: space-between; gap: 8px; }
-  .request-log-heading h1 { font-size: 19px; }
-  .request-log-actions { width: 100%; }
-  .request-log-actions .button { flex: 1; }
+  .request-log-meta { flex-basis: 100%; }
   .request-log-search { flex-basis: 100%; max-width: 100%; }
-  .request-log-metrics { grid-template-columns: 1fr; gap: 6px; }
   .request-log-overview-heading { flex-wrap: wrap; gap: 6px; }
   .request-log-overview-heading > div { flex-wrap: wrap; }
   .request-log-results { flex: 1 0 360px; }
-  .request-log-results-heading > span { max-width: 140px; text-align: right; }
   .request-log-pagination nav { display: flex; flex-wrap: wrap; gap: 4px; }
   .request-log-detail > div:first-child { padding: 16px; flex-wrap: wrap; gap: 12px; }
   .request-log-detail > div:nth-child(2) { padding: 16px; }

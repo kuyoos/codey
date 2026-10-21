@@ -7,7 +7,7 @@ use crate::config::{
 use crate::model_catalog;
 use crate::model_id;
 #[cfg(test)]
-use crate::subagent::rules::{RoleAccess, RolePolicy};
+use crate::subagent::rules::RolePolicy;
 
 #[cfg(test)]
 pub(crate) fn role_policy(role: &str) -> Option<RolePolicy> {
@@ -39,6 +39,7 @@ pub(crate) fn reconcile_for_current_provider(
         config.manual_third_party_models(),
         reasoning_efforts.as_ref(),
         Some(&config.subagent_model),
+        &config.codex_app_path,
     )
     .ok();
     reconcile_with_model_state(config, state.as_ref());
@@ -251,35 +252,17 @@ mod tests {
     use crate::config::ProviderProfile;
 
     #[test]
-    fn role_policies_keep_access_and_visual_capabilities_explicit() {
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_QUICK_SCAN),
-            Some(RolePolicy {
-                access: RoleAccess::ReadOnly,
-                visual: false,
-            })
-        );
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_WORKER),
-            Some(RolePolicy {
-                access: RoleAccess::Write,
-                visual: false,
-            })
-        );
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_VISUAL_WORKER),
-            Some(RolePolicy {
-                access: RoleAccess::Write,
-                visual: true,
-            })
-        );
-        assert_eq!(
-            role_policy(crate::config::SUBAGENT_ROLE_DEFAULT),
-            Some(RolePolicy {
-                access: RoleAccess::Write,
-                visual: true,
-            })
-        );
+    fn task_roles_share_tool_capabilities() {
+        for role in crate::config::SUBAGENT_ROLE_IDS {
+            assert_eq!(
+                role_policy(role),
+                Some(RolePolicy {
+                    access: "write".into(),
+                    visual: true,
+                }),
+                "{role}"
+            );
+        }
         assert_eq!(role_policy("unknown"), None);
     }
 

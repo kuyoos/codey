@@ -88,7 +88,9 @@ impl ResponsesDownstream for CapturedDownstream {
     }
 }
 
-fn test_server(config: &CodeyConfig) -> RouterServer {
+pub(super) fn test_server(config: &CodeyConfig) -> RouterServer {
+    let official_concurrency = Arc::new(OfficialConcurrency::default());
+    official_concurrency.update(&RouterSnapshot::from_config(config));
     RouterServer {
         endpoint: RuntimeRouterEndpoint {
             base_url: "http://127.0.0.1:9/v1".into(),
@@ -101,6 +103,8 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         bearer_token: "Bearer test-router".into(),
         snapshot: Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config)))),
         connection_limit: Arc::new(Semaphore::new(4)),
+        official_concurrency,
+        admitted_connections: Arc::new(Semaphore::new(MAX_ADMITTED_CONNECTIONS)),
         rejection_limit: Arc::new(Semaphore::new(4)),
         request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
         bindings: Arc::default(),
@@ -115,6 +119,7 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         official_auth_path: PathBuf::from("/nonexistent/codey-lifecycle-test-auth"),
         account_usage_cache: Arc::default(),
         official_auth_cache: Arc::default(),
+        siwc_auth_cache: Arc::default(),
         request_log: Arc::new(RouteRequestLogController::new()),
     }
 }
@@ -136,6 +141,203 @@ fn official_history_server(url: String) -> (RouterServer, String) {
         .selected_models_by_provider
         .insert("openai".into(), vec!["test-model".into()]);
     (test_server(&config), model_alias("openai", "test-model"))
+}
+
+fn managed_account_record(
+    id: &str,
+    issued_at: u64,
+) -> crate::official_accounts::OfficialAccountRecord {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "iat": issued_at,
+            "https://api.openai.com/auth": { "chatgpt_account_id": id }
+        }))
+        .unwrap(),
+    );
+    crate::official_accounts::OfficialAccountRecord::from_auth(
+        json!({"tokens": {"access_token": format!("header.{payload}.signature"), "account_id": id}}),
+        1,
+    )
+    .unwrap()
+}
+
+fn managed_account_server(auth: OfficialRouteAuth) -> (RouterServer, RouteTarget) {
+    let (server, _) = official_history_server("http://127.0.0.1:9/v1".into());
+    let mut route = server
+        .snapshot
+        .read()
+        .unwrap()
+        .routes
+        .values()
+        .next()
+        .unwrap()
+        .as_ref()
+        .clone();
+    route.official_auth = Some(auth);
+    (server, route)
+}
+
+fn managed_account_request(
+    record: &crate::official_accounts::OfficialAccountRecord,
+) -> HttpRequest {
+    HttpRequest {
+        method: "POST".into(),
+        path: "/v1/responses".into(),
+        headers: vec![
+            (
+                "authorization".into(),
+                format!(
+                    "Bearer {}",
+                    record.auth["tokens"]["access_token"].as_str().unwrap()
+                ),
+            ),
+            (
+                CHATGPT_ACCOUNT_ID_HEADER.into(),
+                record.account_id.clone().unwrap(),
+            ),
+        ],
+        body: Vec::new(),
+        _body_budget_permit: None,
+    }
+}
+
+#[tokio::test]
+async fn deleted_managed_accounts_reject_old_routes_even_with_cached_credentials() {
+    for mode in ["default", "stored", "siwc"] {
+        let directory = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::official_accounts::OfficialAccountStore::new(directory.path());
+        let record = managed_account_record("selected", 100);
+        store.upsert(&record).unwrap();
+        if mode != "stored" {
+            store.activate(&record.id, home.path()).unwrap();
+        }
+        let siwc_path = if mode == "siwc" {
+            let credential = serde_json::from_value(json!({
+                "clientId": "test-client", "scopes": [], "accessToken": "siwc-token",
+                "expiresAt": crate::official_accounts::unix_timestamp() + 3600,
+            }))
+            .unwrap();
+            store.attach_siwc(&record.id, &credential).unwrap();
+            Some(store.siwc_path(&record.id))
+        } else {
+            None
+        };
+        let (server, old_route) = managed_account_server(OfficialRouteAuth {
+            account_id: record.id.clone(),
+            email: None,
+            path: store.credential_path(home.path(), &record.id),
+            record_path: store.account_path(&record.id),
+            siwc_path,
+            accepts_incoming_authorization: mode == "default",
+        });
+        let request = managed_account_request(&record);
+        // 先填充凭据缓存，删除后继续使用同一快照和同一请求头。
+        assert!(
+            server
+                .prepare_upstream_request_headers(&request, &old_route)
+                .await
+                .is_ok()
+        );
+        store
+            .remove_with_codex_login(&record.id, home.path())
+            .unwrap();
+        let error = server
+            .prepare_upstream_request_headers(&request, &old_route)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, 401, "{mode}");
+        assert_eq!(error.1, "official_account_unavailable", "{mode}");
+        assert!(error.2.contains("已移除"), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn stale_default_route_keeps_selected_account_after_default_switch() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = crate::official_accounts::OfficialAccountStore::new(directory.path());
+    let selected = managed_account_record("selected", 100);
+    let other = managed_account_record("other", 200);
+    store.upsert(&selected).unwrap();
+    store.upsert(&other).unwrap();
+    store.activate(&selected.id, home.path()).unwrap();
+    let (server, old_route) = managed_account_server(OfficialRouteAuth {
+        account_id: selected.id.clone(),
+        email: None,
+        path: store.credential_path(home.path(), &selected.id),
+        record_path: store.account_path(&selected.id),
+        siwc_path: None,
+        accepts_incoming_authorization: true,
+    });
+    store.activate(&other.id, home.path()).unwrap();
+    let headers = server
+        .prepare_upstream_request_headers(&managed_account_request(&other), &old_route)
+        .await
+        .unwrap();
+    assert_eq!(
+        headers[AUTHORIZATION],
+        format!(
+            "Bearer {}",
+            selected.auth["tokens"]["access_token"].as_str().unwrap()
+        )
+    );
+    assert_eq!(headers[CHATGPT_ACCOUNT_ID_HEADER], "selected");
+}
+
+#[tokio::test]
+async fn managed_default_route_accepts_same_account_refresh_and_rejects_foreign_tokens() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = crate::official_accounts::OfficialAccountStore::new(directory.path());
+    let selected = managed_account_record("selected", 100);
+    let refreshed_login = managed_account_record("selected", 200);
+    let refreshed_request = managed_account_record("selected", 300);
+    let other = managed_account_record("other", 400);
+    store.upsert(&selected).unwrap();
+    store.activate(&selected.id, home.path()).unwrap();
+    crate::official_accounts::OfficialAccountStore::write_codex_login(
+        home.path(),
+        &refreshed_login,
+    )
+    .unwrap();
+    let (server, route) = managed_account_server(OfficialRouteAuth {
+        account_id: selected.id.clone(),
+        email: None,
+        path: store.credential_path(home.path(), &selected.id),
+        record_path: store.account_path(&selected.id),
+        siwc_path: None,
+        accepts_incoming_authorization: true,
+    });
+    for request_record in [&selected, &refreshed_request, &other] {
+        let headers = server
+            .prepare_upstream_request_headers(&managed_account_request(request_record), &route)
+            .await
+            .unwrap();
+        let expected = if request_record == &refreshed_request {
+            &refreshed_request
+        } else {
+            &refreshed_login
+        };
+        assert_eq!(
+            headers[AUTHORIZATION],
+            format!(
+                "Bearer {}",
+                expected.auth["tokens"]["access_token"].as_str().unwrap()
+            )
+        );
+        assert_eq!(headers[CHATGPT_ACCOUNT_ID_HEADER], "selected");
+    }
+    // 非文件的记录路径应安全失败，不能借助已有缓存继续授权。
+    std::fs::remove_file(store.account_path(&selected.id)).unwrap();
+    std::fs::create_dir(store.account_path(&selected.id)).unwrap();
+    let error = server
+        .prepare_upstream_request_headers(&managed_account_request(&selected), &route)
+        .await
+        .unwrap_err();
+    assert_eq!(error.1, "official_account_unavailable");
+    assert!(error.2.contains("不是文件"));
 }
 
 fn foreign_history_items() -> Value {
@@ -247,7 +449,7 @@ async fn official_history_sanitization_does_not_change_third_party_requests() {
 }
 
 #[tokio::test]
-async fn official_history_is_sanitized_after_websocket_reconnect_and_http_fallback() {
+async fn official_history_is_sanitized_for_websocket_and_opaque_http_continuations() {
     for websocket in [true, false] {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let (server, model) =
@@ -272,15 +474,8 @@ async fn official_history_is_sanitized_after_websocket_reconnect_and_http_fallba
                     .unwrap();
                 request
             } else {
-                // 官方线路会尝试 WebSocket；握手失败后才走 HTTP 回退。
-                let handshake = read_http_request(&mut stream).await.unwrap();
-                assert_eq!(handshake.method, "GET");
-                write_json_response(&mut stream, 404, &json!({"error":"WebSocket unsupported"}))
-                    .await
-                    .unwrap();
-                drop(stream);
-                let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut stream).await.unwrap();
+                assert_eq!(request.method, "POST");
                 write_json_response(&mut stream, 200, &response)
                     .await
                     .unwrap();
@@ -305,7 +500,20 @@ async fn official_history_is_sanitized_after_websocket_reconnect_and_http_fallba
         downstream
             .prepare_native_http_fallback(&resolved.route, &headers, &mut original)
             .unwrap();
-        downstream.write_event(&json!({"type":"response.completed","response":{"id":"resp-first","status":"completed","output":foreign_history_items()}})).await.unwrap();
+        let mut history = foreign_history_items();
+        if websocket {
+            history[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("encrypted_content");
+        } else {
+            history.as_array_mut().unwrap().push(json!({
+                "type":"web_search_call",
+                "status":"completed",
+                "action":{"type":"search","query":"test"}
+            }));
+        }
+        downstream.write_event(&json!({"type":"response.completed","response":{"id":"resp-first","status":"completed","output":history}})).await.unwrap();
         peer.next().await.unwrap().unwrap();
         downstream.clear_stream_id();
         let body = json!({"model":model,"stream":true,"previous_response_id":"resp-first","input":"follow up"});
@@ -329,10 +537,16 @@ async fn official_history_is_sanitized_after_websocket_reconnect_and_http_fallba
             .unwrap();
         assert!(sent.get("previous_response_id").is_none());
         let items = sent["input"].as_array().unwrap();
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), if websocket { 6 } else { 7 });
         assert_eq!(items[0], json!({"role":"user","content":"original task"}));
         assert_portable_official_history(&items[1..5]);
-        assert_eq!(items[5], json!({"role":"user","content":"follow up"}));
+        if !websocket {
+            assert_eq!(items[5]["type"], "web_search_call");
+        }
+        assert_eq!(
+            items.last().unwrap(),
+            &json!({"role":"user","content":"follow up"})
+        );
     }
 }
 

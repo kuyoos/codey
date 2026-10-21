@@ -37,7 +37,6 @@ test("email masking keeps the domain and hides the local part", () => {
 test("the route page masks on demand and never persists the toggle", () => {
   assert.match(modelSectionSource, /const \[maskSensitive, setMaskSensitive\] = useState\(false\)/);
   assert.match(modelSectionSource, /aria-label=\{maskSensitive \? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"\}/);
-  assert.match(modelSectionSource, /<OfficialAccountsPanel[\s\S]{0,200}?maskSensitive=\{maskSensitive\}/);
   assert.match(modelSectionSource, /hideUrl\(profile\.baseUrl\)/);
   assert.doesNotMatch(modelSectionSource, /localStorage/);
   assert.match(panelSource, /maskSensitive = false/);

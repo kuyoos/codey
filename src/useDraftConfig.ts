@@ -61,6 +61,17 @@ export function useDraftConfig() {
     return merged;
   }
 
+  function adoptSavedConfig(incoming: Config, submittedDraft: Config | null) {
+    if (persistedConfigRef.current && incoming.settingsRevision < persistedConfigRef.current.settingsRevision) return null;
+    const merged = reconcileConfigDraft(submittedDraft, draftConfigRef.current, incoming);
+    if (!merged) return null;
+    persistedConfigRef.current = incoming;
+    draftConfigRef.current = merged.config;
+    setConfig(merged.config);
+    setDirty(merged.dirty);
+    return merged;
+  }
+
   function discardDraft() {
     if (persistedConfigRef.current) {
       setConfig(persistedConfigRef.current);
@@ -80,6 +91,7 @@ export function useDraftConfig() {
     editConfig,
     isOnlyNativeRouterToggle,
     adoptRouteConfig,
+    adoptSavedConfig,
     discardDraft,
   };
 }

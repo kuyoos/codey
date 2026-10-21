@@ -9,7 +9,6 @@ const root = new URL("../", import.meta.url);
 test("settings panels declare render-isolation hooks and stable handlers", async () => {
   const [
     app,
-    appUpdates,
     notice,
     confirmation,
     sections,
@@ -17,7 +16,6 @@ test("settings panels declare render-isolation hooks and stable handlers", async
     draftConfig,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
-    readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
     readFile(new URL("src/useAppNotice.tsx", root), "utf8"),
     readFile(new URL("src/useConfirmationDialog.tsx", root), "utf8"),
     Promise.all(
@@ -38,24 +36,6 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(confirmation, /useSyncExternalStore\(/);
   assert.match(confirmation, /export const ConfirmationDialogHost = memo\(/);
   assert.doesNotMatch(app, /async function checkForUpdates\(/);
-  assert.match(appUpdates, /export function useAppUpdates/);
-  assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates", \{ forceRefresh \}\)/);
-  assert.equal(
-    appUpdates.match(/invoke<UpdateCheck>\("check_for_updates",/g)?.length,
-    1,
-  );
-  assert.match(
-    appUpdates,
-    /updateCheckInFlightRef = useRef<Promise<UpdateCheck> \| null>/,
-  );
-  assert.match(appUpdates, /const result = await requestUpdateCheck\(\)/);
-  assert.match(appUpdates, /const result = await requestUpdateCheck\(true\)/);
-  assert.match(
-    app,
-    /const handleFooterUpdateClick = useStableEvent\(\(\) => void checkForUpdates\(\)\)/,
-  );
-  assert.match(appUpdates, /invoke<UpdateDownload>\(\s*"download_update",/);
-  assert.match(appUpdates, /invoke\("install_downloaded_update"/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onAnalyzeDiagnosticStorage=\{handleAnalyzeDiagnosticStorage\}/);
   assert.match(app, /onToggleDraftModel=\{toggleDraftModel\}/);
@@ -66,10 +46,6 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(app, /onSetDefaultModel=\{handleSetRouteDefaultModel\}/);
   assert.match(app, /onToggleLocalRouter=\{handleToggleLocalRouter\}/);
   assert.match(app, /onToggleRouteRequestLog=\{handleToggleRouteRequestLog\}/);
-  assert.match(
-    app,
-    /onOfficialAccountsChanged=\{handleOfficialAccountsChanged\}/,
-  );
   assert.match(app, /onSave=\{saveModelSelection\}/);
   assert.doesNotMatch(modelSelection, /withTimeout/);
   assert.match(modelSelection, /routeId: modelPickerRouteId/);
@@ -84,7 +60,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /OpenAI Chat Completions/);
   assert.match(sections, /Anthropic Messages/);
   assert.doesNotMatch(sections, /route-auth-mode-label/);
-  assert.equal(sections.match(/<Select\s/g)?.length, 2);
+  assert.equal(sections.match(/<Select\s/g)?.length, 3);
   assert.equal(sections.match(/<ModelCombobox\s/g)?.length, 2);
   assert.doesNotMatch(sections, /<select/);
   assert.match(sections, /visibleProfiles\.map\(\(profile\) =>/);
@@ -95,8 +71,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /checked=\{config\.localRouterEnabled\}/);
   assert.match(sections, /const routeConfigReadOnly = !config\.localRouterEnabled/);
   assert.match(sections, /checked=\{checked\}/);
-  assert.match(sections, /<OfficialAccountsPanel\s/);
-  assert.doesNotMatch(sections, /isOfficial && [^\n]*<OfficialAccountsPanel/);
+  assert.doesNotMatch(sections, /<OfficialAccountsPanel/);
   assert.doesNotMatch(sections, /provider-model-usage-toggle/);
   assert.match(sections, /<DialogTitle>/);
   assert.match(sections, /config\.localRouterEnabled && \(/);

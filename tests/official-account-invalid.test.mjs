@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const panel = await readFile(new URL("../src/OfficialAccountsPanel.tsx", import.meta.url), "utf8");
+const accountState = await readFile(new URL("../src/useOfficialAccounts.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.models.css", import.meta.url), "utf8");
 const types = await readFile(new URL("../src/App.types.ts", import.meta.url), "utf8");
 const mockApi = await readFile(new URL("../src/dev/mockApi.ts", import.meta.url), "utf8");
@@ -23,8 +24,9 @@ test("失效账号卡片使用红色背景并显示失效标识", () => {
   assert.match(panel, /账号已失效/);
 });
 
-test("失效账号隐藏切换默认按钮，后端也拒绝切换", () => {
-  assert.match(panel, /\{!account\.isDefault && !account\.invalid && \(/);
+test("仅有效的非默认账号卡片提供切换交互，后端也拒绝失效账号切换", () => {
+  assert.match(panel, /const switchable = !account\.isDefault && !account\.invalid;/);
+  assert.match(panel, /\.\.\.\(switchable\s*\? \{[\s\S]*?role: "button",[\s\S]*?askSetDefault\(account\);[\s\S]*?onKeyDown:[\s\S]*?askSetDefault\(account\);[\s\S]*?: \{\}\)/);
   const setDefault = accountCommands.slice(
     accountCommands.indexOf("pub(super) async fn set_default_official_account"),
   );
@@ -39,12 +41,15 @@ test("额度查询确认失效后重读列表，且不再请求官方接口", ()
   assert.match(store, /invalid_grant/);
 });
 
-test("源码约束：失效账号在刷新前返回，前端轮询包含失效分支", () => {
-  // 令牌刷新前直接返回本地记录，不再向官方令牌接口发请求。
+test("源码约束：失效账号跳过两类令牌刷新，前端轮询包含失效分支", () => {
+  const refreshTokens = accountCommands.match(/async fn refresh_official_account_tokens\([\s\S]*?\n\}/)?.[0];
+  assert.ok(refreshTokens, "应存在账号令牌刷新入口");
+  // 非默认且有效的账号才轮换 Codex 凭据，失效账号也跳过独立的直连凭据刷新。
   assert.match(
-    accountCommands,
-    /if record\.invalid\(\) \{\s*return Ok\(record\);\s*\}\s*let expected = record\.clone\(\);\s*let proxy = [^;]+;\s*match refresh_if_stale/,
+    refreshTokens,
+    /if !is_default \{[\s\S]*?if !record\.invalid\(\) \{\s*let expected = record\.clone\(\);\s*let proxy = [^;]+;\s*match refresh_if_stale_cached/,
   );
+  assert.match(refreshTokens, /if !record\.invalid\(\) && record\.siwc\.is_some\(\) \{\s*match refresh_siwc_if_stale/);
   const refresh = store.match(/pub async fn refresh_if_stale_cached\([\s\S]*?\n\}/)?.[0];
   assert.ok(refresh, "应存在生产使用的令牌刷新函数");
   assert.match(
@@ -80,11 +85,11 @@ test("失效账号的线路随失效标记一起移除", () => {
   )?.[0];
   assert.ok(refreshRoutes, "应存在账号变更后的线路刷新函数");
   assert.match(refreshRoutes, /prepare_routes_for_current_launch\(state\)\.await/);
-  assert.match(refreshRoutes, /hot_reload_runtime_models\(state\)\.await/);
+  assert.match(refreshRoutes, /ModelHotReloadOutcome::queued\(state, true\)/);
   assert.match(refreshRoutes, /"config": redacted_config\(&config\)/);
   assert.match(refreshRoutes, /"modelState": model_state/);
   assert.match(
-    panel,
+    accountState,
     /invoke<OfficialAccountsResult>\("refresh_official_account_routes"\)/,
   );
   // 预览派生同样跳过失效账号，界面检查时线路列表与后端一致。

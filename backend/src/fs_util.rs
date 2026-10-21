@@ -3,8 +3,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 
 pub(crate) fn timestamp_millis() -> u128 {
@@ -35,6 +36,31 @@ pub(crate) fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 pub(crate) fn file_lock_is_contended(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
         || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+/// 在超时范围内重试独占锁，最后一次等待不超过剩余时间。
+pub(crate) fn acquire_exclusive_lock_with_timeout(
+    file: &File,
+    _lock_path: &Path,
+    timeout: Duration,
+    retry: Duration,
+    timeout_msg: impl Fn() -> String,
+    lock_err_msg: impl Fn() -> String,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if file_lock_is_contended(&error) => {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    anyhow::bail!(timeout_msg());
+                }
+                std::thread::sleep(retry.min(timeout.saturating_sub(elapsed)));
+            }
+            Err(error) => return Err(error).with_context(&lock_err_msg),
+        }
+    }
 }
 
 /// 以毫秒时间戳命名的唯一子目录（不创建）。同一毫秒内的重复调用追加 `-n` 后缀。
@@ -218,6 +244,34 @@ pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusive_lock_times_out_then_succeeds_after_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.lock");
+        let first = File::create(&path).unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&first).unwrap();
+
+        let acquire = || {
+            acquire_exclusive_lock_with_timeout(
+                &second,
+                &path,
+                Duration::from_millis(5),
+                Duration::from_millis(1),
+                || "lock timeout".to_string(),
+                || "lock failed".to_string(),
+            )
+        };
+        assert_eq!(acquire().unwrap_err().to_string(), "lock timeout");
+        fs2::FileExt::unlock(&first).unwrap();
+        acquire().unwrap();
+        fs2::FileExt::unlock(&second).unwrap();
+    }
 
     #[test]
     fn temp_paths_are_unique_for_the_same_destination() {

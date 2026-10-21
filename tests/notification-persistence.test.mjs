@@ -6,10 +6,6 @@ const appSource = readFileSync(
   new URL("../src/App.tsx", import.meta.url),
   "utf8",
 );
-const updateSource = readFileSync(
-  new URL("../src/useAppUpdates.ts", import.meta.url),
-  "utf8",
-);
 const dialogSource = readFileSync(
   new URL("../src/notifications/NotificationChannelDialog.tsx", import.meta.url),
   "utf8",
@@ -20,9 +16,4 @@ test("notification dialog waits for the channel configuration to persist", () =>
   assert.match(dialogSource, /if \(await onSave\(draft\)\) onOpenChange\(false\)/);
   assert.match(appSource, /async function persistNotificationChannels/);
   assert.match(appSource, /await persist\(\{[\s\S]*?webhook:[\s\S]*?channels/);
-});
-
-test("installing an update saves pending settings first", () => {
-  assert.match(appSource, /beforeInstall: async \(\) => \{[\s\S]*?await persist\(config\)/);
-  assert.match(updateSource, /await beforeInstall\(\);[\s\S]*?install_downloaded_update/);
 });

@@ -1,4 +1,6 @@
 import type { ExtensionTransport, Inventory, Scope, SkillCacheInventory } from "./types";
+import { withTimeout } from "../../appUtils";
+export { withTimeout } from "../../appUtils";
 
 // 缓存删除独立于普通库存；关闭窗口也不能绕过未完成写入的检查。
 const skillCacheRequests = new WeakMap<ExtensionTransport, ReturnType<typeof createSkillCacheRequests>>();
@@ -51,28 +53,8 @@ const caches = new WeakMap<
     { expires: number; value?: Inventory; pending?: Promise<Inventory> }
   >
 >();
-export function scopeKey(scope: Scope) {
+function scopeKey(scope: Scope) {
   return JSON.stringify(scope);
-}
-export function withTimeout<T>(
-  promise: Promise<T>,
-  mutation = false,
-  milliseconds = 15000,
-): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () =>
-        reject(
-          new Error(
-            mutation
-              ? "操作等待超时，后台可能仍在执行，结果尚不确定。请刷新确认后再操作，避免重复提交。"
-              : "读取超时，请检查服务连接后重试。",
-          ),
-        ),
-      milliseconds,
-    );
-    promise.then(resolve, reject).finally(() => clearTimeout(timer));
-  });
 }
 export function invalidateInventory(
   request: ExtensionTransport,

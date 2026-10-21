@@ -38,20 +38,6 @@ type InjectionStatusSummary = {
   unverifiedInjectionScriptCount: number;
 };
 
-export function isMainProcessInjectionConfirmed(
-  status: Pick<RuntimeStatus, "running" | "maintenance">,
-): boolean {
-  const mode = status.maintenance?.startupInjectionMode;
-  return status.running && (mode === "node_options" || mode === "inspector");
-}
-
-export function canRepairMainProcessInjection(
-  _status: Pick<RuntimeStatus, "running" | "clientPlatform" | "restartInProgress" | "maintenance">,
-): boolean {
-  // Electron security settings belong to the installed client.
-  return false;
-}
-
 export function buildEnabledOptimizationFeatures(
   status: OptimizationRuntimeStatus,
   fastContextToolsStatus: FastContextToolsStatus,

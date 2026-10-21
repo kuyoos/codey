@@ -226,6 +226,44 @@ test("waits for a visible footer entry instead of falling back to the header", (
   assert.equal(document.getElementById("codey-settings-button").parentElement, stack);
 });
 
+test("keeps the rail entry while Codex marks the rail aria-hidden for a modal", () => {
+  const { document, header, rail, stack, window } = createProfileRailFixture();
+  const button = document.getElementById("codey-settings-button");
+  assert.equal(button.parentElement, stack);
+  // Codex 的模态对话框只给背景内容补 aria-hidden，图标栏布局不变，入口应保持挂载。
+  rail.setAttribute("aria-hidden", "true");
+  window.__codeyRendererScan();
+  assert.equal(document.getElementById("codey-settings-button"), button);
+  assert.equal(button.parentElement, stack);
+  assert.equal(header.querySelector("#codey-settings-button"), null);
+  // 模态期间 React 重建底部堆栈时，入口也能直接挂回新容器。
+  const replacement = new FakeElement("div", { right: 44, width: 36, height: 36, top: 850 });
+  const replacementSlot = new FakeElement("span", { right: 44, width: 36, height: 36, top: 850 });
+  const replacementProfile = new FakeElement("button", { right: 44, width: 36, height: 36, top: 850 });
+  replacementProfile.setAttribute("aria-label", "打开个人资料菜单");
+  replacementSlot.appendChild(replacementProfile);
+  replacement.appendChild(replacementSlot);
+  stack.remove();
+  rail.children.at(-1).appendChild(replacement);
+  window.__codeyRendererScan();
+  const remounted = document.getElementById("codey-settings-button");
+  assert.ok(remounted);
+  assert.equal(remounted.parentElement, replacement);
+  assert.equal(remounted.nextElementSibling, replacementSlot);
+  rail.removeAttribute("aria-hidden");
+  window.__codeyRendererScan();
+  assert.equal(document.getElementById("codey-settings-button"), remounted);
+  // 真实隐藏（hidden）的图标栏仍然不算可用挂载。
+  rail.setAttribute("hidden", "");
+  window.__codeyRendererScan();
+  assert.equal(document.getElementById("codey-settings-button"), null);
+  rail.removeAttribute("hidden");
+  window.__codeyRendererScan();
+  const restored = document.getElementById("codey-settings-button");
+  assert.ok(restored);
+  assert.equal(restored.parentElement, replacement);
+});
+
 test("joins the native measured action row and repairs its noninteractive mirror", () => {
   const header = new FakeElement("header", { right: 1200 });
   const slot = new FakeElement("div", { right: 1200, width: 70 });
@@ -557,8 +595,6 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     },
   };
   let accountUsageCalls = 0;
-  let quotaUsageCalls = 0;
-  let quotaUsageResult = accountUsageResult;
   let appServerUsageCalls = 0;
   let appServerUsageResult = {
     rateLimits: {
@@ -587,7 +623,6 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     },
   };
   const scheduledDelays = [];
-  let storedUsageSnapshots = 0;
   const window = {
     __codeyReadAccountRateLimits: async () => {
       appServerUsageCalls += 1;
@@ -595,13 +630,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     },
     __codeySessionToolsInjectLoaded: true,
     __codexSessionDeleteBridge: async (path, args) => {
-      if (path === "/api/query_official_account_usage") {
-        assert.equal(args.forceRefresh, quotaUsageCalls === 0);
-        quotaUsageCalls += 1;
-        return quotaUsageResult;
-      }
       if (path === "/api/store_official_account_usage") {
-        storedUsageSnapshots += 1;
         assert.equal(args.authGeneration, 1);
         assert.equal(args.snapshot.primary.usedPercent, 20);
         assert.ok(args.snapshot.fetchedAt > 0);
@@ -646,11 +675,6 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
 
   await window.__codeyRefreshAccountUsage();
 
-  assert.equal(await window.__codeyReadQuotaAccountUsage(), accountUsageResult);
-  assert.equal(quotaUsageCalls, 0, "reuse the account display without another query");
-  await window.__codeyReadQuotaAccountUsage({ forceRefresh: true });
-  assert.equal(quotaUsageCalls, 1, "manual refresh bypasses the display cache");
-
   const usage = findById("codey-account-usage");
   const settingsButton = findById("codey-settings-button");
   const injectedStyle = findById("codey-core-injected-style");
@@ -681,7 +705,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.match(usage.innerHTML, /今天 \d{2}:\d{2} 重置/);
   assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 重置/);
   const summaryHtml = usage.innerHTML.split('class="codey-usage-details"')[0];
-  assert.match(summaryHtml, /class="codey-usage-plan-tag">Pro 20x<\/span>[\s\S]*?周额度[\s\S]*?60%/);
+  assert.match(summaryHtml, /class="codey-usage-plan-tag" data-pro-tier="200">Pro 200<\/span>[\s\S]*?周额度[\s\S]*?60%/);
   assert.doesNotMatch(summaryHtml, /余额|42/);
   assert.match(usage.innerHTML, /class="codey-usage-details" role="tooltip"/);
   assert.match(usage.innerHTML, /5 小时额度[\s\S]*?剩余 85%[\s\S]*?已用 15%/);
@@ -760,45 +784,50 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.doesNotMatch(remountedSummaryHtml, /data-window="five-hour"/);
   assert.match(remountedSummaryHtml, /class="codey-usage-plan-tag">Plus<\/span>/);
 
+  for (const [planType, expectedLabel, expectedTier] of [
+    ["prolite", "Pro 100", "100"],
+    ["pro", "Pro 200", "200"],
+    ["promax", "Pro 500", "500"],
+    ["  ProLite  ", "Pro 100", "100"],
+    ["pro100", "Pro 100", "100"],
+    ["pro200", "Pro 200", "200"],
+    ["pro500", "Pro 500", "500"],
+    ["pro 100", "Pro 100", "100"],
+    ["pro_200", "Pro 200", "200"],
+    ["pro-500", "Pro 500", "500"],
+    ["Pro $100", "Pro 100", "100"],
+    ["5x", "Pro 5x"],
+    ["pro5x", "Pro 5x"],
+    ["pro20x", "Pro 20x"],
+    ["plus", "Plus"],
+    ["free", "Free"],
+    ["business_prolite", "business_prolite"],
+    ["business_pro100", "business_pro100"],
+    ["pro500_trial", "pro500_trial"],
+    ["pro_lite", "pro_lite"],
+    ["business_plus", "business_plus"],
+    ["  future_plan  ", "future_plan"],
+    ["__proto__", "__proto__"],
+    ['pro500" data-pro-tier="500', 'pro500" data-pro-tier="500'],
+  ]) {
+    accountUsageResult = { ...accountUsageResult, planType };
+    await window.__codeyRefreshAccountUsage();
+    assert.equal(
+      remountedUsage.innerHTML.match(/class="codey-usage-plan-tag"(?: data-pro-tier="(?:100|200|500)")?>([^<]*)<\/span>/)?.[1],
+      expectedLabel.replaceAll('"', "&quot;"),
+      `rendered plan label for ${planType}`,
+    );
+    assert.equal(
+      remountedUsage.innerHTML.match(/class="codey-usage-plan-tag" data-pro-tier="([^"]*)"/)?.[1],
+      expectedTier,
+      `rendered Pro tier for ${planType}`,
+    );
+    assert.equal(findById("codey-account-usage"), remountedUsage);
+  }
+
   accountUsageResult = { status: "disabled" };
   await window.__codeyRefreshAccountUsage();
-  const pollsBeforeDialog = scheduledDelays.filter(delay => delay === 60000).length;
-  const [first, second] = await Promise.all([
-    window.__codeyReadQuotaAccountUsage(), window.__codeyReadQuotaAccountUsage(),
-  ]);
-  assert.equal(first, quotaUsageResult); assert.equal(second, quotaUsageResult);
-  assert.equal(quotaUsageCalls, 2, "closed display queries once and coalesces overlapping reads");
   assert.equal(findById("codey-account-usage"), null);
-  assert.equal(scheduledDelays.filter(delay => delay === 60000).length, pollsBeforeDialog);
-  quotaUsageResult = { status: "error", message: "offline" };
-  const fallback = await window.__codeyReadQuotaAccountUsage();
-  assert.equal(fallback.status, "ok");
-  assert.equal(fallback.primary.usedPercent, 20);
-  assert.equal(appServerUsageCalls, 2);
-  assert.equal(findById("codey-account-usage"), null);
-  accountUsageResult = { ...first, fetchedAt: Math.floor(Date.now() / 1000) - 120 };
-  await window.__codeyRefreshAccountUsage();
-  quotaUsageResult = { ...first, fetchedAt: Math.floor(Date.now() / 1000) };
-  assert.equal(await window.__codeyReadQuotaAccountUsage(), quotaUsageResult);
-  assert.equal(quotaUsageCalls, 4, "expired display data triggers a fresh query");
-  dispatchWindowEvent({ type: "codey:config-changed" });
-  await window.__codeyReadQuotaAccountUsage();
-  assert.equal(quotaUsageCalls, 5, "configuration changes invalidate reuse");
-  const storedBeforeDrift = storedUsageSnapshots;
-  for (const changedResponse of [
-    { newRateLimits: { weekly: 20 } },
-    { rateLimits: { primary: { usedPercent: null, windowDurationMins: 10080 } } },
-    { rateLimits: { primary: { usedPercent: "", windowDurationMins: 10080 }, credits: {} } },
-    { status: "unavailable", code: "codey_capability_unavailable" },
-  ]) {
-    appServerUsageResult = changedResponse;
-    quotaUsageResult = { ...first, stale: true, authGeneration: 1 };
-    const result = await window.__codeyReadQuotaAccountUsage();
-    assert.equal(result, quotaUsageResult, "unsupported fallback preserves the backend snapshot");
-    assert.equal(storedUsageSnapshots, storedBeforeDrift, "unknown response never writes a successful snapshot");
-  }
-  quotaUsageResult = { status: "error", message: "offline", authGeneration: 1 };
-  assert.equal(await window.__codeyReadQuotaAccountUsage(), quotaUsageResult, "missing capability does not turn a backend error into success");
 });
 
 const createStartupUpdateFixture = (bridge) => {
@@ -950,135 +979,6 @@ const createStartupUpdateFixture = (bridge) => {
   };
 };
 
-test("hydrates the passive update badge from startup backend state", async () => {
-  const bridgeCalls = [];
-  const fixture = createStartupUpdateFixture(async (path, payload) => {
-    bridgeCalls.push({ path, payload });
-    if (path === "/backend/status") {
-      return {
-        status: "ok",
-        availableUpdate: {
-          currentVersion: "0.3.9",
-          latestVersion: "0.4.0",
-          updateAvailable: true,
-          selectedAsset: { fileName: "Codey-0.4.0.zip" },
-        },
-      };
-    }
-    if (path === "/backend/health") return { status: "ok" };
-    throw new Error(`unexpected bridge path: ${path}`);
-  });
-
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const button = fixture.document.getElementById("codey-settings-button");
-  assert.ok(button);
-  assert.equal(button.getAttribute("data-codey-update-available"), "true");
-  assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置，有可用更新");
-  assert.equal(fixture.window.__codeyUpdateAvailability.latestVersion, "0.4.0");
-  const updateEvents = fixture.events.filter(
-    (event) => event.type === "codey-update-availability-changed",
-  );
-  assert.equal(updateEvents.length, 1);
-  assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
-  assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
-  assert.equal(
-    fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
-    false,
-  );
-  assert.deepEqual(
-    bridgeCalls.map(({ path }) => path),
-    ["/backend/status", "/backend/health"],
-  );
-  assert.equal(
-    fixture.activeTimers().some((timer) => timer.delay === 30_000),
-    true,
-  );
-
-  let unchangedAttributeWrites = 0;
-  const originalSetAttribute = button.setAttribute.bind(button);
-  button.setAttribute = (...args) => {
-    unchangedAttributeWrites += 1;
-    originalSetAttribute(...args);
-  };
-  await fixture.window.__codeyRefreshRuntimeHealth();
-  assert.equal(unchangedAttributeWrites, 0);
-});
-
-test("falls back to a passive periodic check when backend update state hangs", async () => {
-  const fixture = createStartupUpdateFixture(
-    async () => new Promise(() => {}),
-  );
-
-  const timeoutTimer = fixture.activeTimers().find(
-    (timer) => timer.delay === 10_000,
-  );
-  assert.ok(timeoutTimer);
-  timeoutTimer.cleared = true;
-  timeoutTimer.callback();
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
-  assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
-  assert.equal(fixture.window.__codeyUpdateAvailability, null);
-  assert.equal(
-    fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
-    true,
-  );
-});
-
-test("saved automatic update preference controls renderer polling and manual update badges", async () => {
-  const calls = [];
-  const fixture = createStartupUpdateFixture(async (path) => {
-    calls.push(path);
-    if (path === "/backend/status") return { autoCheckCodeyUpdates: false };
-    if (path === "/backend/health") return { status: "ok" };
-    if (path === "/account/usage") return { status: "disabled" };
-    if (path === "/api/check_for_updates") return { updateAvailable: false };
-    throw new Error(`unexpected bridge path: ${path}`);
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  const updateTimers = () => fixture.activeTimers().filter((timer) => timer.delay === 30 * 60 * 1000);
-  assert.equal(updateTimers().length, 0);
-  assert.equal(calls.includes("/api/check_for_updates"), false);
-
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: true } } });
-  for (const timer of fixture.activeTimers().filter((timer) => timer.delay === 0)) {
-    timer.cleared = true;
-    timer.callback();
-  }
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls.filter((path) => path === "/api/check_for_updates").length, 1);
-  assert.equal(updateTimers().length, 1);
-
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
-  assert.equal(updateTimers().length, 0);
-  fixture.window.dispatchEvent({ type: "codey:config-changed" });
-  assert.equal(updateTimers().length, 0);
-  fixture.window.dispatchEvent({ type: "codey-update-availability-changed", detail: { updateAvailable: true, latestVersion: "2.0.0" } });
-  assert.equal(fixture.document.getElementById("codey-settings-button").getAttribute("data-codey-update-available"), "true");
-});
-
-test("disabling renderer automatic checks ignores an in-flight update response", async () => {
-  let resolveUpdate;
-  const fixture = createStartupUpdateFixture(async (path) => {
-    if (path === "/backend/status") return { autoCheckCodeyUpdates: true };
-    if (path === "/backend/health") return { status: "ok" };
-    if (path === "/api/check_for_updates") return new Promise((resolve) => { resolveUpdate = resolve; });
-    throw new Error(`unexpected bridge path: ${path}`);
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  const timer = fixture.activeTimers().find((entry) => entry.delay === 30 * 60 * 1000);
-  assert.ok(timer);
-  timer.cleared = true;
-  timer.callback();
-  assert.equal(typeof resolveUpdate, "function");
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
-  resolveUpdate({ updateAvailable: true, latestVersion: "2.0.0" });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.window.__codeyUpdateAvailability, null);
-  assert.equal(fixture.activeTimers().some((entry) => entry.delay === 30 * 60 * 1000), false);
-});
 
 test("marks the Codey icon unavailable after consecutive hung health checks and recovers", async () => {
   let healthMode = "hang";

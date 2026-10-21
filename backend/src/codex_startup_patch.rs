@@ -10,31 +10,11 @@ use std::ffi::{OsStr, OsString};
 #[cfg(any(windows, target_os = "macos", test))]
 use std::io::Write;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v40";
-const APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT: &str =
-    "codey-app-server-runtime-overrides-verified";
-/// 配置已验证且使用 Codey stdin relay 时，允许消息补丁失配后降级启动。
-const APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT: &str =
-    "codey-app-server-runtime-overrides-degraded";
-/// JS 在等待窗口内没有观察到 app-server 启动时放进异常文本，启动器据此重试。
-const APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER: &str =
-    "codey-app-server-runtime-overrides-timeout";
-const MAX_INSPECTOR_TARGET_RESPONSE_BYTES: usize = 1024 * 1024;
-/// Inspector 发现窗口。fuse 允许时 Node 在应用脚本运行前就绑定端口，20 秒足以覆盖冷启动。
-pub(crate) const STARTUP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const STARTUP_PATCH_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// 覆盖确认的调试会话上限。须盖住断点恢复前的协议和补丁求值，以及 JS 侧
-/// `appServerRuntimeOverrideTimeoutMs`（150 秒）。Codex 先显示窗口再启动
-/// app-server，Windows 商店版冷启动经常要超过一分钟才走到这次 spawn。
-const STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(165);
 /// 单次启动尝试等待 CLI 包装器确认的上限。进程退出、明确失败或确认成功都会提前结束；
-/// Windows 最多两次尝试，清理后重新计时。须盖住上面的调试会话，否则会话还在等
-/// app-server 时外层截止时间会先把它掐断。
+/// Windows 最多两次尝试，清理后重新计时。须盖住 app-server 冷启动——Codex 先显示
+/// 窗口再拉起 CLI，Windows 商店版经常要超过一分钟。
 pub(crate) const STARTUP_CLI_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
-/// 回环端口连通性探测时限（渲染进程调试端口、Inspector 端口）。
-const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) const CLI_WRAPPER_TARGET_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TARGET";
@@ -55,20 +35,6 @@ pub(crate) const CLI_WRAPPER_TOKEN_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TOKEN";
 /// 包装器执行记录文件的绝对路径；回环握手丢失时启动器据此确认目标已执行。
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const CLI_WRAPPER_MARKER_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_MARKER";
-/// When Inspector installation may win the startup race, the wrapper records
-/// progress through its marker only and does not connect a listener that the
-/// launcher can drop after Inspector success.
-#[cfg(any(windows, target_os = "macos", test))]
-pub(crate) const CLI_WRAPPER_HANDSHAKE_OPTIONAL_ENV: &str =
-    "CODEY_CODEX_CLI_WRAPPER_HANDSHAKE_OPTIONAL";
-/// Absolute JSON path the `--require` patch writes after it installs. Reuses
-/// [`CliWrapperMarker`] so the launcher can poll the same record format.
-#[cfg(any(windows, target_os = "macos", test))]
-pub(crate) const STARTUP_PATCH_MARKER_ENV: &str = "CODEY_STARTUP_PATCH_MARKER";
-#[cfg(any(windows, target_os = "macos", test))]
-const STARTUP_REQUIRE_DIR: &str = "startup-require";
-#[cfg(any(windows, target_os = "macos", test))]
-const STARTUP_REQUIRE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 #[cfg(any(windows, target_os = "macos", test))]
 const CLI_WRAPPER_HANDSHAKE_CONNECT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
@@ -80,299 +46,6 @@ const CLI_WRAPPER_HANDSHAKE_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(100);
 #[cfg(any(windows, test))]
 pub(crate) const WINDOWS_PACKAGE_RESUME_ARGUMENT: &str = "--codey-resume-packaged-app";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PatchOptions {
-    pub disable_pet: bool,
-    pub subagent_gate_active: bool,
-    /// 杂事模型在 Codex 模型目录里的 id。`None` 表示保持 Codex 原生行为。
-    pub misc_model: Option<String>,
-}
-
-pub fn inspector_argument(port: u16) -> String {
-    format!("--inspect-brk=127.0.0.1:{port}")
-}
-
-const STARTUP_PATCH_TEMPLATE: &str = concat!("\n", include_str!("codex_startup_patch.js"));
-
-#[cfg(test)]
-fn patch_expression(options: PatchOptions) -> String {
-    patch_expression_with_runtime_overrides(options, &[])
-}
-
-#[cfg(test)]
-fn patch_expression_with_runtime_overrides(
-    options: PatchOptions,
-    runtime_config_overrides: &[String],
-) -> String {
-    patch_expression_with_runtime_overrides_and_validation(options, runtime_config_overrides, false)
-}
-
-fn patch_expression_with_runtime_overrides_and_validation(
-    options: PatchOptions,
-    runtime_config_overrides: &[String],
-    require_app_server_runtime_overrides: bool,
-) -> String {
-    let error_logger_executable = match std::env::current_exe() {
-        Ok(path) => serde_json::to_string(&path.to_string_lossy().to_string())
-            .expect("error logger executable path should serialize"),
-        Err(error) => {
-            crate::error_log::record_failure(
-                "patch_failed",
-                "resolve_error_log_helper",
-                error.to_string(),
-                serde_json::json!({}),
-            );
-            "\"\"".to_string()
-        }
-    };
-    STARTUP_PATCH_TEMPLATE
-        .replace(
-            "\"__CODEY_RUNTIME_CONFIG_OVERRIDES__\"",
-            &serde_json::to_string(runtime_config_overrides)
-                .expect("runtime config overrides should serialize"),
-        )
-        .replace(
-            "\"__CODEY_ERROR_LOGGER_EXECUTABLE__\"",
-            &error_logger_executable,
-        )
-        .replace(
-            "__DISABLE_PET__",
-            if options.disable_pet { "true" } else { "false" },
-        )
-        .replace(
-            "__SUBAGENT_GATE_ACTIVE__",
-            if options.subagent_gate_active {
-                "true"
-            } else {
-                "false"
-            },
-        )
-        .replace(
-            "__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__",
-            if require_app_server_runtime_overrides {
-                "true"
-            } else {
-                "false"
-            },
-        )
-        .replace(
-            "\"__CODEY_MISC_MODEL_ID__\"",
-            &serde_json::to_string(&options.misc_model).expect("misc model should serialize"),
-        )
-}
-
-/// Main-process `--require` payload written next to Codey state and pointed at
-/// by `NODE_OPTIONS`. Never combined with `--inspect-brk`: both wrap
-/// `Module._load`.
-#[cfg(any(windows, target_os = "macos", test))]
-pub(crate) struct StartupRequire {
-    pub environment: Vec<(String, String)>,
-    pub marker_path: std::path::PathBuf,
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-pub(crate) fn prepare_startup_require(
-    options: PatchOptions,
-    runtime_config_overrides: &[String],
-) -> Result<StartupRequire> {
-    prepare_startup_require_in(
-        &codey_runtime_core::paths::default_app_state_dir(),
-        options,
-        runtime_config_overrides,
-    )
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn prepare_startup_require_in(
-    state_dir: &std::path::Path,
-    options: PatchOptions,
-    runtime_config_overrides: &[String],
-) -> Result<StartupRequire> {
-    prepare_startup_require_with_path(
-        state_dir,
-        options,
-        runtime_config_overrides,
-        space_free_path,
-    )
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn prepare_startup_require_with_path(
-    state_dir: &std::path::Path,
-    options: PatchOptions,
-    runtime_config_overrides: &[String],
-    resolve_path: impl FnOnce(&std::path::Path) -> Result<std::path::PathBuf>,
-) -> Result<StartupRequire> {
-    let directory = state_dir.join(STARTUP_REQUIRE_DIR);
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("创建 Codex 启动补丁目录失败：{}", directory.display()))?;
-    prune_startup_require_files(
-        &directory,
-        std::time::SystemTime::now(),
-        STARTUP_REQUIRE_MAX_AGE,
-    );
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let script_path = directory.join(format!("{token}.js"));
-    let marker_path = directory.join(format!("{token}.json"));
-    // `--require` has no Inspector evaluate step; the executed marker is the
-    // confirmation. Keep inspector.close() enabled in the payload.
-    let expression = patch_expression_with_runtime_overrides_and_validation(
-        options,
-        runtime_config_overrides,
-        false,
-    );
-    crate::fs_util::atomic_write_private_with_parent(&script_path, expression.as_bytes())
-        .with_context(|| format!("写入 Codex 启动补丁失败：{}", script_path.display()))?;
-    let require_argument =
-        match resolve_path(&script_path).and_then(|path| node_require_argument(&path)) {
-            Ok(argument) => argument,
-            Err(error) => {
-                if let Err(cleanup) = std::fs::remove_file(&script_path) {
-                    return Err(anyhow::anyhow!(
-                        "{error:#}；清理未使用的启动补丁失败：{cleanup}"
-                    ));
-                }
-                return Err(error);
-            }
-        };
-    Ok(StartupRequire {
-        environment: vec![
-            ("CODEX_SPARKLE_ENABLED".to_string(), "false".to_string()),
-            (
-                "CODEY_DISABLE_MACOS_CHILD_PROCESS_SAMPLER".to_string(),
-                "true".to_string(),
-            ),
-            ("NODE_OPTIONS".to_string(), require_argument),
-            (
-                STARTUP_PATCH_MARKER_ENV.to_string(),
-                marker_path.to_string_lossy().into_owned(),
-            ),
-        ],
-        marker_path,
-    })
-}
-
-/// `NODE_OPTIONS` splits on whitespace and does not honour quotes, so the
-/// `--require` path must be a single token.
-#[cfg(any(windows, target_os = "macos", test))]
-pub(crate) fn node_require_argument(path: &std::path::Path) -> Result<String> {
-    let path = space_free_path(path)?;
-    let rendered = path.to_string_lossy();
-    anyhow::ensure!(
-        !path_has_whitespace(&path),
-        "Codex 启动补丁路径包含空白，无法通过 NODE_OPTIONS 注入：{rendered}"
-    );
-    Ok(format!("--require={rendered}"))
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn path_has_whitespace(path: &std::path::Path) -> bool {
-    path.to_string_lossy().chars().any(char::is_whitespace)
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn space_free_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    if !path_has_whitespace(path) {
-        return Ok(path.to_path_buf());
-    }
-    #[cfg(windows)]
-    if let Ok(short) = windows_short_path(path)
-        && !path_has_whitespace(&short)
-    {
-        return Ok(short);
-    }
-    copy_startup_require_to_temp(path, &std::env::temp_dir())
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn copy_startup_require_to_temp(
-    path: &std::path::Path,
-    temp_dir: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    // Keep the UUID filename so the launcher's existing cleanup removes this copy.
-    let file_name = path.file_name().context("Codex 启动补丁路径缺少文件名")?;
-    let destination = temp_dir.join(file_name);
-    anyhow::ensure!(
-        !path_has_whitespace(&destination),
-        "临时补丁路径包含空白，无法通过 NODE_OPTIONS 注入：{}",
-        destination.display()
-    );
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("读取 Codex 启动补丁失败：{}", path.display()))?;
-    crate::fs_util::atomic_write_private(&destination, &bytes).with_context(|| {
-        format!(
-            "复制 Codex 启动补丁到无空格路径失败：{} -> {}",
-            path.display(),
-            destination.display()
-        )
-    })?;
-    Ok(destination)
-}
-
-#[cfg(windows)]
-fn windows_short_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
-    use windows::core::PCWSTR;
-
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut buffer = vec![0u16; 1024];
-    let mut length =
-        unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(buffer.as_mut_slice())) };
-    if length as usize >= buffer.len() {
-        buffer.resize(length as usize + 1, 0);
-        length = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(buffer.as_mut_slice())) };
-    }
-    anyhow::ensure!(
-        length > 0,
-        "无法为 Codex 启动补丁生成无空格短路径：{}",
-        path.display()
-    );
-    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
-        &buffer[..length as usize],
-    )))
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn prune_startup_require_files(
-    directory: &std::path::Path,
-    now: std::time::SystemTime,
-    max_age: std::time::Duration,
-) -> usize {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.flatten().take(1024) {
-        let path = entry.path();
-        let keep = path
-            .extension()
-            .is_none_or(|extension| extension != "js" && extension != "json" && extension != "tmp");
-        if keep {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= max_age);
-        if stale && std::fs::remove_file(&path).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-pub fn reserve_loopback_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    Ok(listener.local_addr()?.port())
-}
 
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn is_retryable_startup_io_error(error: &std::io::Error) -> bool {
@@ -475,26 +148,6 @@ pub(crate) fn cli_wrapper_marker_path_from_env(
     .then_some(path)
 }
 
-/// 渲染进程调试端口已应答而 Inspector 端口拒绝连接：Node 环境早已创建却没有 Inspector，
-/// 说明 `--inspect-brk` 被 Electron 丢弃，主进程补丁不会再有机会；进程本身在正常运行。
-#[derive(Debug)]
-pub(crate) struct InspectorUnavailable {
-    pub refused: u32,
-    pub elapsed_ms: u128,
-}
-
-impl std::fmt::Display for InspectorUnavailable {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Codex 主进程 Inspector 不可用：渲染进程调试端口已就绪，但 Inspector 端口拒绝连接 {} 次（{} ms）",
-            self.refused, self.elapsed_ms
-        )
-    }
-}
-
-impl std::error::Error for InspectorUnavailable {}
-
 /// 启动兼容等待期间 Codex 进程已退出；无需再等待任何握手。
 #[derive(Debug)]
 pub(crate) struct StartupProcessExited {
@@ -519,15 +172,6 @@ impl std::fmt::Display for StartupProcessExited {
 }
 
 impl std::error::Error for StartupProcessExited {}
-
-pub(crate) async fn loopback_port_accepts(port: u16) -> bool {
-    tokio::time::timeout(
-        LOOPBACK_PROBE_TIMEOUT,
-        tokio::net::TcpStream::connect(("127.0.0.1", port)),
-    )
-    .await
-    .is_ok_and(|result| result.is_ok())
-}
 
 #[cfg(any(windows, target_os = "macos"))]
 fn cli_wrapper_target(
@@ -570,9 +214,32 @@ fn cli_wrapper_target(
 
 #[cfg(any(windows, target_os = "macos"))]
 pub fn run_cli_wrapper_if_requested() -> Result<bool> {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(OsStr::new("--codey-observe-app-server-output"))
+    {
+        let result = observe_local_app_server_output(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+            crate::codex_config::codex_home(),
+        );
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(error).context("转发 Codex 会话响应失败");
+        }
+        return Ok(true);
+    }
     if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--codey-route-app-server-input")) {
-        let result =
-            route_local_app_server_input(std::io::stdin().lock(), std::io::stdout().lock());
+        let overrides =
+            std::env::var(CLI_WRAPPER_OVERRIDES_ENV).context("Codex 请求转发缺少运行时配置")?;
+        let overrides: Vec<String> =
+            serde_json::from_str(&overrides).context("解析 Codex 请求转发配置失败")?;
+        let result = route_local_app_server_input(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+            &overrides,
+            Some(crate::codex_config::codex_home()),
+        );
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::BrokenPipe
         {
@@ -603,6 +270,13 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     // 启动器只接收首次握手；之后 app-server 重启时仍必须能执行 CLI。
     let readiness = (app_server && managed_launch).then(CliWrapperReadiness::begin);
     let mut input_router: Option<std::process::Child> = None;
+    // 共享模式要接管桌面 app-server 的 stdio，管道必须在 spawn 后立刻交给网关；状态与
+    // `input_router` 一样声明在闭包外，闭包内只赋值。
+    #[cfg(windows)]
+    let mut shared_upstream: Option<crate::remote_gateway::SharedUpstream> = None;
+    #[cfg(windows)]
+    let mut shared_source: Option<Box<dyn std::io::Read + Send>> = None;
+    let mut output_observer: Option<std::process::Child> = None;
     let launch = (|| -> Result<std::process::Child> {
         anyhow::ensure!(
             target.is_absolute(),
@@ -636,8 +310,24 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             None => original_args,
         };
         let runtime_overrides = runtime_overrides.unwrap_or_default();
+        // 桌面 app-server 的 stdio 与桌面窗口一一绑定，浏览器无法接入。默认的共享模式在
+        // 同一包装进程内接管这条 stdio：桌面数据流逐行直通，网页请求注入同一会话，因此
+        // 桌面正在运行的会话也能收发；桌面自身的协议流、握手与降级语义都不受影响。
+        #[cfg(windows)]
+        if app_server && managed_launch {
+            shared_upstream = crate::remote_gateway::prepare_upstream(
+                &target,
+                &rewritten_args,
+                &runtime_overrides,
+            );
+        }
         let mut command = std::process::Command::new(&target);
         command.args(rewritten_args);
+        #[cfg(windows)]
+        if shared_upstream.is_some() {
+            command.stdin(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
+        }
         for name in [
             "CODEX_CLI_PATH",
             CLI_WRAPPER_TARGET_ENV,
@@ -648,8 +338,6 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             CLI_WRAPPER_PORT_ENV,
             CLI_WRAPPER_TOKEN_ENV,
             CLI_WRAPPER_MARKER_ENV,
-            CLI_WRAPPER_HANDSHAKE_OPTIONAL_ENV,
-            STARTUP_PATCH_MARKER_ENV,
             "NODE_OPTIONS",
         ] {
             command.env_remove(name);
@@ -685,13 +373,43 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
                 relay.creation_flags(codey_runtime_core::windows_create_no_window());
             }
             let mut relay = relay.spawn().context("启动 Codex 本地路由请求转发失败")?;
-            command.stdin(
-                relay
-                    .stdout
-                    .take()
-                    .context("Codex 本地路由请求管道不可用")?,
-            );
+            let relay_output = relay
+                .stdout
+                .take()
+                .context("Codex 本地路由请求管道不可用")?;
+            #[cfg(windows)]
+            match shared_upstream.as_ref() {
+                // 共享模式由网关把已改写的桌面输入直通给 app-server。
+                Some(_) => {
+                    shared_source = Some(Box::new(relay_output));
+                }
+                None => {
+                    command.stdin(relay_output);
+                }
+            }
+            #[cfg(not(windows))]
+            command.stdin(relay_output);
             input_router = Some(relay);
+            // 共享网关本身要读取 app-server 的 stdout，并在转发时保存会话设置；再串一个
+            // 观察进程会夺走网关需要的管道。独占模式或网关未启用时仍用独立观察器。
+            #[cfg(windows)]
+            let uses_shared_gateway = shared_upstream.is_some();
+            #[cfg(not(windows))]
+            let uses_shared_gateway = false;
+            if !uses_shared_gateway {
+                let mut observer = std::process::Command::new(std::env::current_exe()?);
+                observer
+                    .arg("--codey-observe-app-server-output")
+                    .stdin(std::process::Stdio::piped());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    observer.creation_flags(codey_runtime_core::windows_create_no_window());
+                }
+                let mut observer = observer.spawn().context("启动 Codex 会话响应转发失败")?;
+                command.stdout(observer.stdin.take().context("Codex 会话响应管道不可用")?);
+                output_observer = Some(observer);
+            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -716,6 +434,10 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     let mut child = match launch {
         Ok(child) => child,
         Err(error) => {
+            if let Some(mut observer) = output_observer {
+                let _ = observer.kill();
+                let _ = observer.wait();
+            }
             if let Some(mut relay) = input_router {
                 let _ = relay.kill();
                 let _ = relay.wait();
@@ -736,7 +458,17 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     if let Some(readiness) = readiness {
         readiness.executed();
     }
+    // 桌面 app-server 已经启动，把它的 stdio 交给网关：桌面输入逐行直通，网页请求注入
+    // 同一会话，因此共享模式对桌面不可见，改动也不会影响桌面协议流。
+    #[cfg(windows)]
+    if let Some(setup) = shared_upstream {
+        setup.serve(child.stdin.take(), child.stdout.take(), shared_source);
+    }
     let status = child.wait();
+    // 等待原生进程关闭 stdout 后读完最后一条通知，不能提前终止输出转发器。
+    if let Some(mut observer) = output_observer {
+        let _ = observer.wait();
+    }
     if let Some(mut relay) = input_router {
         let _ = relay.kill();
         let _ = relay.wait();
@@ -747,23 +479,172 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+#[cfg(windows)]
+/// 本地路由模式要求会话一律使用 `codey_router` 提供商：覆盖桌面传入的提供商，并清掉会被
+/// app-server 当作自定义提供商的配置项。返回是否发生了改写。
+///
+/// 网页注入的会话请求走 remote_gateway::shared，同样调用这里以保持行为一致。
+pub(crate) fn rewrite_local_router_message(message: &mut serde_json::Value) -> bool {
+    if !matches!(
+        message.get("method").and_then(serde_json::Value::as_str),
+        Some("thread/start" | "thread/resume" | "thread/fork")
+    ) {
+        return false;
+    }
+    if message.get("params").is_none_or(serde_json::Value::is_null) {
+        message["params"] = serde_json::json!({});
+    }
+    let Some(params) = message
+        .get_mut("params")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    params.insert("modelProvider".into(), "codey_router".into());
+    if let Some(config) = params
+        .get_mut("config")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        config.retain(|key, _| {
+            key != "model_provider"
+                && !key.starts_with("model_provider.")
+                && key != "model_providers"
+                && !key.starts_with("model_providers.")
+        });
+    }
+    true
+}
+
+fn observe_local_app_server_output(
+    mut input: impl std::io::Read,
+    mut output: impl std::io::Write,
+    home: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut buffer = [0; 8192];
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            if !oversized && !line.is_empty() {
+                remember_app_server_settings(&line, home);
+            }
+            return Ok(());
+        }
+        for &byte in &buffer[..count] {
+            if byte == b'\n' {
+                if !oversized {
+                    remember_app_server_settings(&line, home);
+                }
+                line.clear();
+                oversized = false;
+            } else if !oversized {
+                // 大型响应仍原样转发，但无需为观察小型设置通知保留完整副本。
+                if line.len() == 1024 * 1024 {
+                    line.clear();
+                    oversized = true;
+                } else {
+                    line.push(byte);
+                }
+            }
+        }
+        output.write_all(&buffer[..count])?;
+        output.flush()?;
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn remember_app_server_settings(line: &[u8], home: &std::path::Path) {
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return;
+    };
+    if message.get("method").and_then(serde_json::Value::as_str) != Some("thread/settings/updated")
+        || message.get("id").is_some()
+    {
+        return;
+    }
+    let Some(thread_id) = message
+        .pointer("/params/threadId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let Some(model) = message
+        .pointer("/params/threadSettings/model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+    let provider = message
+        .pointer("/params/threadSettings/modelProvider")
+        .and_then(serde_json::Value::as_str);
+    let selected_at_ms = message
+        .get("emittedAtMs")
+        .and_then(serde_json::Value::as_i64);
+    let effort = message
+        .pointer("/params/threadSettings/effort")
+        .or_else(|| {
+            message.pointer("/params/threadSettings/collaborationMode/settings/reasoning_effort")
+        });
+    if let Err(error) = crate::session_model::remember_settings(
+        home,
+        thread_id,
+        model,
+        provider,
+        selected_at_ms,
+        effort,
+    ) {
+        eprintln!("Codey 保存会话模型失败：{error:#}");
+    }
+}
+
 #[cfg(any(windows, target_os = "macos", test))]
 fn route_local_app_server_input(
     mut input: impl std::io::BufRead,
     mut output: impl std::io::Write,
+    runtime_overrides: &[String],
+    codex_home: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let mut line = Vec::new();
+    let mut live_threads = std::collections::HashSet::<String>::new();
     loop {
         line.clear();
         if input.read_until(b'\n', &mut line)? == 0 {
             return Ok(());
         }
-        if let Ok(mut message) = serde_json::from_slice::<serde_json::Value>(&line)
+        let mut parsed = serde_json::from_slice::<serde_json::Value>(&line).ok();
+        if let Some(message) = parsed.as_ref()
+            && matches!(
+                message.get("method").and_then(serde_json::Value::as_str),
+                Some("thread/unsubscribe" | "thread/archive")
+            )
+            && let Some(thread_id) = message
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str)
+        {
+            live_threads.remove(thread_id);
+        }
+        if let Some(message) = parsed.as_ref()
+            && matches!(
+                message.get("method").and_then(serde_json::Value::as_str),
+                Some("thread/settings/update" | "turn/start")
+            )
+            && let Some(thread_id) = message
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str)
+        {
+            // 活跃会话的选择保留在原生进程内，磁盘上的最后一轮可能更旧。
+            live_threads.insert(thread_id.to_owned());
+        }
+        if let Some(message) = parsed.as_mut()
             && matches!(
                 message.get("method").and_then(serde_json::Value::as_str),
                 Some("thread/start" | "thread/resume" | "thread/fork")
             )
         {
+            let method = message["method"].as_str().unwrap().to_string();
             if message.get("params").is_none_or(serde_json::Value::is_null) {
                 message["params"] = serde_json::json!({});
             }
@@ -771,7 +652,61 @@ fn route_local_app_server_input(
                 .get_mut("params")
                 .and_then(serde_json::Value::as_object_mut)
             {
-                params.insert("modelProvider".into(), "codey_router".into());
+                if method == "thread/resume"
+                    && params
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|model| !model.trim().is_empty())
+                    && let Some(thread_id) =
+                        params.get("threadId").and_then(serde_json::Value::as_str)
+                {
+                    live_threads.insert(thread_id.to_owned());
+                }
+                if method == "thread/resume"
+                    && params.get("model").is_none_or(|model| {
+                        model.is_null()
+                            || model.as_str().is_some_and(|model| model.trim().is_empty())
+                    })
+                    && let Some(home) = codex_home
+                    && let Some(thread_id) =
+                        params.get("threadId").and_then(serde_json::Value::as_str)
+                    && !live_threads.contains(thread_id)
+                {
+                    match restored_resume_settings(home, thread_id, runtime_overrides) {
+                        Ok(Some((model, effort))) => {
+                            params.insert("model".into(), model.into());
+                            if let Some(effort) = effort {
+                                if effort.is_null() {
+                                    if let Some(config) = params
+                                        .get_mut("config")
+                                        .and_then(serde_json::Value::as_object_mut)
+                                    {
+                                        config.remove("model_reasoning_effort");
+                                    }
+                                } else if params
+                                    .get("config")
+                                    .is_none_or(serde_json::Value::is_null)
+                                {
+                                    params.insert(
+                                        "config".into(),
+                                        serde_json::json!({"model_reasoning_effort":effort}),
+                                    );
+                                } else if let Some(config) = params
+                                    .get_mut("config")
+                                    .and_then(serde_json::Value::as_object_mut)
+                                {
+                                    config.insert("model_reasoning_effort".into(), effort);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        // 单向转发器无法发送 RPC 错误响应；保留请求和后续消息，错误仅写 stderr。
+                        Err(error) => eprintln!("Codey 恢复会话模型失败：{error:#}"),
+                    }
+                }
+                let provider = router_provider_for_params(&method, params, runtime_overrides);
+                params.insert("modelProvider".into(), provider.into());
+                params.remove("model_provider");
                 if let Some(config) = params
                     .get_mut("config")
                     .and_then(serde_json::Value::as_object_mut)
@@ -790,6 +725,76 @@ fn route_local_app_server_input(
         output.write_all(&line)?;
         output.flush()?;
     }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn restored_resume_settings(
+    home: &std::path::Path,
+    thread_id: &str,
+    overrides: &[String],
+) -> Result<Option<(String, Option<serde_json::Value>)>> {
+    let saved = crate::session_model::read(home, thread_id)?;
+    let model = resolve_resume_model(&saved, overrides)?;
+    Ok(model.map(|model| (model, saved.get("reasoningEffort").cloned())))
+}
+
+#[cfg(test)]
+fn restored_resume_model(
+    home: &std::path::Path,
+    thread_id: &str,
+    overrides: &[String],
+) -> Result<Option<String>> {
+    Ok(restored_resume_settings(home, thread_id, overrides)?.map(|(model, _)| model))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn resolve_resume_model(saved: &serde_json::Value, overrides: &[String]) -> Result<Option<String>> {
+    let Some(model) = saved.get("model").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(catalog_path) = runtime_override_string(overrides, "model_catalog_json") else {
+        return Ok(None);
+    };
+    let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(catalog_path)?)?;
+    let models = catalog
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .context("模型目录缺少 models")?;
+    let slugs = models
+        .iter()
+        .filter_map(|entry| entry.get("slug")?.as_str())
+        .collect::<Vec<_>>();
+    // 当前稳定 ID 优先，不把包含斜杠的上游型号误解为失效的线路 ID。
+    if let Some(slug) = slugs
+        .iter()
+        .find(|slug| crate::model_id::equal(slug, model))
+    {
+        return Ok(Some((*slug).to_owned()));
+    }
+    let provider = saved
+        .get("modelProvider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty());
+    if let Some(provider) =
+        provider.filter(|provider| !crate::local_router::is_router_provider(provider))
+    {
+        let alias = crate::model_id::model_alias(provider, model);
+        return Ok(slugs
+            .iter()
+            .find(|slug| crate::model_id::equal(slug, &alias))
+            .map(|slug| (*slug).to_owned()));
+    }
+    let mut matches = slugs.iter().filter(|slug| {
+        crate::model_id::parse_alias(slug)
+            .is_some_and(|alias| crate::model_id::equal(alias.upstream_model, model))
+    });
+    let first = matches.next();
+    Ok(if matches.next().is_none() {
+        first.map(|slug| (*slug).to_owned())
+    } else {
+        None
+    })
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -913,34 +918,19 @@ impl CliWrapperReadiness {
     fn begin() -> Self {
         let started = std::time::Instant::now();
         let marker = cli_wrapper_marker_path_from_env(std::env::var_os(CLI_WRAPPER_MARKER_ENV));
-        let handshake_required = cli_wrapper_handshake_required(
-            std::env::var_os(CLI_WRAPPER_HANDSHAKE_OPTIONAL_ENV).as_deref(),
-        );
-        Self::begin_with_diagnostics(
-            marker,
-            handshake_required,
-            started,
-            connect_cli_wrapper_handshake,
-        )
+        Self::begin_with_diagnostics(marker, started, connect_cli_wrapper_handshake)
     }
 
     #[cfg(test)]
     fn begin_with(
         marker: Option<std::path::PathBuf>,
-        handshake_required: bool,
         connect: impl FnOnce() -> Result<std::net::TcpStream>,
     ) -> Self {
-        Self::begin_with_diagnostics(
-            marker,
-            handshake_required,
-            std::time::Instant::now(),
-            connect,
-        )
+        Self::begin_with_diagnostics(marker, std::time::Instant::now(), connect)
     }
 
     fn begin_with_diagnostics(
         marker: Option<std::path::PathBuf>,
-        handshake_required: bool,
         started: std::time::Instant,
         connect: impl FnOnce() -> Result<std::net::TcpStream>,
     ) -> Self {
@@ -949,7 +939,6 @@ impl CliWrapperReadiness {
             serde_json::json!({
                 "pid": std::process::id(),
                 "markerPresent": marker.is_some(),
-                "handshakeRequired": handshake_required,
             }),
         );
         let readiness = Self {
@@ -957,9 +946,8 @@ impl CliWrapperReadiness {
             marker,
         };
         readiness.mark(CliWrapperMarkerStatus::Launching, None);
-        let stream = if !handshake_required {
-            None
-        } else {
+        let tcp_available = handshake_tcp_channel_available();
+        let stream = if tcp_available {
             match connect() {
                 Ok(stream) => Some(stream),
                 Err(error) => {
@@ -978,11 +966,14 @@ impl CliWrapperReadiness {
                     None
                 }
             }
+        } else {
+            None
         };
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "launcher.cli_wrapper_handshake_connect",
             serde_json::json!({
                 "connected": stream.is_some(),
+                "tcpChannelAvailable": tcp_available,
                 "elapsedMs": started.elapsed().as_millis(),
             }),
         );
@@ -1029,9 +1020,46 @@ impl CliWrapperReadiness {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
-fn cli_wrapper_handshake_required(optional: Option<&OsStr>) -> bool {
-    optional != Some(OsStr::new("1"))
+/// Windows 打包（MSIX/商店版）Codex 派生的子进程继承 AppContainer 令牌：
+/// 回环 TCP 出站被网络隔离拦死，握手注定烧满连接预算后超时，且每次启动
+/// 都往错误日志记一条假失败。检测到自己跑在 AppContainer 里就跳过 TCP
+/// 通道，汇报只剩 marker 文件——文件写不受这条隔离影响。
+#[cfg(windows)]
+fn handshake_tcp_channel_available() -> bool {
+    !running_in_app_container()
+}
+
+#[cfg(all(not(windows), any(target_os = "macos", test)))]
+fn handshake_tcp_channel_available() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn running_in_app_container() -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    // 让 OwnedHandle 负责关闭；查不到令牌信息时按非隔离进程处理，不影响握手。
+    let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut value = 0u32;
+    let mut returned = 0u32;
+    unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenIsAppContainer,
+            Some((&mut value as *mut u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        )
+    }
+    .is_ok()
+        && value != 0
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1128,10 +1156,31 @@ fn app_server_runtime_configs(runtime_overrides: &[String]) -> Vec<String> {
 
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn local_router_runtime_enabled(overrides: &[String]) -> bool {
-    overrides.iter().rev().find_map(|entry| {
-        let (key, value) = entry.split_once('=')?;
-        (key.trim() == "model_provider").then(|| value.trim().trim_matches(['\'', '"']))
-    }) == Some(crate::local_router::ROUTER_PROVIDER_ID)
+    runtime_override_string(overrides, "model_provider")
+        .is_some_and(|provider| crate::local_router::is_router_provider(&provider))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn runtime_override_string(overrides: &[String], name: &str) -> Option<String> {
+    let (_, value) = overrides
+        .iter()
+        .rev()
+        .filter_map(|entry| entry.split_once('='))
+        .find(|(key, _)| key.trim() == name)?;
+    match format!("value={value}").parse::<toml_edit::DocumentMut>() {
+        Ok(document) => document.get("value")?.as_str().map(str::to_string),
+        // Codex also accepts bare strings in CLI configuration overrides.
+        Err(_) => Some(value.trim().to_string()),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn router_provider_for_params(
+    _method: &str,
+    _params: &serde_json::Map<String, serde_json::Value>,
+    _overrides: &[String],
+) -> &'static str {
+    crate::local_router::ROUTER_PROVIDER_ID
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1199,406 +1248,274 @@ fn rewrite_app_server_args(
     Ok(rewritten)
 }
 
-pub async fn install(
-    port: u16,
-    options: PatchOptions,
-    runtime_config_overrides: &[String],
-    require_app_server_runtime_overrides: bool,
-    renderer_debug_port: Option<u16>,
-) -> Result<()> {
-    let websocket_url = wait_for_inspector(port, renderer_debug_port).await?;
-    let expression = patch_expression_with_runtime_overrides_and_validation(
-        options,
-        runtime_config_overrides,
-        require_app_server_runtime_overrides,
-    );
-    let install_timeout = if require_app_server_runtime_overrides {
-        STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT
-    } else {
-        STARTUP_PATCH_INSTALL_TIMEOUT
-    };
-    tokio::time::timeout(
-        install_timeout,
-        install_over_websocket(
-            &websocket_url,
-            &expression,
-            require_app_server_runtime_overrides,
-        ),
-    )
-    .await
-    .map_err(|_| startup_debug_session_timeout())??;
-    Ok(())
-}
-
-/// 调试会话没在时限内返回。保留为可重试的超时，Windows 才会进行下一次启动尝试。
-pub(crate) fn startup_debug_session_timeout() -> anyhow::Error {
-    std::io::Error::new(std::io::ErrorKind::TimedOut, "Codex 启动补丁调试会话超时").into()
-}
-
-/// 运行时覆盖确认的异常。未观察到启动是超时，配置不兼容则保持不可重试。
-pub(crate) fn app_server_runtime_override_confirmation_error(
-    exception: &serde_json::Value,
-) -> anyhow::Error {
-    if exception
-        .to_string()
-        .contains(APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER)
-    {
-        return std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("Codex app-server 运行时覆盖确认超时：{exception}"),
-        )
-        .into();
-    }
-    anyhow::anyhow!("Codex app-server 运行时覆盖校验失败：{exception}")
-}
-
-/// 从 reqwest 错误链里找出底层 socket 错误类型，用于区分「被拒绝」与「被拖住」。
-fn connect_error_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
-    for current in error.chain() {
-        if current
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_timeout)
-        {
-            return Some(std::io::ErrorKind::TimedOut);
-        }
-        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
-            return Some(io_error.kind());
-        }
-    }
-    None
-}
-
-/// 等待 Inspector 的 `/json/list`。传入渲染进程调试端口时，一旦该端口已应答而 Inspector
-/// 端口仍被拒绝，立即返回 [`InspectorUnavailable`]：Chromium 的调试服务在应用脚本运行后
-/// 才监听，此时 Node 环境早已创建，Inspector 不会再出现，无需耗满发现窗口。
-async fn wait_for_inspector(port: u16, renderer_debug_port: Option<u16>) -> Result<String> {
-    // 这里只访问本机 HTTP，无需同步加载系统 TLS 证书库。
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .tls_built_in_root_certs(false)
-        .timeout(std::time::Duration::from_millis(750))
-        .build()?;
-    let endpoint = format!("http://127.0.0.1:{port}/json/list");
-    wait_for_inspector_with_probe(port, renderer_debug_port, || async {
-        client
-            .get(&endpoint)
-            .send()
-            .await
-            .map_err(anyhow::Error::from)
-    })
-    .await
-}
-
-async fn wait_for_inspector_with_probe<F, Fut>(
-    port: u16,
-    renderer_debug_port: Option<u16>,
-    mut probe: F,
-) -> Result<String>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<reqwest::Response>>,
-{
-    let started = tokio::time::Instant::now();
-    let deadline = started + STARTUP_READY_TIMEOUT;
-    let mut last_error = "调试端口尚未响应".to_string();
-    let mut retry_delay = std::time::Duration::from_millis(20);
-    let mut refused = 0_u32;
-    let mut timed_out = 0_u32;
-    let mut other_errors = 0_u32;
-    let mut next_renderer_probe = started;
-
-    while tokio::time::Instant::now() < deadline {
-        match probe().await {
-            Ok(response) if response.status().is_success() => {
-                let targets = crate::http_response::read_bounded_body(
-                    response,
-                    MAX_INSPECTOR_TARGET_RESPONSE_BYTES,
-                    "Codex Inspector 目标响应",
-                )
-                .await
-                .and_then(|body| {
-                    serde_json::from_slice::<Vec<serde_json::Value>>(&body)
-                        .map_err(anyhow::Error::from)
-                });
-                match targets {
-                    Ok(targets) => {
-                        if let Some(url) = targets.iter().find_map(|target| {
-                            target
-                                .get("webSocketDebuggerUrl")
-                                .and_then(serde_json::Value::as_str)
-                        }) {
-                            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                                "launcher.inspector_discovered",
-                                serde_json::json!({ "port": port }),
-                            );
-                            return Ok(url.to_string());
-                        }
-                        last_error = "调试端口没有可连接的目标".to_string();
-                    }
-                    Err(error) => return Err(error.context("Codex Inspector 返回了无效的目标响应")),
-                }
-            }
-            Ok(response) => anyhow::bail!("Codex Inspector 返回 HTTP {}", response.status()),
-            Err(error) => {
-                match connect_error_kind(&error) {
-                    Some(std::io::ErrorKind::ConnectionRefused) => {
-                        refused += 1;
-                        let now = tokio::time::Instant::now();
-                        if let Some(debug_port) = renderer_debug_port
-                            && now >= next_renderer_probe
-                        {
-                            next_renderer_probe = now + std::time::Duration::from_millis(500);
-                            if loopback_port_accepts(debug_port).await {
-                                let elapsed_ms = started.elapsed().as_millis();
-                                let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                                    "launcher.inspector_probe_summary",
-                                    serde_json::json!({
-                                        "port": port,
-                                        "outcome": "unavailable",
-                                        "refused": refused,
-                                        "timedOut": timed_out,
-                                        "otherErrors": other_errors,
-                                        "rendererReady": true,
-                                        "elapsedMs": elapsed_ms,
-                                    }),
-                                );
-                                return Err(InspectorUnavailable {
-                                    refused,
-                                    elapsed_ms,
-                                }
-                                .into());
-                            }
-                        }
-                    }
-                    Some(std::io::ErrorKind::TimedOut) => timed_out += 1,
-                    _ => other_errors += 1,
-                }
-                last_error = format!("{error:#}");
-            }
-        }
-        tokio::time::sleep(retry_delay).await;
-        retry_delay = std::cmp::min(
-            retry_delay.saturating_mul(2),
-            std::time::Duration::from_millis(100),
-        );
-    }
-
-    let renderer_ready = match renderer_debug_port {
-        Some(debug_port) => Some(loopback_port_accepts(debug_port).await),
-        None => None,
-    };
-    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-        "launcher.inspector_probe_summary",
-        serde_json::json!({
-            "port": port,
-            "outcome": "timeout",
-            "refused": refused,
-            "timedOut": timed_out,
-            "otherErrors": other_errors,
-            "rendererReady": renderer_ready,
-            "elapsedMs": started.elapsed().as_millis(),
-        }),
-    );
-    let renderer_state = match renderer_ready {
-        Some(true) => "，渲染进程调试端口已就绪",
-        Some(false) => "，渲染进程调试端口未就绪",
-        None => "",
-    };
-    Err(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        format!(
-            "等待 Codex 启动补丁超时：{last_error}；连接被拒绝 {refused} 次、超时 {timed_out} 次、其他错误 {other_errors} 次{renderer_state}"
-        ),
-    )
-    .into())
-}
-
-async fn install_over_websocket(
-    websocket_url: &str,
-    expression: &str,
-    require_app_server_runtime_overrides: bool,
-) -> Result<()> {
-    use futures_util::StreamExt;
-    use tokio_tungstenite::tungstenite::Message;
-
-    let (mut socket, _) = tokio_tungstenite::connect_async(websocket_url).await?;
-    send_command(&mut socket, 1, "Runtime.enable", serde_json::json!({})).await?;
-    send_command(&mut socket, 2, "Debugger.enable", serde_json::json!({})).await?;
-
-    let mut runtime_enabled = false;
-    let mut debugger_enabled = false;
-    let mut continued = false;
-    let mut evaluation_sent = false;
-
-    while let Some(message) = socket.next().await {
-        let message = message?;
-        let text = match message {
-            Message::Text(text) => text,
-            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
-                continue;
-            }
-            Message::Close(_) => anyhow::bail!("Codex 启动补丁调试连接提前关闭"),
-        };
-        let payload: serde_json::Value = serde_json::from_str(text.as_ref())?;
-
-        match payload.get("id").and_then(serde_json::Value::as_u64) {
-            Some(1) => {
-                ensure_protocol_success(&payload, "Runtime.enable")?;
-                runtime_enabled = true;
-            }
-            Some(2) => {
-                ensure_protocol_success(&payload, "Debugger.enable")?;
-                debugger_enabled = true;
-            }
-            Some(3) => {
-                ensure_protocol_success(&payload, "Runtime.runIfWaitingForDebugger")?;
-            }
-            Some(4) => {
-                ensure_protocol_success(&payload, "Debugger.evaluateOnCallFrame")?;
-                if let Some(exception) = payload
-                    .get("result")
-                    .and_then(|result| result.get("exceptionDetails"))
-                {
-                    anyhow::bail!("Codex 启动补丁执行异常：{exception}");
-                }
-                let value = payload
-                    .pointer("/result/result/value")
-                    .and_then(serde_json::Value::as_str);
-                if value != Some(PATCH_RESULT) {
-                    anyhow::bail!("Codex 启动补丁未返回预期状态");
-                }
-                send_command(&mut socket, 5, "Debugger.resume", serde_json::json!({})).await?;
-            }
-            Some(5) => {
-                ensure_protocol_success(&payload, "Debugger.resume")?;
-                if require_app_server_runtime_overrides {
-                    send_command(
-                        &mut socket,
-                        6,
-                        "Runtime.evaluate",
-                        serde_json::json!({
-                            "expression": "globalThis.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__()",
-                            "awaitPromise": true,
-                            "returnByValue": true,
-                            "silent": false,
-                        }),
-                    )
-                    .await?;
-                    continue;
-                }
-                let _ = socket.close(None).await;
-                return Ok(());
-            }
-            Some(6) => {
-                ensure_protocol_success(&payload, "Runtime.evaluate")?;
-                if let Some(exception) = payload
-                    .get("result")
-                    .and_then(|result| result.get("exceptionDetails"))
-                {
-                    return Err(app_server_runtime_override_confirmation_error(exception));
-                }
-                let value = payload
-                    .pointer("/result/result/value")
-                    .and_then(serde_json::Value::as_str);
-                match value {
-                    Some(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT) => {}
-                    // JS 已确认运行时配置和转发入口，仅消息补丁失配。
-                    Some(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT) => {
-                        crate::error_log::record_failure(
-                            "patch_failed",
-                            "app_server_runtime_overrides_degraded",
-                            "启动补丁锚点漂移，已降级为 stdin relay 协议层改写".to_string(),
-                            serde_json::json!({
-                                "degraded": true,
-                                "transport": "stdin-relay",
-                            }),
-                        );
-                    }
-                    _ => anyhow::bail!("Codex app-server 运行时覆盖校验未返回预期状态"),
-                }
-                let _ = socket.close(None).await;
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        if runtime_enabled && debugger_enabled && !continued {
-            continued = true;
-            send_command(
-                &mut socket,
-                3,
-                "Runtime.runIfWaitingForDebugger",
-                serde_json::json!({}),
-            )
-            .await?;
-        }
-
-        if payload.get("method").and_then(serde_json::Value::as_str) == Some("Debugger.paused")
-            && !evaluation_sent
-        {
-            let frame_id = payload
-                .pointer("/params/callFrames/0/callFrameId")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("Codex 启动补丁没有收到可用的调用栈"))?;
-            evaluation_sent = true;
-            send_command(
-                &mut socket,
-                4,
-                "Debugger.evaluateOnCallFrame",
-                serde_json::json!({
-                    "callFrameId": frame_id,
-                    "expression": expression,
-                    "returnByValue": true,
-                    "silent": false,
-                }),
-            )
-            .await?;
-        }
-    }
-
-    anyhow::bail!("Codex 启动补丁调试连接未返回执行结果")
-}
-
-async fn send_command<S>(
-    socket: &mut tokio_tungstenite::WebSocketStream<S>,
-    id: u64,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use futures_util::SinkExt;
-    use tokio_tungstenite::tungstenite::Message;
-
-    let message = serde_json::json!({
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-    socket
-        .send(Message::Text(message.to_string().into()))
-        .await?;
-    Ok(())
-}
-
-fn ensure_protocol_success(payload: &serde_json::Value, method: &str) -> Result<()> {
-    if let Some(error) = payload.get("error") {
-        anyhow::bail!("{method} 失败：{error}");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn optional_cli_wrapper_handshake_writes_marker_without_connecting() {
+    fn output_observer_preserves_bytes_and_persists_only_confirmed_settings() {
+        struct SplitRead<'a>(&'a [u8]);
+        impl std::io::Read for SplitRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.0, &mut buffer[..1])
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let notification = |id: &str, model: &str| {
+            serde_json::json!({
+                "method":"thread/settings/updated", "emittedAtMs":chrono::Utc::now().timestamp_millis(),
+                "params":{"threadId":id,"threadSettings":{"model":model,"modelProvider":"codey_router"}}
+            })
+        };
+        let mut requested = notification("requested", "route/unconfirmed");
+        requested["method"] = "thread/settings/update".into();
+        requested["id"] = 9.into();
+        let mut invalid_request = notification("with-id", "route/unconfirmed");
+        invalid_request["id"] = 10.into();
+        let input = format!(
+            "invalid\r\n{{\"id\":9,\"error\":{{\"message\":\"failed\"}}}}\n{}\n{}\n{}\n{}\r\n{}",
+            requested,
+            invalid_request,
+            notification("blank", "  "),
+            notification("first", "route/first"),
+            notification("second", "route/second")
+        );
+        let mut output = Vec::new();
+        observe_local_app_server_output(SplitRead(input.as_bytes()), &mut output, home.path())
+            .unwrap();
+        assert_eq!(output, input.as_bytes());
+        for (id, model) in [("first", "route/first"), ("second", "route/second")] {
+            let saved = crate::session_model::read(home.path(), id).unwrap();
+            assert_eq!(saved["model"], model);
+            assert_eq!(saved["modelProvider"], "codey_router");
+        }
+        for id in ["requested", "with-id", "blank"] {
+            assert_eq!(
+                crate::session_model::read(home.path(), id).unwrap()["status"],
+                "missing"
+            );
+        }
+    }
+
+    #[test]
+    fn output_observer_keeps_forwarding_after_storage_failure_and_large_messages() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("codey-session-models"), b"blocked").unwrap();
+        let notification = serde_json::json!({"method":"thread/settings/updated",
+            "params":{"threadId":"first","threadSettings":{"model":"route/first"}}});
+        let input = format!(
+            "{}\n{}\n{{\"id\":1,\"result\":{{}}}}\n",
+            "x".repeat(1024 * 1024 + 1),
+            notification
+        );
+        let mut output = Vec::new();
+        observe_local_app_server_output(input.as_bytes(), &mut output, home.path()).unwrap();
+        assert_eq!(output, input.as_bytes());
+    }
+
+    #[test]
+    fn confirmed_effort_restores_with_model_and_preserves_other_config() {
+        let home = tempfile::tempdir().unwrap();
+        let catalog = home.path().join("catalog.json");
+        std::fs::write(&catalog, r#"{"models":[{"slug":"route/model"}]}"#).unwrap();
+        let overrides = vec![format!(
+            "model_catalog_json={}",
+            toml_edit::Value::from(catalog.to_str().unwrap())
+        )];
+        for (settings, expected) in [
+            (
+                serde_json::json!({"effort":"high"}),
+                Some(serde_json::json!("high")),
+            ),
+            (
+                serde_json::json!({"effort":null,"collaborationMode":{"settings":{"reasoning_effort":"low"}}}),
+                None,
+            ),
+            (
+                serde_json::json!({"collaborationMode":{"settings":{"reasoning_effort":"low"}}}),
+                Some(serde_json::json!("low")),
+            ),
+            (serde_json::json!({}), Some(serde_json::json!("medium"))),
+        ] {
+            let mut settings = settings;
+            settings["model"] = "route/model".into();
+            remember_app_server_settings(&serde_json::to_vec(&serde_json::json!({
+                "method":"thread/settings/updated", "params":{"threadId":"saved","threadSettings":settings}
+            })).unwrap(), home.path());
+            let input = b"{\"method\":\"thread/resume\",\"params\":{\"threadId\":\"saved\",\"model\":null,\"config\":{\"model_reasoning_effort\":\"medium\",\"other\":true}}}\n";
+            let mut output = Vec::new();
+            route_local_app_server_input(
+                input.as_slice(),
+                &mut output,
+                &overrides,
+                Some(home.path()),
+            )
+            .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(result["params"]["model"], "route/model");
+            assert_eq!(result["params"]["config"]["other"], true);
+            assert_eq!(
+                result["params"]["config"]
+                    .get("model_reasoning_effort")
+                    .cloned(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cli_resume_recovers_each_rollout_model_without_changing_explicit_or_new_models() {
+        let home = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, model TEXT, model_provider TEXT, rollout_path TEXT);
+            INSERT INTO threads VALUES ('first', 'route/default', 'codey_router', 'first.jsonl');
+            INSERT INTO threads VALUES ('second', 'route/default', 'codey_router', 'second.jsonl');").unwrap();
+        for (id, model) in [("first", "route/first"), ("second", "route/second")] {
+            std::fs::write(home.path().join(format!("{id}.jsonl")), format!("{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":id,"model_provider":"codey_router"}}),
+                serde_json::json!({"type":"turn_context","payload":{"model":model}}))).unwrap();
+        }
+        let catalog = home.path().join("catalog.json");
+        std::fs::write(&catalog, serde_json::json!({"models":[{"slug":"route/first"},{"slug":"route/second"},{"slug":"route/default"}]}).to_string()).unwrap();
+        let overrides = vec![format!(
+            "model_catalog_json={}",
+            toml_edit::Value::from(catalog.to_str().unwrap())
+        )];
+        for (method, thread, model, expected) in [
+            (
+                "thread/resume",
+                "first",
+                serde_json::Value::Null,
+                serde_json::json!("route/first"),
+            ),
+            (
+                "thread/resume",
+                "second",
+                serde_json::json!("  "),
+                serde_json::json!("route/second"),
+            ),
+            (
+                "thread/resume",
+                "first",
+                serde_json::json!("route/default"),
+                serde_json::json!("route/default"),
+            ),
+            (
+                "thread/resume",
+                "missing",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            (
+                "thread/start",
+                "first",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            (
+                "thread/fork",
+                "first",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+        ] {
+            let input = format!(
+                "{}\n{{\"id\":2,\"result\":{{}}}}\r\ninvalid\n",
+                serde_json::json!({"id":1,"method":method,"params":{"threadId":thread,"model":model}})
+            );
+            let mut output = Vec::new();
+            route_local_app_server_input(
+                std::io::BufReader::with_capacity(1, input.as_bytes()),
+                &mut output,
+                &overrides,
+                Some(home.path()),
+            )
+            .unwrap();
+            let newline = output.iter().position(|byte| *byte == b'\n').unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&output[..newline]).unwrap();
+            assert_eq!(result["params"]["model"], expected);
+            assert_eq!(
+                &output[newline + 1..],
+                b"{\"id\":2,\"result\":{}}\r\ninvalid\n"
+            );
+        }
+        // 活跃模型不被较旧的磁盘记录覆盖。
+        for method in ["thread/settings/update", "turn/start", "thread/resume"] {
+            let input = format!(
+                "{}\n{}\n",
+                serde_json::json!({"id":1,"method":method,"params":{"threadId":"first","model":"route/second"}}),
+                serde_json::json!({"id":2,"method":"thread/resume","params":{"threadId":"first"}})
+            );
+            let mut output = Vec::new();
+            route_local_app_server_input(
+                input.as_bytes(),
+                &mut output,
+                &overrides,
+                Some(home.path()),
+            )
+            .unwrap();
+            let lines = String::from_utf8(output).unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(lines.lines().nth(1).unwrap()).unwrap();
+            assert!(result["params"].get("model").is_none());
+        }
+        // 损坏的元数据不能中断共享协议流。
+        std::fs::write(home.path().join("first.jsonl"), "invalid").unwrap();
+        let mut output = Vec::new();
+        route_local_app_server_input(b"{\"method\":\"thread/resume\",\"params\":{\"threadId\":\"first\",\"model\":null}}\n{}\n".as_slice(), &mut output, &overrides, Some(home.path())).unwrap();
+        assert!(String::from_utf8(output).unwrap().ends_with("\n{}\n"));
+    }
+
+    #[test]
+    fn resume_model_alias_resolution_never_guesses_between_routes() {
+        let home = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT, model TEXT, model_provider TEXT);
+            INSERT INTO threads VALUES ('saved', 'shared', 'codey_router');",
+        )
+        .unwrap();
+        let catalog = home.path().join("catalog.json");
+        std::fs::write(&catalog, serde_json::json!({"models":[{"slug":"a/shared"},{"slug":"b/shared"},{"slug":"a/unique"}]}).to_string()).unwrap();
+        let overrides = vec![format!(
+            "model_catalog_json={}",
+            toml_edit::Value::from(catalog.to_str().unwrap())
+        )];
+        assert_eq!(
+            restored_resume_model(home.path(), "saved", &overrides).unwrap(),
+            None
+        );
+        for (model, provider, expected) in [
+            ("shared", "b", Some("b/shared")),
+            ("a/shared", "b", Some("a/shared")),
+            ("unique", "codey_router", Some("a/unique")),
+            ("unique", "b", None),
+            ("deleted/shared", "codey_router", None),
+        ] {
+            db.execute(
+                "UPDATE threads SET model=?1, model_provider=?2",
+                [model, provider],
+            )
+            .unwrap();
+            assert_eq!(
+                restored_resume_model(home.path(), "saved", &overrides)
+                    .unwrap()
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cli_wrapper_readiness_writes_marker_even_when_handshake_is_refused() {
         let temporary = tempfile::tempdir().unwrap();
         let marker_path = temporary.path().join("wrapper.json");
-        let readiness = CliWrapperReadiness::begin_with(Some(marker_path.clone()), false, || {
-            panic!("an Inspector-capable launch must not open a discarded handshake listener")
+        let readiness = CliWrapperReadiness::begin_with(Some(marker_path.clone()), || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "listener already gone",
+            )
+            .into())
         });
         assert!(readiness.stream.is_none());
         assert_eq!(
@@ -1608,8 +1525,6 @@ mod tests {
                 .status,
             CliWrapperMarkerStatus::Launching
         );
-        assert!(cli_wrapper_handshake_required(Some(OsStr::new("0"))));
-        assert!(!cli_wrapper_handshake_required(Some(OsStr::new("1"))));
     }
 
     #[test]
@@ -1632,6 +1547,8 @@ mod tests {
             route_local_app_server_input(
                 std::io::BufReader::with_capacity(1, input.as_slice()),
                 &mut output,
+                &[],
+                None,
             )
             .unwrap();
             let first_line = output.iter().position(|byte| *byte == b'\n').unwrap();
@@ -1644,6 +1561,115 @@ mod tests {
                 })
             );
             assert_eq!(&output[first_line + 1..], passthrough);
+        }
+    }
+
+    #[test]
+    fn cli_input_uses_one_provider_in_mixed_catalogs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"models":[
+                {"slug":"remote/shared", "codey_remote_compaction":true},
+                {"slug":"local/shared", "codey_remote_compaction":false}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let overrides = vec![
+            "model_provider=\"codey_router_remote\"".into(),
+            format!(
+                "model_catalog_json={}",
+                toml_edit::Value::from(path.to_str().unwrap())
+            ),
+            "model=\"remote/shared\"".into(),
+        ];
+        assert!(local_router_runtime_enabled(&overrides));
+        for method in ["thread/start", "thread/resume", "thread/fork"] {
+            for (model, provider) in [
+                ("remote/shared", "codey_router"),
+                ("local/shared", "codey_router"),
+                ("shared", "codey_router"),
+            ] {
+                let input = serde_json::json!({"method":method, "params":{"model":model,"modelProvider":"codey_router_remote"}}).to_string();
+                let mut output = Vec::new();
+                route_local_app_server_input(input.as_bytes(), &mut output, &overrides, None)
+                    .unwrap();
+                let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(result["params"]["modelProvider"], provider);
+            }
+        }
+        let empty = serde_json::Map::new();
+        assert_eq!(
+            router_provider_for_params("thread/start", &empty, &overrides),
+            "codey_router"
+        );
+        let params = serde_json::json!({"modelProvider":"codey_router"});
+        assert_eq!(
+            router_provider_for_params("thread/start", params.as_object().unwrap(), &overrides),
+            "codey_router"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            router_provider_for_params("thread/start", &empty, &overrides),
+            "codey_router"
+        );
+    }
+
+    #[test]
+    fn model_less_history_requests_keep_the_model_and_use_the_shared_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"models":[
+                {"slug":"remote/shared", "codey_remote_compaction":true}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        for default_provider in ["codey_router", "codey_router_remote"] {
+            for with_catalog in [false, true] {
+                let mut overrides = vec![
+                    format!("model_provider=\"{default_provider}\""),
+                    "model=\"remote/shared\"".into(),
+                ];
+                if with_catalog {
+                    overrides.push(format!(
+                        "model_catalog_json={}",
+                        toml_edit::Value::from(path.to_str().unwrap())
+                    ));
+                }
+                for method in ["thread/resume", "thread/fork"] {
+                    for model in [
+                        None,
+                        Some(serde_json::Value::Null),
+                        Some("".into()),
+                        Some("  ".into()),
+                    ] {
+                        let mut params = serde_json::json!({
+                            "threadId":"saved", "modelProvider":"codey_router_remote"
+                        });
+                        if let Some(model) = model {
+                            params["model"] = model;
+                        }
+                        let input =
+                            serde_json::json!({"method":method,"params":params}).to_string();
+                        let mut output = Vec::new();
+                        route_local_app_server_input(
+                            input.as_bytes(),
+                            &mut output,
+                            &overrides,
+                            None,
+                        )
+                        .unwrap();
+                        let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                        params["modelProvider"] = "codey_router".into();
+                        assert_eq!(result["params"], params);
+                    }
+                }
+            }
         }
     }
 
@@ -1872,605 +1898,25 @@ mod tests {
 
     #[test]
     fn router_runtime_rejects_shared_app_server_commands() {
-        let router = vec!["model_provider=\"codey_router\"".to_string()];
-        assert!(local_router_runtime_enabled(&router));
-        assert!(!local_router_runtime_enabled(&[
-            router[0].clone(),
-            "model_provider=\"openai\"".to_string(),
-        ]));
-        for subcommand in ["proxy", "daemon"] {
-            let args = ["app-server", subcommand].map(OsString::from);
-            assert!(rewrite_app_server_args(&args, &router).is_err());
-            assert!(rewrite_app_server_args(&args, &[]).is_ok());
+        for id in crate::local_router::ROUTER_PROVIDER_IDS {
+            for router in [
+                format!("model_provider=\"{id}\""),
+                format!("model_provider='{id}'"),
+                format!("model_provider={id}"),
+            ] {
+                let router = vec![router];
+                assert!(local_router_runtime_enabled(&router));
+                assert!(!local_router_runtime_enabled(&[
+                    router[0].clone(),
+                    "model_provider=\"openai\"".to_string(),
+                ]));
+                for subcommand in ["proxy", "daemon"] {
+                    let args = ["app-server", subcommand].map(OsString::from);
+                    assert!(rewrite_app_server_args(&args, &router).is_err());
+                    assert!(rewrite_app_server_args(&args, &[]).is_ok());
+                }
+            }
         }
-    }
-
-    #[test]
-    fn inspector_is_loopback_only_and_pauses_before_startup() {
-        assert_eq!(inspector_argument(19321), "--inspect-brk=127.0.0.1:19321");
-    }
-
-    #[test]
-    fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v40");
-        assert_eq!(
-            APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT,
-            "codey-app-server-runtime-overrides-verified"
-        );
-        assert_eq!(
-            APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT,
-            "codey-app-server-runtime-overrides-degraded"
-        );
-        // 降级态必须与已验证态可区分，否则启动器会把锚点漂移当成正常结果。
-        assert_ne!(
-            APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT,
-            APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT
-        );
-        assert!(STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT > STARTUP_PATCH_INSTALL_TIMEOUT);
-        // 调试会话必须盖住 JS 的等待，否则慢启动会先被会话超时掐断。
-        // 外层启动预算再盖住调试会话，避免窗口还没出来就结束这次尝试。
-        assert!(
-            STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT
-                >= std::time::Duration::from_secs(150) + std::time::Duration::from_secs(10)
-        );
-        assert!(STARTUP_CLI_READY_TIMEOUT > STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT);
-        assert!(STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER));
-        assert!(STARTUP_PATCH_TEMPLATE.contains("appServerRuntimeOverrideTimeoutMs = 150_000"));
-    }
-
-    #[test]
-    fn runtime_override_timeouts_stay_retryable() {
-        let session = startup_debug_session_timeout();
-        let session_io = session
-            .downcast_ref::<std::io::Error>()
-            .expect("debug session timeout should stay an io timeout");
-        assert_eq!(session_io.kind(), std::io::ErrorKind::TimedOut);
-        assert!(session.to_string().contains("调试会话超时"));
-
-        let timed_out = app_server_runtime_override_confirmation_error(&serde_json::json!({
-            "exception": {
-                "description": format!("{APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER} 未观察到 app-server 启动调用")
-            }
-        }));
-        assert_eq!(
-            timed_out
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind),
-            Some(std::io::ErrorKind::TimedOut)
-        );
-
-        let incompatible = app_server_runtime_override_confirmation_error(&serde_json::json!({
-            "exception": { "description": "缺失：model_provider" }
-        }));
-        assert!(incompatible.downcast_ref::<std::io::Error>().is_none());
-        assert!(incompatible.to_string().contains("运行时覆盖校验失败"));
-    }
-
-    /// 状态字是 Rust 与 JS 两侧各自硬编码的跨语言契约：改了一边而忘了另一边，
-    /// 判定点会静默走 `_ => bail!` 分支，把降级重新变回「进不去」。
-    #[test]
-    fn app_server_override_status_is_a_shared_cross_language_contract() {
-        assert!(
-            STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT),
-            "JS payload must return the verified status the launcher compares against"
-        );
-        assert!(
-            STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT),
-            "JS payload must return the degraded status the launcher accepts"
-        );
-        assert!(
-            STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER),
-            "JS payload must mark an unobserved app-server wait so the launcher can retry"
-        );
-    }
-
-    #[test]
-    fn patch_expression_keeps_pet_slimming_voice_compatible() {
-        let expression = patch_expression(PatchOptions {
-            disable_pet: true,
-            subagent_gate_active: true,
-            misc_model: None,
-        });
-
-        assert!(expression.contains("const disablePet = true"));
-        assert!(
-            expression
-                .contains("const disableWindowsOptimizations = process.platform === \"win32\"")
-        );
-        assert!(expression.contains("const disableMicro = disableWindowsOptimizations"));
-        assert!(
-            expression.contains("const disableWindowsWmiSampler = disableWindowsOptimizations")
-        );
-        assert!(expression.contains("CodeyDisabledWmiSnapshotWorker"));
-        assert!(expression.contains("patchCodexAvatarOverlayPrewarm"));
-        assert!(expression.contains("throttleHiddenAvatarOverlay: disablePet"));
-        assert!(expression.contains("CODEY_STARTUP_PATCH_MARKER"));
-        assert!(expression.contains("delete process.env.NODE_OPTIONS"));
-        assert!(expression.contains("isRequireArgument"));
-        assert!(expression.contains("patchCodexRendererResponse"));
-        assert!(expression.contains("pet settings avatar resources"));
-        assert!(expression.contains("restoreNativeModelAndSpeedControls: true"));
-        assert!(!expression.contains("CodeyPetBlockedBrowserWindow"));
-        assert!(!expression.contains("__CODEY_DISABLED_PET_MANAGER__"));
-        assert!(!expression.contains("__CODEY_PET_HARD_DISABLE_STATUS__"));
-        assert!(!expression.contains("CODEY_PET_DISABLED"));
-        assert!(!expression.contains("guardAvatarOverlayLifecycle"));
-        assert!(!expression.contains("Codex pet window disabled by Codey"));
-        assert!(expression.contains("process.getBuiltinModule(\"inspector\").close()"));
-        assert!(expression.contains("disableAppServerAnalytics: true"));
-        assert!(expression.contains("get disableDesktopCesAnalytics()"));
-        assert!(expression.contains("analytics.enabled=false"));
-        assert!(expression.contains("reconcileExternalPluginState"));
-        assert!(expression.contains("get throttleExternalPluginFocusReconcile()"));
-        assert!(expression.contains("get disableAppStateHeartbeat()"));
-        assert!(expression.contains("get optionalMainBundlePatchFailures()"));
-        assert!(expression.contains("const originalCompile = module._compile"));
-        assert!(expression.contains("CODEY_SUBAGENT_GATE_RUNTIME_ID"));
-        assert!(!expression.contains("localeOverride"));
-        assert!(expression.contains("spawnSync"));
-        assert!(expression.contains("writeCodeyPatchFailuresAsync"));
-        assert!(expression.contains("optionalPatchFailureQueue"));
-        assert!(expression.contains("--codey-record-error"));
-        assert!(expression.contains("codex: readCodexAppVersion()"));
-        assert!(expression.replace("\r\n", "\n").contains(
-            "setImmediate(() => {\n        try { process.getBuiltinModule(\"inspector\").close()"
-        ));
-        assert!(!expression.contains("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__"));
-        assert!(!expression.contains("\"__CODEY_ERROR_LOGGER_EXECUTABLE__\""));
-    }
-
-    #[test]
-    fn patch_expression_embeds_runtime_config_overrides_as_json() {
-        let overrides = vec![
-            "features.hooks=true".to_string(),
-            "developer_instructions=\"line one\\nline two\"".to_string(),
-        ];
-        let expression = patch_expression_with_runtime_overrides(
-            PatchOptions {
-                disable_pet: false,
-                subagent_gate_active: true,
-                misc_model: None,
-            },
-            &overrides,
-        );
-
-        assert!(expression.contains("const codeyRuntimeConfigOverrides = ["));
-        assert!(expression.contains("features.hooks=true"));
-        assert!(expression.contains("developer_instructions="));
-        assert!(!expression.contains("__CODEY_RUNTIME_CONFIG_OVERRIDES__"));
-    }
-
-    #[test]
-    fn patch_expression_injects_the_misc_model_without_renaming_its_global() {
-        let unset = patch_expression(PatchOptions {
-            disable_pet: false,
-            subagent_gate_active: true,
-            misc_model: None,
-        });
-        assert!(!unset.contains("__CODEY_MISC_MODEL_ID__"));
-        assert!(unset.contains("const rawMiscModelId = null"));
-        assert!(unset.contains("globalThis, \"__CODEY_MISC_MODEL__\""));
-
-        let selected = patch_expression(PatchOptions {
-            disable_pet: false,
-            subagent_gate_active: true,
-            misc_model: Some("relay/housekeeping".to_string()),
-        });
-        assert!(selected.contains("const rawMiscModelId = \"relay/housekeeping\""));
-        assert!(selected.contains("globalThis, \"__CODEY_MISC_MODEL__\""));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn inspector_discovery_accepts_cold_start_after_fifteen_seconds() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let port = reserve_loopback_port().unwrap();
-        let server = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(18)).await;
-            tokio::time::resume();
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            assert_ne!(stream.read(&mut request).await.unwrap(), 0);
-            let body = r#"[{"webSocketDebuggerUrl":"ws://127.0.0.1/test"}]"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-        assert_eq!(
-            wait_for_inspector(port, None).await.unwrap(),
-            "ws://127.0.0.1/test"
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn inspector_protocol_installs_stub_before_resuming() {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
-
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-            for expected_id in [1_u64, 2] {
-                let message = socket.next().await.unwrap().unwrap();
-                let Message::Text(text) = message else {
-                    panic!("expected inspector command");
-                };
-                let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-                assert_eq!(command["id"], expected_id);
-                socket
-                    .send(Message::Text(
-                        serde_json::json!({"id": expected_id, "result": {}})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected runIfWaitingForDebugger");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["method"], "Runtime.runIfWaitingForDebugger");
-            socket
-                .send(Message::Text(
-                    serde_json::json!({"id": 3, "result": {}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "method": "Debugger.paused",
-                        "params": {
-                            "callFrames": [{"callFrameId": "frame-1"}]
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected evaluateOnCallFrame");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["method"], "Debugger.evaluateOnCallFrame");
-            assert_eq!(command["params"]["callFrameId"], "frame-1");
-            let expression = command["params"]["expression"].as_str().unwrap();
-            assert!(expression.contains("@worklouder/device-kit-oai"));
-            assert!(expression.contains("pet settings avatar resources"));
-            assert!(!expression.contains("CodeyPetBlockedBrowserWindow"));
-            assert!(!expression.contains("CODEY_PET_DISABLED"));
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "id": 4,
-                        "result": {
-                            "result": {
-                                "type": "string",
-                                "value": PATCH_RESULT
-                            }
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected Debugger.resume");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["method"], "Debugger.resume");
-            socket
-                .send(Message::Text(
-                    serde_json::json!({"id": 5, "result": {}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let expression = patch_expression(PatchOptions {
-            disable_pet: true,
-            subagent_gate_active: true,
-            misc_model: None,
-        });
-        install_over_websocket(&format!("ws://{address}"), &expression, false)
-            .await
-            .unwrap();
-        server.await.unwrap();
-    }
-
-    /// 驱动完整的 Inspector 安装协议，确认结果由用例指定。
-    async fn run_inspector_runtime_override_case(status: &'static str) -> anyhow::Result<()> {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
-
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-            for expected_id in [1_u64, 2] {
-                let message = socket.next().await.unwrap().unwrap();
-                let Message::Text(text) = message else {
-                    panic!("expected inspector command");
-                };
-                let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-                assert_eq!(command["id"], expected_id);
-                socket
-                    .send(Message::Text(
-                        serde_json::json!({"id": expected_id, "result": {}})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected runIfWaitingForDebugger");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["id"], 3);
-            assert_eq!(command["method"], "Runtime.runIfWaitingForDebugger");
-            socket
-                .send(Message::Text(
-                    serde_json::json!({"id": 3, "result": {}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "method": "Debugger.paused",
-                        "params": {
-                            "callFrames": [{"callFrameId": "frame-1"}]
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected evaluateOnCallFrame");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["id"], 4);
-            assert_eq!(command["method"], "Debugger.evaluateOnCallFrame");
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "id": 4,
-                        "result": {
-                            "result": {
-                                "type": "string",
-                                "value": PATCH_RESULT
-                            }
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected Debugger.resume");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["id"], 5);
-            assert_eq!(command["method"], "Debugger.resume");
-            socket
-                .send(Message::Text(
-                    serde_json::json!({"id": 5, "result": {}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected Runtime.evaluate");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["id"], 6);
-            assert_eq!(command["method"], "Runtime.evaluate");
-            assert_eq!(command["params"]["awaitPromise"], true);
-            assert!(
-                command["params"]["expression"]
-                    .as_str()
-                    .unwrap()
-                    .contains("__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__")
-            );
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "id": 6,
-                        "result": {
-                            "result": {
-                                "type": "string",
-                                "value": status
-                            }
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let expression = patch_expression(PatchOptions {
-            disable_pet: true,
-            subagent_gate_active: true,
-            misc_model: None,
-        });
-        let result = install_over_websocket(&format!("ws://{address}"), &expression, true).await;
-        server.await.unwrap();
-        result
-    }
-
-    #[tokio::test]
-    async fn inspector_protocol_waits_for_app_server_runtime_override_validation() {
-        run_inspector_runtime_override_case(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT)
-            .await
-            .unwrap();
-    }
-
-    /// JS 确认满足降级条件后，启动器接受该状态。
-    #[tokio::test]
-    async fn inspector_protocol_accepts_the_degraded_runtime_override_status() {
-        run_inspector_runtime_override_case(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn inspector_protocol_rejects_unknown_runtime_override_status() {
-        let error = run_inspector_runtime_override_case("unexpected-runtime-status")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("运行时覆盖校验未返回预期状态"));
-    }
-
-    #[tokio::test]
-    async fn inspector_protocol_fails_immediately_when_continue_is_rejected() {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
-
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-            for expected_id in [1_u64, 2] {
-                let message = socket.next().await.unwrap().unwrap();
-                let Message::Text(text) = message else {
-                    panic!("expected inspector command");
-                };
-                let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-                assert_eq!(command["id"], expected_id);
-                socket
-                    .send(Message::Text(
-                        serde_json::json!({"id": expected_id, "result": {}})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-
-            let message = socket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                panic!("expected runIfWaitingForDebugger");
-            };
-            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(command["id"], 3);
-            assert_eq!(command["method"], "Runtime.runIfWaitingForDebugger");
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "id": 3,
-                        "error": { "code": -32000, "message": "not waiting" }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let expression = patch_expression(PatchOptions {
-            disable_pet: true,
-            subagent_gate_active: true,
-            misc_model: None,
-        });
-        let error = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            install_over_websocket(&format!("ws://{address}"), &expression, false),
-        )
-        .await
-        .expect("protocol error should not wait for the outer startup timeout")
-        .expect_err("runIfWaitingForDebugger error should fail installation");
-        let message = error.to_string();
-        assert!(
-            message.contains("Runtime.runIfWaitingForDebugger"),
-            "{message}"
-        );
-        assert!(message.contains("not waiting"), "{message}");
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn inspector_wait_gives_up_once_the_renderer_port_answers_but_the_inspector_refuses() {
-        let renderer = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let renderer_port = renderer.local_addr().unwrap().port();
-        let started = std::time::Instant::now();
-        // Closed loopback ports can time out on Windows before refusal arrives.
-        // Supply the error explicitly so this test exercises refusal handling.
-        let mut probes = 0;
-        let error = wait_for_inspector_with_probe(0, Some(renderer_port), || {
-            probes += 1;
-            let kind = if probes == 1 {
-                std::io::ErrorKind::TimedOut
-            } else {
-                std::io::ErrorKind::ConnectionRefused
-            };
-            std::future::ready(Err(std::io::Error::from(kind).into()))
-        })
-        .await
-        .unwrap_err();
-        let unavailable = error
-            .downcast_ref::<InspectorUnavailable>()
-            .unwrap_or_else(|| panic!("expected InspectorUnavailable, got {error:#}"));
-        assert!(unavailable.refused >= 1);
-        assert!(
-            probes >= 2,
-            "a timeout alone must not mark Inspector unavailable"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "must not wait for the full discovery window"
-        );
-        drop(renderer);
     }
 
     #[test]
@@ -2569,190 +2015,5 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(attempts, 1);
-    }
-
-    #[test]
-    fn node_require_argument_is_a_single_unquoted_token() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("patch.js");
-        std::fs::write(&path, "0").unwrap();
-        let argument = node_require_argument(&path).unwrap();
-        assert!(argument.starts_with("--require="));
-        assert!(!argument.contains(char::is_whitespace));
-        assert!(argument.ends_with("patch.js"));
-    }
-
-    #[test]
-    fn prepare_startup_require_writes_js_and_marker_env() {
-        let temp = tempfile::tempdir().unwrap();
-        let prepared = prepare_startup_require_in(
-            temp.path(),
-            PatchOptions {
-                disable_pet: false,
-                subagent_gate_active: true,
-                misc_model: None,
-            },
-            &["analytics.enabled=false".to_string()],
-        )
-        .unwrap();
-        let environment = prepared
-            .environment
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashMap<_, _>>();
-        let node_options = environment
-            .get("NODE_OPTIONS")
-            .expect("NODE_OPTIONS must be set for --require");
-        assert_eq!(
-            environment.get("CODEX_SPARKLE_ENABLED"),
-            Some(&"false".to_string())
-        );
-        assert!(node_options.starts_with("--require="));
-        assert!(!node_options.contains(char::is_whitespace));
-        let script = std::path::PathBuf::from(node_options.trim_start_matches("--require="));
-        let source = std::fs::read_to_string(&script).unwrap();
-        assert!(source.contains("CODEY_STARTUP_PATCH_MARKER"));
-        assert!(source.contains("delete process.env.NODE_OPTIONS"));
-        assert!(source.contains("analytics.enabled=false"));
-        let marker = environment
-            .get(STARTUP_PATCH_MARKER_ENV)
-            .expect("require path must publish a marker");
-        assert_eq!(std::path::Path::new(marker), prepared.marker_path);
-        assert!(marker.ends_with(".json"));
-        assert!(!prepared.marker_path.exists());
-    }
-
-    #[test]
-    fn space_free_path_moves_off_whitespace() {
-        let temp = tempfile::tempdir().unwrap();
-        let spaced = temp.path().join("has space");
-        std::fs::create_dir(&spaced).unwrap();
-        let source = spaced.join(format!("{}.js", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&source, "1").unwrap();
-        let resolved = space_free_path(&source).unwrap();
-        assert!(!path_has_whitespace(&resolved));
-        assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "1");
-        std::fs::remove_file(resolved).unwrap();
-    }
-
-    #[test]
-    fn failed_path_preparation_removes_the_unused_patch() {
-        let temp = tempfile::tempdir().unwrap();
-        let options = PatchOptions {
-            disable_pet: false,
-            subagent_gate_active: false,
-            misc_model: None,
-        };
-        let failure = prepare_startup_require_with_path(temp.path(), options.clone(), &[], |_| {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
-        });
-        assert!(failure.is_err());
-        let invalid_argument =
-            prepare_startup_require_with_path(temp.path(), options.clone(), &[], |_| {
-                Ok(temp.path().join("missing patch.js"))
-            });
-        assert!(invalid_argument.is_err());
-        assert_eq!(
-            std::fs::read_dir(temp.path().join(STARTUP_REQUIRE_DIR))
-                .unwrap()
-                .count(),
-            0
-        );
-        let first = prepare_startup_require_in(temp.path(), options.clone(), &[]).unwrap();
-        let second = prepare_startup_require_in(temp.path(), options, &[]).unwrap();
-        assert_ne!(first.marker_path, second.marker_path);
-        assert!(first.marker_path.with_extension("js").is_file());
-        assert!(second.marker_path.with_extension("js").is_file());
-    }
-
-    #[test]
-    fn startup_require_temp_copy_preserves_content_and_cleanup_filename() {
-        let temp = tempfile::tempdir().unwrap();
-        let spaced = temp.path().join("has space");
-        std::fs::create_dir(&spaced).unwrap();
-        let source = spaced.join(format!("{}.js", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&source, "module.exports = 1;").unwrap();
-
-        let resolved = copy_startup_require_to_temp(&source, temp.path()).unwrap();
-
-        assert_eq!(resolved, temp.path().join(source.file_name().unwrap()));
-        assert_eq!(
-            std::fs::read(&resolved).unwrap(),
-            std::fs::read(&source).unwrap()
-        );
-        assert_eq!(
-            node_require_argument(&resolved).unwrap(),
-            format!("--require={}", resolved.display())
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[test]
-    fn startup_require_temp_copy_rejects_whitespace_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("patch.js");
-        std::fs::write(&source, "1").unwrap();
-        let destination_dir = temp.path().join("has space");
-        std::fs::create_dir(&destination_dir).unwrap();
-
-        let error = copy_startup_require_to_temp(&source, &destination_dir).unwrap_err();
-
-        assert!(error.to_string().contains("临时补丁路径包含空白"));
-        assert!(!destination_dir.join("patch.js").exists());
-    }
-
-    #[test]
-    fn startup_require_temp_copy_reports_missing_source() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("has space").join("missing.js");
-
-        let error = copy_startup_require_to_temp(&source, temp.path()).unwrap_err();
-
-        assert!(error.to_string().contains("读取 Codex 启动补丁失败"));
-        assert!(error.to_string().contains("missing.js"));
-        assert!(!temp.path().join("missing.js").exists());
-    }
-
-    #[test]
-    fn prune_startup_require_files_removes_stale_payloads() {
-        let temp = tempfile::tempdir().unwrap();
-        let now = std::time::SystemTime::now();
-        let old = now - std::time::Duration::from_secs(2 * 60 * 60);
-        let stale_js = temp.path().join("stale.js");
-        let stale_json = temp.path().join("stale.json");
-        let stale_tmp = temp.path().join("stale.tmp");
-        let fresh = temp.path().join("fresh.js");
-        let other = temp.path().join("stale.txt");
-        for path in [&stale_js, &stale_json, &stale_tmp, &fresh, &other] {
-            std::fs::write(path, "{}").unwrap();
-        }
-        for path in [&stale_js, &stale_json, &stale_tmp, &other] {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
-        }
-        assert_eq!(
-            prune_startup_require_files(temp.path(), now, STARTUP_REQUIRE_MAX_AGE),
-            3
-        );
-        assert!(!stale_js.exists());
-        assert!(!stale_json.exists());
-        assert!(!stale_tmp.exists());
-        assert!(fresh.exists());
-        assert!(other.exists());
-        assert_eq!(
-            prune_startup_require_files(&temp.path().join("missing"), now, STARTUP_REQUIRE_MAX_AGE),
-            0
-        );
     }
 }

@@ -3,6 +3,7 @@ pub mod lifecycle;
 mod logs;
 mod provider;
 pub(crate) mod transport;
+pub(crate) mod turn_state;
 
 #[allow(unused_imports)]
 pub(crate) use provider::{PluginRouteSpec, RouteChange, set_route_handler};
@@ -11,6 +12,7 @@ mod package;
 
 use native::Native;
 pub use package::Inspection;
+pub(crate) use package::MAX_PACKAGE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -64,8 +66,32 @@ where
 {
     T::deserialize(deserializer).map(Some)
 }
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_CONFIG_BYTES: u64 = codey_plugin_sdk::config::MAX_CONFIG_BYTES as u64;
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 静态协议信息；不初始化插件管理器，也不读取配置或加载动态库。
+pub fn host_info() -> codey_plugin_sdk::host::HostInfo {
+    use codey_plugin_sdk::{
+        host::{HostInfo, HostLimits},
+        transport,
+    };
+    HostInfo {
+        abi_version: codey_plugin_sdk::ABI_VERSION,
+        platform: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        accepted_capabilities: package::ACCEPTED_CAPABILITIES
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+        limits: HostLimits {
+            max_config_bytes: codey_plugin_sdk::config::MAX_CONFIG_BYTES,
+            max_message_bytes: codey_plugin_sdk::MAX_MESSAGE_BYTES,
+            max_package_bytes: MAX_PACKAGE,
+            transport_chunk_bytes: transport::CHUNK_BYTES,
+            max_transport_body_bytes: transport::MAX_BODY_BYTES,
+        },
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -840,7 +866,15 @@ impl Manager {
             self.log_event(id, "uninstalled_data_retained");
         }
         for (_, trash) in moved {
-            if let Err(error) = fs::remove_dir_all(&trash) {
+            // 不跟随符号链接判断类型，目录递归清理，普通文件仅删除该条目。
+            let cleanup = fs::symlink_metadata(&trash).and_then(|metadata| {
+                if metadata.is_dir() {
+                    fs::remove_dir_all(&trash)
+                } else {
+                    fs::remove_file(&trash)
+                }
+            });
+            if let Err(error) = cleanup {
                 return Err(format!(
                     "插件已卸载，但文件清理失败；请退出 Codey 后删除 {}: {error}",
                     trash.display()
@@ -1114,7 +1148,11 @@ impl Manager {
         generations.retain(|generation| generation.strong_count() > 0);
         generations.push(native.lifetime());
         let instance = Arc::new(Mutex::new(native));
-        let lifecycle = lifecycle::LifecyclePlugin::native(&manifest, instance.clone());
+        let lifecycle = lifecycle::LifecyclePlugin::native(
+            &manifest,
+            instance.clone(),
+            prepared.context.log_dir.clone(),
+        );
         self.live.insert(
             prepared.id.clone(),
             Active {
@@ -1214,58 +1252,15 @@ fn verify_library(path: &Path, expected_sha256: &str) -> Result<(), String> {
         return Err("插件动态库必须是普通文件，不能是符号链接".into());
     }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > package::MAX_PACKAGE || package::digest(&bytes) != expected_sha256 {
+    if bytes.len() as u64 > MAX_PACKAGE || package::digest(&bytes) != expected_sha256 {
         return Err("已安装动态库校验失败".into());
     }
     Ok(())
 }
 
 fn parse_config(content: &str) -> Result<Value, String> {
-    if content.len() as u64 > MAX_CONFIG_BYTES {
-        return Err("配置文件超过 1 MiB".into());
-    }
-    let mut value: Value = serde_json::from_str(content)
-        .map_err(|e| format!("config.json 不是有效 JSON，请打开配置文件修复：{e}"))?;
-    if !value.is_object() {
-        return Err("config.json 的根值必须是 JSON 对象".into());
-    }
-    remove_config_comments(&mut value, "$")?;
-    Ok(value)
-}
-
-// 仅移除运行配置中的说明，保存和冲突检查始终使用文件原文。
-fn remove_config_comments(value: &mut Value, path: &str) -> Result<(), String> {
-    match value {
-        Value::Object(object) => {
-            if let Some(comments) = object.remove("_comments") {
-                let comments_path = format!("{path}[\"_comments\"]");
-                let entries = comments
-                    .as_object()
-                    .ok_or_else(|| format!("{comments_path} 必须是对象，每项说明必须是字符串"))?;
-                for (key, description) in entries {
-                    if !description.is_string() {
-                        return Err(format!(
-                            "{comments_path}[{}] 说明必须是字符串",
-                            serde_json::to_string(key).unwrap()
-                        ));
-                    }
-                }
-            }
-            for (key, child) in object {
-                remove_config_comments(
-                    child,
-                    &format!("{path}[{}]", serde_json::to_string(key).unwrap()),
-                )?;
-            }
-        }
-        Value::Array(array) => {
-            for (index, child) in array.iter_mut().enumerate() {
-                remove_config_comments(child, &format!("{path}[{index}]"))?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    // 保存与冲突检查仍使用文件原文；这里只生成插件运行配置。
+    codey_plugin_sdk::config::parse(content).map_err(|error| error.to_string())
 }
 
 fn checked_config_file(path: &Path) -> Result<(), String> {
@@ -1414,6 +1409,26 @@ fn checked_child_directory(parent: &Path, name: &str, create: bool) -> Result<Pa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn advertised_capabilities_are_accepted_with_required_manifest_fields() {
+        let info = host_info();
+        let mut manifest = fixture_package().inspection.manifest;
+        manifest.capabilities = info.accepted_capabilities.clone();
+        manifest.api_key_urls = vec!["https://example.test/v1/responses".into()];
+        package::validate_manifest(&manifest).unwrap();
+        manifest
+            .capabilities
+            .push("unknown.future.capability".into());
+        assert!(package::validate_manifest(&manifest).is_err());
+        let encoded = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            serde_json::from_value::<codey_plugin_sdk::host::HostInfo>(encoded).unwrap(),
+            info
+        );
+        assert_eq!(info.limits.max_config_bytes as u64, MAX_CONFIG_BYTES);
+        assert_eq!(info.limits.max_package_bytes, MAX_PACKAGE);
+    }
 
     #[test]
     fn state_file_read_preserves_the_size_limit_and_does_not_rewrite_input() {
@@ -2141,6 +2156,75 @@ mod tests {
         assert_eq!(fs::read(&config_path).unwrap(), b"{\"saved\":true}\n");
         reopened.uninstall("test.boundary", true).unwrap();
         assert!(!context.plugin_dir.exists());
+    }
+
+    #[test]
+    fn retained_uninstall_removes_plain_files_and_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let context = manager.context("test.boundary", false).unwrap();
+        fs::write(context.plugin_dir.join("cache.json"), b"cache").unwrap();
+        fs::create_dir(context.plugin_dir.join("cache")).unwrap();
+        fs::write(context.plugin_dir.join("cache/item"), b"cache").unwrap();
+        fs::write(context.data_dir.join("saved.json"), b"persistent").unwrap();
+        fs::write(context.log_dir.join("plugin.log"), b"log").unwrap();
+        let config = fs::read(context.plugin_dir.join(CONFIG_FILE)).unwrap();
+
+        manager.uninstall("test.boundary", false).unwrap();
+
+        assert!(!manager.state.plugins.contains_key("test.boundary"));
+        assert!(!context.plugin_dir.join("cache.json").exists());
+        assert!(!context.plugin_dir.join("cache").exists());
+        assert!(!context.plugin_dir.join("versions").exists());
+        assert_eq!(
+            fs::read(context.data_dir.join("saved.json")).unwrap(),
+            b"persistent"
+        );
+        assert_eq!(
+            fs::read(context.log_dir.join("plugin.log")).unwrap(),
+            b"log"
+        );
+        assert_eq!(
+            fs::read(context.plugin_dir.join(CONFIG_FILE)).unwrap(),
+            config
+        );
+        assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".trash-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_uninstall_rejects_top_level_symlinks_and_does_not_follow_nested_links() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"preserve").unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let context = manager.context("test.boundary", false).unwrap();
+        let link = context.plugin_dir.join("cache-link");
+        std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+        assert!(
+            manager
+                .uninstall("test.boundary", false)
+                .unwrap_err()
+                .contains("符号链接")
+        );
+        assert!(manager.state.plugins.contains_key("test.boundary"));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        fs::remove_file(link).unwrap();
+        let cache = context.plugin_dir.join("cache");
+        fs::create_dir(&cache).unwrap();
+        std::os::unix::fs::symlink(outside.path(), cache.join("outside")).unwrap();
+        manager.uninstall("test.boundary", false).unwrap();
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve");
+        assert!(!cache.exists());
     }
 
     #[test]

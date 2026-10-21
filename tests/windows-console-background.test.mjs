@@ -37,12 +37,12 @@ test("Windows source contract: fatal startup failures remain visible", async () 
   const failureBranch = library.slice(failureStart, shutdownCleanup);
   assert.match(failureBranch, /commands::launch_codey_runtime\(&state\)\.await/);
   assert.match(failureBranch, /stop_runtime_with_retry\(&state\)\.await/);
-  assert.match(failureBranch, /finish_failed_startup\(/);
+  assert.match(failureBranch, /initial_startup_failure_error\(/);
   assert.match(
     failureBranch,
-    /if let Err\(error\) = &result \{\s*show_initial_startup_failure\(error\)\.await;/,
+    /show_initial_startup_failure\(&failure\)\.await;/,
   );
-  assert.match(failureBranch, /return result\.map_err\(anyhow::Error::msg\)/);
+  assert.match(failureBranch, /return Err\(anyhow::Error::msg\(failure\)\)/);
 
   const cleanupHelper = library.slice(
     library.indexOf("async fn stop_runtime_with_retry"),
@@ -119,50 +119,15 @@ test("Windows source contract: packaged Codex exit uses an OS process wait", asy
   assert.doesNotMatch(coreLauncher, /WaitForSingleObject\([^\n]*INFINITE\)/);
 });
 
-test("Windows source contract: updates use the detached native helper", async () => {
-  const [main, updates, updateHelper] = await Promise.all([
-    readSource("backend/src/main.rs"),
-    readSource("backend/src/commands/updates.rs"),
-    readSource("backend/src/update_helper.rs"),
-  ]);
+test("Windows source contract: helper entry points run before the desktop app", async () => {
+  const main = await readSource("backend/src/main.rs");
 
+  // 桌面入口先按参数分派到各自的后台助手，未命中任何助手时才启动桌面应用。
   assert.match(
     main,
-    /run_update_helper_if_requested\(\)\?[\s\S]*run_desktop_application\(\)/,
+    /codey_lib::run_plugin_log_terminal_if_requested\(\)[\s\S]*codey_lib::run_desktop_application\(\)/,
   );
-  assert.match(
-    updates,
-    /crate::update_helper::spawn_update_installer\(update_path, asset\.size, &asset\.sha256\)/,
-  );
-  assert.doesNotMatch(updates, /powershell\.exe|install-codey-update\.ps1/i);
-  assert.match(
-    updateHelper,
-    /std::fs::copy\(&executable, &helper_path\)[\s\S]*Command::new\(&helper_path\)/,
-  );
-  // 安装结果必须先复核，再决定是否重启：静默 NSIS 失败时盲目重启只会让用户
-  // 反复回到旧版本。
-  assert.match(
-    updateHelper,
-    /match outcome \{[\s\S]*?Ok\(UpdateInstallOutcome::Updated\s*\|\s*UpdateInstallOutcome::Failed\)[\s\S]*?restart_codey\(invocation, &log_path\)/,
-  );
-  assert.match(
-    updateHelper,
-    /Ok\(UpdateInstallOutcome::Unverified\) => \{[\s\S]*?restart_codey\(invocation, &log_path\)/,
-  );
-  assert.match(
-    updateHelper,
-    /Err\(install_error\) => \{[\s\S]*?finish_update_report\(&report_path, &report_version, "failed", &install_error\)[\s\S]*?Err\(install_error\)/,
-  );
-  assert.doesNotMatch(
-    updateHelper,
-    /let install_result = install_windows_update/,
-    "安装失败后不得再无条件重启旧版本",
-  );
-  assert.match(updateHelper, /raw_arg\(nsis_install_directory_argument/);
-  assert.match(
-    updateHelper,
-    /let outcome = verify_installed_update\(invocation, expected_version\.as_deref\(\), before\)/,
-  );
+  assert.doesNotMatch(main, /run_update_helper_if_requested|update_helper/);
 });
 
 test("Windows source contract: missing Codex paths recover before startup", async () => {

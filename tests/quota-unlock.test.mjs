@@ -12,48 +12,113 @@ function createRuntime(initialValue = null) {
     setItem: (key, value) => values.set(key, String(value)),
     removeItem: (key) => values.delete(key),
   };
-  const window = { localStorage };
+  class WebSocket {
+    send(data) { this.sent = data; }
+    addEventListener() {}
+  }
+  const window = { localStorage, WebSocket };
   window.window = window;
-  const context = { window, localStorage, console };
-  vm.runInNewContext(source, context);
-  return { context, window, localStorage };
+  const context = vm.createContext({ window, localStorage, console });
+  const nativeParse = vm.runInContext("JSON.parse", context);
+  vm.runInContext(source, context);
+  return { context, window, localStorage, nativeParse, WebSocket, api: window.__codeyQuotaUnlock };
 }
 
-test("quota unlock sanitizes rate-limit payloads before Codex reads them", () => {
-  const { context, window } = createRuntime();
-  const value = vm.runInNewContext(
-    `JSON.parse(${JSON.stringify(JSON.stringify({
-      rate_limit: { allowed: false, limit_reached: true },
-      primary_window: { used_percent: 100, reset_at: 1 },
-      spend_control: { reached: true },
-      credits: { has_credits: false, unlimited: false, balance: 0 },
-      blocked_features: [{ name: "send" }, { name: "other" }],
-    }))})`,
-    context,
-  );
+const usage = {
+  rate_limit: { allowed: false, limit_reached: true,
+    primary_window: { used_percent: 100, reset_at: 1 },
+    secondary_window: { used_percent: 55, reset_at: 0 } },
+  rateLimits: { primary: { usedPercent: 4, resetAt: 1 }, secondary: { usedPercent: 55, resetAt: null } },
+  rateLimitsByLimitId: { codex: { primary: { usedPercent: 100, resetAt: 1 } } },
+  rate_limit_reached_type: "weekly", rateLimitReachedType: "weekly",
+  spend_control: { reached: true },
+  credits: { has_credits: false, unlimited: false, balance: 0 },
+  rate_limit_upsell: { plan: "pro" }, rate_limit_warning: "exhausted",
+  sidebar_usage_warnings: ["exhausted"],
+  blocked_features: [{ name: "send" }, { name: "tpp_send" }, { name: "other" }],
+  limits_progress: [{ remaining: 0 }],
+  additional_rate_limits: [{ primary_window: { used_percent: 99, reset_at: 1 } }],
+  code_review_rate_limit: { allowed: false, limit_reached: true },
+};
 
-  assert.equal(value.rate_limit.allowed, true);
-  assert.equal(value.rate_limit.limit_reached, false);
-  assert.equal(value.primary_window.used_percent, 3);
-  assert.ok(value.primary_window.reset_at > Math.floor(Date.now() / 1000));
-  assert.equal(value.spend_control.reached, false);
-  assert.equal(value.credits.has_credits, true);
-  assert.equal(value.credits.unlimited, true);
-  assert.equal(value.credits.balance, 1_000_000);
-  assert.equal(JSON.stringify(value.blocked_features), JSON.stringify([{ name: "other" }]));
-  assert.equal(window.__codeyQuotaUnlock.status().sanitized, 1);
+test("official REST, WebSocket and SSE usage payloads remain unchanged", () => {
+  const { context, window, nativeParse, WebSocket } = createRuntime();
+  assert.equal(vm.runInContext("JSON.parse", context), nativeParse);
+  assert.equal(window.WebSocket, WebSocket);
+  const socket = new window.WebSocket("ws://localhost");
+  assert.equal(socket.send, WebSocket.prototype.send);
+  assert.equal(socket.addEventListener, WebSocket.prototype.addEventListener);
+  for (const payload of [usage, { id: 1, result: usage },
+    { method: "account/rateLimits/updated", params: usage }, { type: "usage.snapshot", usage }]) {
+    const serialized = JSON.stringify(payload);
+    const parsed = vm.runInContext(`JSON.parse(${JSON.stringify(serialized)})`, context);
+    assert.equal(JSON.stringify(parsed), serialized);
+    socket.send(serialized);
+    assert.equal(socket.sent, serialized);
+  }
 });
 
-test("quota unlock can be disabled before the document is loaded", () => {
-  const { context, window } = createRuntime("off");
-  const value = vm.runInNewContext(
-    `JSON.parse(${JSON.stringify(JSON.stringify({
-      rate_limit: { allowed: false, limit_reached: true },
-    }))})`,
-    context,
-  );
+test("ordinary business data and JSON.parse revivers remain unchanged", () => {
+  const { context } = createRuntime();
+  const serialized = JSON.stringify({ name: "task", count: 2, nested: { credits: { balance: -20 } } });
+  assert.equal(vm.runInContext(`JSON.stringify(JSON.parse(${JSON.stringify(serialized)}))`, context), serialized);
+  assert.equal(vm.runInContext('JSON.parse(\'{"count":2}\', (key, value) => key === "count" ? value + 1 : value).count', context), 3);
+});
 
-  assert.equal(value.rate_limit.allowed, false);
-  assert.equal(value.rate_limit.limit_reached, true);
-  assert.equal(window.__codeyQuotaUnlock.status().enabled, false);
+test("only confirmed third-party models on the local host allow sending", () => {
+  const { window, api } = createRuntime();
+  const calls = [];
+  window.__codeyModelWhitelistPatch = {
+    isThirdPartyModel(context) { calls.push(context); return context.model === "third-party"; },
+  };
+  const context = { hostId: "local", model: "third-party" };
+  assert.equal(api.allowsLocalSend(context), true);
+  assert.equal(calls[0], context);
+  assert.equal(api.allowsLocalSend({ hostId: "local", model: "official" }), false);
+  const before = calls.length;
+  for (const invalid of [undefined, null, {}, { model: "third-party" },
+    { hostId: "remote", model: "third-party" }, { hostId: "local" },
+    { hostId: "local", model: 42 }, { hostId: "local", model: "" }, { hostId: "local", model: "  " }]) {
+    assert.equal(api.allowsLocalSend(invalid), false);
+  }
+  assert.equal(calls.length, before);
+});
+
+test("missing, failing and unconfirmed helpers preserve restrictions", () => {
+  const { window, api } = createRuntime();
+  const context = { hostId: "local", model: "third-party" };
+  assert.equal(api.allowsLocalSend(context), false);
+  for (const helper of [{}, { isThirdPartyModel: true },
+    { isThirdPartyModel() { throw new Error("unavailable"); } },
+    ...[false, undefined, null, 1, "true"].map(value => ({ isThirdPartyModel: () => value }))]) {
+    window.__codeyModelWhitelistPatch = helper;
+    assert.equal(api.allowsLocalSend(context), false);
+  }
+});
+
+test("enable and disable take immediate effect and persist the local option", () => {
+  const { window, api, localStorage } = createRuntime("off");
+  window.__codeyModelWhitelistPatch = { isThirdPartyModel: () => true };
+  const context = { hostId: "local", model: "third-party" };
+  assert.equal(api.status().version, "2.0.0");
+  assert.ok(Number.isFinite(Date.parse(api.status().installedAt)));
+  assert.equal(api.status().enabled, false);
+  assert.equal(api.allowsLocalSend(context), false);
+  api.enable();
+  assert.equal(localStorage.getItem("codeyQuotaUnlock"), null);
+  assert.equal(api.status().enabled, true);
+  assert.equal(api.allowsLocalSend(context), true);
+  api.disable();
+  assert.equal(localStorage.getItem("codeyQuotaUnlock"), "off");
+  assert.equal(api.status().enabled, false);
+  assert.equal(api.allowsLocalSend(context), false);
+});
+
+test("storage failures do not prevent immediate enable or disable", () => {
+  const { api, localStorage } = createRuntime();
+  localStorage.setItem = localStorage.removeItem = () => { throw new Error("denied"); };
+  api.disable();
+  assert.equal(api.status().enabled, false);
+  api.enable();
+  assert.equal(api.status().enabled, true);
 });

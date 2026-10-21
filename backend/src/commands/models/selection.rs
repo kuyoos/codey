@@ -184,11 +184,11 @@ pub async fn save_selected_models(
         .is_some_and(|refresh| refresh.fallback);
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
+    let hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(_config_write_guard);
     timings.mark("saveConfigMs");
-    let hot_reload = hot_reload_runtime_models(state).await;
     timings.mark("modelDeliveryMs");
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    let subagent_hot_reload = SubagentHotReloadOutcome::default();
     timings.mark("subagentReloadMs");
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(add_subagent_hot_reload_to_response(
@@ -298,9 +298,9 @@ pub(crate) async fn save_native_selected_models(
         *state.config.write().await = next.clone();
     }
     let public_config = redacted_config(&next);
+    let hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &next).await;
+    let subagent_hot_reload = SubagentHotReloadOutcome::default();
     let restart_required = runtime_config_requires_restart(state, &next).await;
     Ok(add_subagent_hot_reload_to_response(
         hot_reload.add_to_response(json!({

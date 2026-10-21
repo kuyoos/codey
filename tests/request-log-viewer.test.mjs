@@ -4,40 +4,140 @@ import ts from "typescript";
 
 import { readSource } from "./helpers/read-source.mjs";
 
-test("request log cache hit rate uses input tokens and preserves unknown usage", async () => {
+test("request log provider labels use route short names and distinguish official accounts", async () => {
   const viewer = await readSource("src/RequestLogDialog.tsx");
-  const source = viewer.match(/function formatCacheHitRate\([\s\S]*?\n\}/)?.[0];
-  assert.ok(source);
-  const compiled = ts.transpileModule(source, {}).outputText;
-  const format = new Function(`${compiled}; return formatCacheHitRate;`)();
-  assert.equal(format(64268, 32000), "49.8%");
-  assert.equal(format(100, 0), "0.0%");
-  assert.equal(format(100, 100), "100.0%");
-  for (const [input, cached] of [[null, 0], [100, null], [undefined, undefined], [0, 0], [-1, 0], [100, -1], [100, 101], [Infinity, 1], [100, NaN]]) {
-    assert.equal(format(input, cached), "—");
-  }
+  const routeNames = await readSource("src/routeShortNames.ts");
+  const source = [
+    routeNames.match(/export function fallbackRouteShortName\([\s\S]*?\n\}/)?.[0],
+    routeNames.match(/export function formatRouteName\([\s\S]*?\n\}/)?.[0],
+    viewer.match(/function requestLogProviderLabel\([\s\S]*?\n\}/)?.[0],
+  ];
+  source.forEach((part) => assert.ok(part));
+  const compiled = ts.transpileModule(source.join("\n").replaceAll("export function", "function"), {}).outputText;
+  const label = new Function(`${compiled}; return requestLogProviderLabel;`)();
+  const profiles = [
+    { id: "local-a", sourceProviderId: "route-a", name: "线路甲", shortName: "甲" },
+    { id: "route-b", name: "", shortName: "乙" },
+    { id: "official-a", sourceProviderId: "official", name: "官方甲", shortName: "官甲", officialAccountId: "account-a" },
+    { id: "official-b", sourceProviderId: "official", name: "官方乙", shortName: "官乙", officialAccountId: "account-b" },
+  ];
+  assert.equal(label({ provider: "route-a", providerName: "route-a" }, profiles), "[甲] 线路甲");
+  assert.equal(label({ provider: "local-a" }, profiles), "[甲] 线路甲");
+  assert.equal(label({ provider: "route-b" }, profiles), "乙");
+  assert.equal(label({ provider: "official", officialAccountId: "account-b" }, profiles), "[官乙] 官方乙");
+  assert.equal(label({ provider: "removed", providerName: "历史线路" }, profiles), "历史线路");
+  assert.equal(label({ provider: "removed" }, profiles), "removed");
+  assert.equal(label({}, profiles), "—");
+  assert.equal(label({ provider: "legacy" }, [{ id: "legacy", name: "自建" }]), "自建");
+  assert.equal(label({ provider: "empty", providerName: "历史线路" }, [{ id: "empty", name: "", shortName: "" }]), "历史线路");
 });
 
-test("request log model cell shows the model sent upstream and the upstream model when it differs", async () => {
+test("request log cache hit rate uses input tokens and preserves unknown usage", async () => {
+  const viewer = await readSource("src/RequestLogDialog.tsx");
+  const source = viewer.match(/function cacheRateValue\([\s\S]*?\n\}/)?.[0];
+  assert.ok(source);
+  const compiled = ts.transpileModule(source, {}).outputText;
+  const cacheRateValue = new Function(`${compiled}; return cacheRateValue;`)();
+  assert.equal(cacheRateValue(64268, 32000).toFixed(1), "49.8");
+  assert.equal(cacheRateValue(100, 0).toFixed(1), "0.0");
+  assert.equal(cacheRateValue(100, 100).toFixed(1), "100.0");
+  for (const [input, cached] of [[null, 0], [100, null], [undefined, undefined], [0, 0], [-1, 0], [100, -1], [100, 101], [Infinity, 1], [100, NaN]]) {
+    assert.equal(cacheRateValue(input, cached), null);
+  }
+  // 未知读数在展示层渲染成短横线，而不是 0%。
+  assert.match(viewer, /cacheRate != null \?/);
+  assert.match(viewer, /\{cacheRate\.toFixed\(1\)\}%/);
+});
+
+test("request log output speed uses one decimal and preserves unknown values", async () => {
+  const [viewer, usage] = await Promise.all([
+    readSource("src/RequestLogDialog.tsx"),
+    readSource("src/usageAnalysis.ts"),
+  ]);
+  const source = viewer.match(/function formatTokensPerSecondValue\([\s\S]*?\n\}/)?.[0];
+  assert.ok(source);
+  const compiled = ts.transpileModule(source, {}).outputText;
+  const formatValue = new Function(`${compiled}; return formatTokensPerSecondValue;`)();
+  assert.equal(formatValue(123.44), "123.4");
+  assert.equal(formatValue(123.46), "123.5");
+  assert.equal(formatValue(1), "1.0");
+  for (const value of [null, undefined, 0, -1, NaN, Infinity, -Infinity]) {
+    assert.equal(formatValue(value), null);
+  }
+  assert.match(viewer, /outputTokensPerSecond\?: number \| null;/);
+  // 列表行与统计区共用同一份数值格式化：行内取数值，统计区追加单位。
+  assert.match(viewer, /const tpsText = formatTokensPerSecondValue\(item\.outputTokensPerSecond\);/);
+  assert.match(viewer, /function formatTokensPerSecond\(value\?: number \| null\) \{[\s\S]{0,80}formatTokensPerSecondValue\(value\)/);
+  assert.match(viewer, /输出速度<\/span>[\s\S]*?formatTokensPerSecond\(selectedItem\.outputTokensPerSecond\)/);
+  assert.match(viewer, /平均总耗时 \{formatDuration\(stats\.avgDuration\)\} · <span[^>]*>平均输出 \{formatTokensPerSecond\(stats\.avgOutputTokensPerSecond\)\}/);
+  assert.match(viewer, /hidden md:inline"[^>]*>速度:[\s\S]*?formatTokensPerSecond\(stats\.avgOutputTokensPerSecond\)/);
+  assert.equal((usage.match(/avgOutputTokensPerSecond: number \| null/g) ?? []).length, 2);
+});
+
+test("request log preview measures all output after the upstream first byte and aggregates by duration", async () => {
+  const preview = await readSource("src/dev/mockApi.ts");
+  const durationSource = preview.match(/function eligiblePreviewOutputDurationMs\([\s\S]*?\n\}\n/)?.[0];
+  const rowsSource = preview.match(/const previewRouteRequestLogs = Array\.from\([\s\S]*?\n    \}\);/)?.[0];
+  const aggregateSource = preview.match(/const aggregate = \(rows: typeof filtered\) => \{[\s\S]*?\n          \};/)?.[0];
+  for (const source of [durationSource, rowsSource, aggregateSource]) assert.ok(source);
+  const compiled = ts.transpileModule([
+    "const previewOfficialAccounts = [];",
+    durationSource, rowsSource, aggregateSource,
+  ].join("\n"), {}).outputText;
+  const { duration, rows, aggregate } = new Function(`${compiled}; return {
+    duration: eligiblePreviewOutputDurationMs, rows: previewRouteRequestLogs, aggregate,
+  };`)();
+  const buffered = rows[0];
+  assert.equal(duration(buffered), 110_465);
+  assert.equal(buffered.outputTokensPerSecond.toFixed(1), "169.5");
+  assert.ok(buffered.reasoningOutputTokens > 0);
+  assert.equal(buffered.outputTokensPerSecond, buffered.outputTokens * 1_000 / duration(buffered));
+  assert.equal(rows[7].outputTokensPerSecond, undefined);
+  assert.equal(rows[8].outputTokensPerSecond, undefined);
+  const base = { outputTokens: 100, totalDurationMs: 300, routerPreUpstreamMs: 50, upstreamFirstByteMs: 150 };
+  assert.equal(duration(base), 100);
+  assert.equal(duration({ ...base, downstreamFirstContentMs: null, ttftMs: 299 }), 100);
+  for (const changes of [
+    { outputTokens: 99 }, { outputTokens: null }, { outputTokens: NaN },
+    { routerPreUpstreamMs: null }, { upstreamFirstByteMs: undefined },
+    { routerPreUpstreamMs: -1 }, { upstreamFirstByteMs: -1 },
+    { totalDurationMs: -1 }, { totalDurationMs: Infinity },
+    { routerPreUpstreamMs: NaN }, { upstreamFirstByteMs: Infinity },
+    { totalDurationMs: 299 }, { upstreamFirstByteMs: 301 },
+  ]) assert.equal(duration({ ...base, ...changes }), undefined);
+  const short = { ...rows[1], ...base, outputTokensPerSecond: 1_000 };
+  const invalid = { ...short, upstreamFirstByteMs: null, outputTokens: 999_999 };
+  const expected = (buffered.outputTokens + short.outputTokens) * 1_000 / (110_465 + 100);
+  assert.equal(aggregate([buffered, short, invalid]).avgOutputTokensPerSecond, expected);
+  assert.notEqual(expected, (buffered.outputTokensPerSecond + short.outputTokensPerSecond) / 2);
+  assert.equal(aggregate([invalid]).avgOutputTokensPerSecond, null);
+  assert.equal(aggregate([]).avgOutputTokensPerSecond, null);
+});
+
+test("request log model cell shows requested, mapped and returned models", async () => {
   const [viewer, preview] = await Promise.all([
     readSource("src/RequestLogDialog.tsx"),
     readSource("src/dev/mockApi.ts"),
   ]);
 
   assert.ok(viewer.includes('import { modelIdsEqual } from "./modelIds";'));
-  assert.ok(viewer.includes('const sentModel = (item.model ?? "").trim() || item.requestedModel.trim();'));
-  assert.ok(viewer.includes('const upstreamModel = (item.upstreamResponseModel ?? "").trim();'));
-  assert.ok(viewer.includes("const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);"));
-  assert.ok(viewer.includes('{sentModel || "—"}'));
-  assert.ok(viewer.includes("{upstreamModelDiffers ? ("));
-  assert.ok(viewer.includes("请求模型（发往上游）：${sentModel}"));
-  assert.ok(viewer.includes("上游实际使用模型：${upstreamModel}"));
+  assert.ok(viewer.includes('const requestedModelText = item.requestedModel.trim();'));
+  assert.ok(viewer.includes('const sentModelRaw = (item.model ?? "").trim();'));
+  assert.ok(viewer.includes('const returnedModelRaw = (item.upstreamResponseModel ?? "").trim();'));
+  assert.ok(viewer.includes('const primaryModel = displayModelName(requestedModelText || sentModelRaw, providerKeys);'));
+  assert.ok(viewer.includes('!modelIdsEqual(sentDisplay, primaryModel)'));
+  assert.ok(viewer.includes('!modelIdsEqual(returnedDisplay, mappedModel || sentDisplay || primaryModel)'));
+  assert.ok(viewer.includes('{primaryModel || "—"}'));
+  assert.ok(viewer.includes('{mappedModel ? ('));
+  assert.ok(viewer.includes('{returnedShown ? ('));
+  assert.ok(viewer.includes('网关映射后发送给上游的模型：${sentModelRaw}'));
+  assert.ok(viewer.includes('上游响应回报的模型与发送不一致：${returnedModelRaw}'));
   assert.ok(viewer.includes("upstreamResponseModel?: string | null;"));
   assert.ok(viewer.includes("Codex 请求 Codey 时选择的模型 ID，带线路前缀"));
   // 请求模型取发往上游的模型，实际模型取上游响应回报的模型。
   assert.match(viewer, /请求模型<\/dt>[\s\S]*?selectedItem\.model \|\| selectedItem\.requestedModel/);
   assert.match(viewer, /实际使用模型<\/dt>[\s\S]*?selectedItem\.upstreamResponseModel/);
-  // 请求模型不展示带线路前缀的 Codex 选择器，只在详情里单列一行。
+  // 详情保留带线路前缀的 Codex 请求模型 ID。
   assert.ok(viewer.includes("{selectedItem.requestedModel}"));
   // 预览覆盖实际模型与请求模型一致、不一致以及上游未回报三种形态。
   assert.ok(preview.includes('primary ? "primary/provider-fast-coder" : "claude-sonnet-4-5"'));
@@ -127,7 +227,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /\{ label: "按官方账号统计", value: "official_account" \}/);
   assert.match(viewer, /official_account: "官方账号"/);
   assert.match(viewer, /官方账号：\$\{officialAccountLabel\(item\.officialAccountId\)\}/);
-  assert.match(viewer, />\s*官\s*<\/span>/);
+  assert.match(viewer, /<Chip[^>]*title="官方账号"[^>]*>\s*官\s*<\/Chip>/);
   assert.doesNotMatch(viewer, />官方账号<\/span>/);
   // 独立页面拿不到启动期能力标志，存在官方线路时仍要读取账号列表。
   assert.match(viewer, /profile\.officialAccount \|\| Boolean\(profile\.officialAccountId\)/);
@@ -142,7 +242,10 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(styles, /\.request-log-protocol-ws/);
   assert.match(styles, /\.request-log-pagination \.pagination[\s\S]*width:\s*auto/);
   assert.match(viewer, /<Drawer[\s\S]*onOpenChange=\{[^}]*setSelectedItem\(null\)/);
-  assert.match(viewer, /onRowAction=\{\(key\) =>[\s\S]*setSelectedItem\(record\)/);
+  assert.match(viewer, /<Table\.Row[\s\S]*?onAction=\{\(\) => onOpen\(item\)\}/);
+  // Table 行通过 onAction 打开详情，复制按钮仍阻断点击冒泡。
+  assert.doesNotMatch(viewer, /<Table\.Row[^>]*onClick=/);
+  assert.match(viewer, /function CopyIdButton\([\s\S]*?onClick=\{\(event\) => \{[\s\S]*?event\.stopPropagation\(\);\s*onCopy\(id, \{ kind, copiedKey \}\)/);
   assert.match(viewer, /aria-label=\{`复制请求 ID：\$\{item\.requestId\}`\}/);
   assert.match(viewer, /cursorMode: true/);
   assert.match(viewer, /nextResult\.nextCursor/);
@@ -167,19 +270,17 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /result\?\.status === "unavailable"/);
   assert.match(viewer, /请求日志加载失败/);
   assert.match(viewer, /没有匹配的请求日志/);
-  for (const heading of [
-    "时间 / 请求 ID",
-    "会话 ID",
-    "供应商 / 上游",
-    "模型",
-    "思考强度",
-    "上游协议",
-    "状态",
-    "耗时",
-    "Token 用量",
-    "缓存 Token",
+  for (const [columnId, heading] of [
+    ["time", "时间"],
+    ["status", "状态"],
+    ["provider", "供应商 / 上游"],
+    ["model", "模型"],
+    ["protocol", "协议"],
+    ["latency", "耗时"],
+    ["tokens", "Token 用量"],
+    ["cache", "缓存"],
   ]) {
-    assert.match(viewer, new RegExp(`title: "${heading}", width: \\d+`));
+    assert.match(viewer, new RegExp(`\\{ id: "${columnId}", title: "${heading}" \\}`));
   }
   assert.doesNotMatch(viewer, />重试</);
   assert.doesNotMatch(viewer, /retryCount/);
@@ -192,12 +293,13 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /upstreamErrorSummary\?: string \| null/);
   assert.match(viewer, /\[\s*item\.statusCode,\s*item\.upstreamStatusCode\s*\]\.some/);
   assert.match(viewer, /statusCode < 200 \|\| statusCode >= 300/);
-  assert.match(viewer, /<IconQuestionMark/);
-  assert.match(viewer, /查看上游错误信息/);
+  // 上游错误与中断原因改由状态 pill 的提示承载，不再有独立图标入口。
+  assert.match(viewer, /const statusDetail = hasUpstreamError \? upstreamErrorPreview : cancellation\?\.message \?\? null;/);
+  assert.match(viewer, /renderStatusPill\(true\)/);
   assert.match(viewer, /cancelled: \{ label: "已中断"/);
   assert.match(viewer, /downstream_event_write_failed/);
   assert.match(viewer, /completionReason === "scope_dropped"/);
-  assert.match(viewer, /查看中断原因/);
+  assert.match(viewer, /const cancellation = cancellationPresentation\(item\);/);
   assert.match(viewer, /`HTTP \$\{item\.statusCode\}`/);
   assert.match(viewer, /<Tooltip[\s\S]*position="top"/);
   for (const reason of [
@@ -212,19 +314,20 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
     assert.match(viewer, new RegExp(`${reason}:`));
   }
   assert.match(viewer, /item\.totalTokens == null[\s\S]*usageUnavailable\.label/);
-  assert.match(viewer, /Token 使用量不可用：\$\{usageUnavailable\.message\}/);
+  // 提示内容走 Tooltip，触发器本身仍是可聚焦的短标签。
+  assert.match(viewer, /\{usageUnavailable\.message\}/);
+  assert.match(viewer, /className="request-log-usage-none" tabIndex=\{0\}/);
   assert.match(viewer, /formatTokens\(item\.totalTokens\)/);
   assert.match(viewer, /formatTokens\(item\.reasoningOutputTokens\)/);
-  assert.match(viewer, /formatCacheHitRate\(item\.inputTokens, item\.cachedInputTokens\)/);
+  assert.match(viewer, /cacheRateValue\(item\.inputTokens, item\.cachedInputTokens\)/);
   assert.match(viewer, /formatTimestamp\(item\.timestampUnixMs\)/);
   assert.match(viewer, /item\.requestId/);
   assert.match(viewer, /codexSessionId\?: string \| null/);
   assert.match(viewer, /codexSessionIsParent\?: boolean \| null/);
   assert.match(viewer, /item\.codexSessionIsParent[\s\S]*父/);
-  assert.match(viewer, /flex w-36 max-w-36 items-center gap-1\.5 overflow-hidden/);
-  assert.match(viewer, /className="shrink-0 whitespace-nowrap"/);
-  assert.match(viewer, /onClick=\{\(\) => handleCopyId\(item\.codexSessionId!\)\}/);
-  assert.match(viewer, /navigator\.clipboard\.writeText\(requestId\)\.then\([\s\S]*setCopiedId\(requestId\)/);
+  assert.match(viewer, /<CopyIdButton\s+id=\{item\.codexSessionId\}/);
+  assert.match(viewer, /onCopyId=\{handleCopyId\}/);
+  assert.match(viewer, /navigator\.clipboard\.writeText\(requestId\)\.then\([\s\S]*setCopiedId\(options\?\.copiedKey \?\? requestId\)/);
   assert.match(viewer, /复制\$\{item\.codexSessionIsParent \? "父会话" : "会话"\} ID/);
   assert.match(viewer, /setCopyToast\(\{/);
   assert.match(viewer, /role="status"/);

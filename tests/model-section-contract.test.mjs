@@ -76,13 +76,10 @@ test("model settings merge context budget and reasoning effort declarations", as
   assert.match(presetsSource, /MAX_CONTEXT_WINDOW_TOKENS/);
 });
 
-test("official account panel is only mounted while the local router is on", () => {
-  // 关闭本地路由时只读展示当前线路，账号登录区域不再出现；线路卡片仍需要
-  // 账号列表显示所属邮箱，因此由线路面板自行读取一次。
-  assert.match(
-    modelSectionSource,
-    /\{!routeConfigReadOnly && \(\s*<OfficialAccountsPanel/,
-  );
+test("official account panel is not mounted in the route settings", () => {
+  // 官方账号登录/管理入口已移除；线路卡片仍需要账号列表显示所属邮箱，
+  // 因此由线路面板自行读取一次。
+  assert.doesNotMatch(modelSectionSource, /<OfficialAccountsPanel/);
   assert.match(
     modelSectionSource,
     /if \(!routeConfigReadOnly\) return;\s*void refreshOfficialAccounts\(\);/,

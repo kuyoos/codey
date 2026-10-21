@@ -175,7 +175,7 @@ fn route_specific_credential_headers_are_hidden_without_the_fixed_list() {
     assert_eq!(text.matches("[REDACTED]").count(), 4);
     assert!(text.contains("x-client-request-id: request-123"));
 
-    // 粘性路由令牌是 Codex 依赖的端到端响应头，必须保留明文。
+    // 日志隐藏粘性路由令牌，响应头的转发另有测试覆盖。
     let mut response = HeaderMap::new();
     response.insert(
         HeaderName::from_static("x-codex-turn-state"),
@@ -186,12 +186,13 @@ fn route_specific_credential_headers_are_hidden_without_the_fixed_list() {
         HeaderValue::from_static("route-secret"),
     );
     let text = super::responses::format_upstream_response_headers(&response);
-    assert!(text.contains("x-codex-turn-state: sticky-token"));
-    assert_eq!(text.matches("[REDACTED]").count(), 1);
+    assert!(text.contains("x-codex-turn-state: [REDACTED]"));
+    assert!(!text.contains("sticky-token"));
+    assert_eq!(text.matches("[REDACTED]").count(), 2);
 }
 
 #[test]
-fn response_header_logs_hide_credentials_but_keep_route_tokens() {
+fn response_header_logs_hide_credentials_and_route_tokens() {
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("set-cookie"),
@@ -212,8 +213,8 @@ fn response_header_logs_hide_credentials_but_keep_route_tokens() {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let text = super::responses::format_upstream_response_headers(&headers);
     assert!(!text.contains("private-value"));
-    // 粘性路由令牌是 Codex 依赖的端到端响应头，必须保留明文。
-    assert!(text.contains("x-codex-turn-state: sticky-token"));
+    assert!(text.contains("x-codex-turn-state: [REDACTED]"));
+    assert!(!text.contains("sticky-token"));
     assert!(text.contains("x-models-etag: etag-1"));
     assert!(text.contains("content-type: application/json"));
     assert!(text.contains("set-cookie: [REDACTED]"));

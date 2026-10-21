@@ -8,6 +8,7 @@ import {
 } from "react";
 
 import { invoke } from "./api";
+import type { ConfigCommandResult } from "./configCommandResult";
 import type {
   Config,
   ModelState,
@@ -15,7 +16,6 @@ import type {
   ModelReasoningEffort,
   Notice,
   ProviderStatus,
-  RuntimeStatus,
 } from "./App.types";
 import {
   AUTO_REVIEW_MODEL,
@@ -57,8 +57,7 @@ type UseModelSelectionOptions = {
   currentProvider: ProviderStatus["provider"] | null;
   officialAccountAvailable: boolean;
   runOperation: (name: string, action: () => Promise<void>) => Promise<void>;
-  setPersistedConfig: (config: Config) => void;
-  setStatus: Dispatch<SetStateAction<RuntimeStatus>>;
+  applyConfigResult: (result: ConfigCommandResult) => boolean;
   setNotice: Dispatch<SetStateAction<Notice>>;
 };
 
@@ -67,8 +66,7 @@ export function useModelSelection({
   currentProvider,
   officialAccountAvailable,
   runOperation,
-  setPersistedConfig,
-  setStatus,
+  applyConfigResult,
   setNotice,
 }: UseModelSelectionOptions) {
   const [modelState, setModelState] = useState<ModelState>({
@@ -491,12 +489,7 @@ export function useModelSelection({
             : {}),
           ...(modelPickerRouteId == null ? {} : { routeId: modelPickerRouteId }),
         });
-    setPersistedConfig(result.config);
-    setModelState(result.modelState);
-    setStatus((current) => ({
-      ...current,
-      restartRequired: result.restartRequired ?? current.restartRequired,
-    }));
+    if (!applyConfigResult(result)) return;
     if (closePicker) {
       setModelPickerVisible(false);
       setModelPickerRouteId(null);
@@ -506,8 +499,7 @@ export function useModelSelection({
     setNotice(modelSelectionNotice(result, summary));
   }, [
     setNotice,
-    setPersistedConfig,
-    setStatus,
+    applyConfigResult,
     modelPickerRouteId,
     officialRoutePicker,
     config,

@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useState } from "react";
 import {
   IconCheck,
   IconCopy,
@@ -16,10 +16,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  Switch,
   Tooltip,
 } from "./components/ui";
-import { invoke } from "./api";
 
 export type SystemSettingsDialogProps = {
   open: boolean;
@@ -32,8 +30,6 @@ export type SystemSettingsDialogProps = {
   busy: string | null;
   onRepairCodexConfig: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
-  autoCheckCodeyUpdates: boolean;
-  onAutoCheckCodeyUpdatesChange: (checked: boolean) => void;
 };
 
 function SystemSettingsDialogComponent({
@@ -47,52 +43,8 @@ function SystemSettingsDialogComponent({
   busy,
   onRepairCodexConfig,
   configRepairNotice,
-  autoCheckCodeyUpdates,
-  onAutoCheckCodeyUpdatesChange,
 }: SystemSettingsDialogProps) {
   const [copied, setCopied] = useState(false);
-  const [machineNo, setMachineNo] = useState<string | null>(null);
-  const [machineNoLoading, setMachineNoLoading] = useState(true);
-  const [machineNoFailed, setMachineNoFailed] = useState(false);
-  const [machineNoAttempt, setMachineNoAttempt] = useState(0);
-  const [machineNoCopyState, setMachineNoCopyState] = useState<
-    "idle" | "copied" | "error"
-  >("idle");
-
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setMachineNo(null);
-    setMachineNoLoading(true);
-    setMachineNoFailed(false);
-    setMachineNoCopyState("idle");
-    void invoke<string | null>("get_device_machine_no")
-      .then(
-        (value) => {
-          if (!cancelled) setMachineNo(value);
-        },
-        () => {
-          if (!cancelled) setMachineNoFailed(true);
-        },
-      )
-      .finally(() => {
-        if (!cancelled) setMachineNoLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, machineNoAttempt]);
-
-  const handleCopyMachineNo = async () => {
-    if (!machineNo || machineNoLoading) return;
-    try {
-      await navigator.clipboard.writeText(machineNo);
-      setMachineNoCopyState("copied");
-    } catch {
-      setMachineNoCopyState("error");
-    }
-    setTimeout(() => setMachineNoCopyState("idle"), 2000);
-  };
 
   const resolvedCodexPath = codexAppPath || "/Applications/ChatGPT.app";
   const formattedCodexVersion = codexAppVersion?.trim()
@@ -123,17 +75,17 @@ function SystemSettingsDialogComponent({
             <div className="min-w-0 flex-1">
               <DialogTitle>系统设置与偏好</DialogTitle>
               <DialogDescription>
-                查看版本、设备号与本地路径，管理 Codex 维护与更新策略。
+                查看版本与本地路径，管理 Codex 配置维护。
               </DialogDescription>
             </div>
           </div>
         </DialogHeader>
 
         <div className="flex flex-col gap-2.5 py-1 text-sm">
-          {/* 版本、设备号与目录信息 */}
+          {/* 版本与目录信息 */}
           <div className="flex flex-col rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-muted)] p-3">
             {/* 上半部分：Codey 与 Codex 版本并排 */}
-            <div className="grid grid-cols-2 divide-x divide-[var(--codey-border-subtle)] pb-2.5 border-b border-[var(--codey-border-subtle)]">
+            <div className="grid grid-cols-2 divide-x divide-[var(--codey-border-subtle)]">
               <div className="flex items-center justify-between pr-3 min-w-0">
                 <span className="text-xs font-medium text-[var(--codey-muted)] shrink-0">Codey 版本</span>
                 <span className="font-mono text-xs font-semibold tracking-tight text-[var(--codey-text)] truncate">
@@ -146,50 +98,6 @@ function SystemSettingsDialogComponent({
                   {formattedCodexVersion}
                 </span>
               </div>
-            </div>
-
-            <div className="flex items-center gap-3 border-b border-[var(--codey-border-subtle)] py-2.5">
-              <span className="shrink-0 text-xs font-medium text-[var(--codey-muted)]">当前设备号</span>
-              <code
-                className="min-w-0 flex-1 break-all select-all text-xs text-[var(--codey-text)]"
-                title={machineNo || undefined}
-                aria-live="polite"
-              >
-                {machineNoLoading ? "读取中…" : machineNoFailed ? "读取失败" : machineNo || "尚未登记"}
-              </code>
-              {machineNoFailed ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  aria-label="重新读取设备号"
-                  onClick={() => setMachineNoAttempt((attempt) => attempt + 1)}
-                >
-                  重试
-                </Button>
-              ) : (
-                <Tooltip content={
-                  machineNoCopyState === "copied"
-                    ? "已复制到剪贴板"
-                    : machineNoCopyState === "error"
-                      ? "复制失败，请选中设备号手动复制"
-                      : "复制设备号"
-                }>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="size-6 min-w-6 shrink-0 text-[var(--codey-muted)] hover:text-[var(--codey-text)]"
-                    aria-label="复制设备号"
-                    disabled={!machineNo || machineNoLoading}
-                    onClick={handleCopyMachineNo}
-                  >
-                    {machineNoCopyState === "copied" ? (
-                      <IconCheck size={13} className="text-success" aria-hidden="true" />
-                    ) : (
-                      <IconCopy size={13} aria-hidden="true" />
-                    )}
-                  </Button>
-                </Tooltip>
-              )}
             </div>
 
             {/* Codex 目录支持长路径换行与一键复制 */}
@@ -259,20 +167,6 @@ function SystemSettingsDialogComponent({
                 {configRepairNotice.text}
               </div>
             )}
-          </div>
-
-          {/* 自动检查更新开关 */}
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-muted)] p-3">
-            <span id="system-settings-auto-update-label" className="text-xs font-semibold text-[var(--codey-text)]">
-              自动检查 Codey 更新
-            </span>
-            <Switch
-              size="sm"
-              aria-labelledby="system-settings-auto-update-label"
-              checked={autoCheckCodeyUpdates}
-              disabled={isBusy}
-              onCheckedChange={onAutoCheckCodeyUpdatesChange}
-            />
           </div>
         </div>
 

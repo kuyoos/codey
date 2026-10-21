@@ -15,9 +15,7 @@ use super::{
 use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::codex_provider;
-use crate::config::{
-    CodeyConfig, OFFICIAL_ROUTE_SHORT_NAME, ProviderProfile, validate_provider_profiles,
-};
+use crate::config::{CodeyConfig, ProviderProfile, validate_provider_profiles};
 use crate::error_log;
 use crate::local_router;
 use crate::model_catalog;
@@ -73,6 +71,7 @@ mod routes;
 mod selection;
 mod state;
 mod sync;
+mod test_connection;
 #[cfg(test)]
 mod tests;
 
@@ -84,6 +83,7 @@ pub use routes::*;
 pub use selection::*;
 pub(crate) use state::*;
 pub use sync::*;
+pub(crate) use test_connection::*;
 
 pub(super) async fn invoke(
     state: &Arc<AppState>,
@@ -128,6 +128,13 @@ pub(super) async fn invoke(
             (Ok(route_id), Ok(expected_revision)) => {
                 fetch_route_models(state, route_id, expected_revision).await
             }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "test_route_model" => match (
+            string_argument(args, "routeId"),
+            string_argument(args, "model"),
+        ) {
+            (Ok(route_id), Ok(model)) => test_route_model(state, route_id, model).await,
             (Err(error), _) | (_, Err(error)) => Err(error),
         },
         "save_selected_models" => match (
@@ -214,8 +221,15 @@ pub(super) async fn invoke(
                     optional_argument::<String>(args, "routeName"),
                     optional_argument::<String>(args, "routeShortName"),
                     optional_argument::<String>(args, "baseUrl"),
+                    optional_argument::<u32>(args, "maxConcurrency"),
                 ) {
-                    (Ok(account_id), Ok(route_name), Ok(route_short_name), Ok(base_url)) => {
+                    (
+                        Ok(account_id),
+                        Ok(route_name),
+                        Ok(route_short_name),
+                        Ok(base_url),
+                        Ok(max_concurrency),
+                    ) => {
                         save_official_route_models(
                             state,
                             OfficialRouteModelSave {
@@ -229,14 +243,16 @@ pub(super) async fn invoke(
                                 account_id,
                                 route_name,
                                 route_short_name,
+                                max_concurrency,
                             },
                         )
                         .await
                     }
-                    (Err(error), _, _, _)
-                    | (_, Err(error), _, _)
-                    | (_, _, Err(error), _)
-                    | (_, _, _, Err(error)) => Err(error),
+                    (Err(error), _, _, _, _)
+                    | (_, Err(error), _, _, _)
+                    | (_, _, Err(error), _, _)
+                    | (_, _, _, Err(error), _)
+                    | (_, _, _, _, Err(error)) => Err(error),
                 }
             }
             (Err(error), _, _, _, _, _, _)

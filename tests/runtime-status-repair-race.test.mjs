@@ -22,6 +22,7 @@ test(`starting ${operation} discards older status flights and queued injection r
   const scheduler = await loadTypeScriptModule(new URL("../src/runtimeStatusPollScheduler.ts", import.meta.url));
   const dependencies = {
     react,
+    "./configApply": await loadTypeScriptModule(new URL("../src/configApply.ts", import.meta.url)),
     "./api": { invoke: () => new Promise((resolve) => requests.push(resolve)) },
     "./appUtils": { withTimeout: (promise) => promise },
     "./runtimeStatusPollScheduler": {
@@ -58,7 +59,7 @@ test(`starting ${operation} discards older status flights and queued injection r
     assert.ok(handler);
     const calls = [];
     const context = {
-      config: {}, dirty: false,
+      config: {}, dirty: false, remoteDirty: false, remoteControlRef: { current: null },
       runOperation: async (_name, run) => run(),
       setNotice: () => {},
       withTimeout: (promise) => promise,

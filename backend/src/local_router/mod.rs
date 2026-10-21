@@ -51,6 +51,18 @@ use crate::route_request_log::{
 };
 
 pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";
+/// Codey 曾为原生远程压缩单独创建 Provider。旧配置可能残留这张表，这里只用于
+/// 识别旧数据、清理残留表，以及让前端把旧绑定当作同一网关载体，不再作为启动选择。
+pub(crate) const REMOTE_COMPACTION_PROVIDER_ID: &str = "codey_router_remote";
+/// 启动时实际写入 Codex 配置的 Provider。压缩能力统一声明，由网关按线路分流。
+pub(crate) const ROUTER_PROVIDER_IDS: [&str; 1] = [ROUTER_PROVIDER_ID];
+/// Codey 拥有或被 Codey 接管过的全部 Provider ID，用于占用检查和残留清理。
+pub(crate) const OWNED_ROUTER_PROVIDER_IDS: [&str; 2] =
+    [ROUTER_PROVIDER_ID, REMOTE_COMPACTION_PROVIDER_ID];
+
+pub(crate) fn is_router_provider(id: &str) -> bool {
+    OWNED_ROUTER_PROVIDER_IDS.contains(&id)
+}
 pub(crate) const ROUTER_AUTH_HEADER: &str = "x-codey-router-token";
 const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const ROUTE_METADATA_KEY: &str = "codey_route";
@@ -73,6 +85,8 @@ const REQUEST_JSON_OFFLOAD_BYTES: usize = 256 * 1024;
 const MAX_CUSTOM_TOOL_BRIDGE_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_CUSTOM_TOOL_SOURCE_DESCRIPTION_BYTES: usize = 2 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+// 排队连接与正在执行的连接分开计数，等待不会占满全部执行入口。
+const MAX_ADMITTED_CONNECTIONS: usize = 320;
 const MAX_CONCURRENT_REJECTIONS: usize = 4;
 // 句柄耗尽、对端提前中止等 accept 错误通常是暂时的；监听器一旦退出，Codex
 // 的所有请求都会被拒绝连接，所以只退避重试，关闭信号才结束监听。
@@ -143,9 +157,11 @@ const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_WEBSOCKET_PATHS: [&str; 2] = ["/v1/responses", "/responses"];
 const REQUEST_LOG_PAGE_PATH: &str = "/codey/request-logs";
 const REQUEST_LOG_SCRIPT_PATH: &str = "/codey/request-logs.js";
+const REQUEST_LOG_ICON_PATH: &str = "/codey/request-logs-icon.png";
+const REQUEST_LOG_ICON: &[u8] = include_bytes!("../../icons/favicon.png");
 const REQUEST_LOG_PAGE: &str = r#"<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codey 请求日志</title></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/codey/request-logs-icon.png"><title>Codey 请求日志</title></head>
 <body><div id="root"></div><script src="/codey/request-logs.js"></script></body>
 </html>"#;
 #[cfg(not(test))]
@@ -166,13 +182,17 @@ mod anthropic_request;
 mod auth;
 mod chat_request;
 mod chat_tools;
+mod collaboration_alias;
 mod compaction;
+mod concurrency;
 mod downstream;
 mod errors;
 mod http;
 mod lifecycle;
 mod native_history;
+mod native_response_fix;
 mod plugin_transport;
+mod portable_compaction;
 mod request_log_tap;
 mod request_meta;
 mod resource_budget;
@@ -183,10 +203,12 @@ mod sse;
 mod sse_anthropic;
 mod sse_chat;
 mod sse_responses;
+mod steering;
 mod upstream;
 mod upstream_response;
 mod websocket;
 mod websocket_context;
+mod websocket_ingress;
 mod websocket_tls;
 mod xai;
 
@@ -195,12 +217,16 @@ pub(crate) use anthropic_request::*;
 pub(crate) use auth::*;
 pub(crate) use chat_request::*;
 pub(crate) use chat_tools::*;
+pub(crate) use collaboration_alias::*;
 pub(crate) use compaction::*;
+pub(crate) use concurrency::*;
 pub(crate) use downstream::*;
 pub(crate) use errors::*;
 pub(crate) use http::*;
 use lifecycle::*;
 pub(crate) use native_history::*;
+pub(crate) use native_response_fix::*;
+pub(crate) use portable_compaction::*;
 pub(crate) use request_log_tap::*;
 pub(crate) use request_meta::*;
 pub(crate) use resource_budget::*;
@@ -210,10 +236,12 @@ pub(crate) use sse::*;
 pub(crate) use sse_anthropic::*;
 pub(crate) use sse_chat::*;
 pub(crate) use sse_responses::*;
+pub(crate) use steering::*;
 pub(crate) use upstream::*;
 pub(crate) use upstream_response::*;
 pub(crate) use websocket::*;
 pub(crate) use websocket_context::*;
+pub(crate) use websocket_ingress::*;
 pub(crate) use xai::*;
 
 #[cfg(test)]
@@ -230,6 +258,9 @@ mod tail_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod compaction_tests;
 
 #[cfg(test)]
 mod safety_tests;

@@ -27,7 +27,7 @@ test("settings reports startup health and the confirmed main-process injection m
   ]);
   const launcherSource = `${launcherRootSource}\n${launcherProcessSource}`;
 
-  assert.match(commandsSource, /"clientPlatform": current_update_platform\(\)/);
+  assert.match(commandsSource, /"clientPlatform": client_platform\(\)/);
   assert.match(typesSource, /clientPlatform\?: string/);
   assert.match(
     sectionsSource,
@@ -38,10 +38,8 @@ test("settings reports startup health and the confirmed main-process injection m
     /const startupNeedsAttention = maintenance\?\.performanceStatus === "degraded"/,
   );
   assert.match(sectionsSource, /startupNeedsAttention\s*\? "需检查"\s*: "正常"/);
-  assert.doesNotMatch(sectionsSource, /title: "主进程注入"/);
-  assert.match(sectionsSource, />主进程注入<\/h4>/);
-  assert.match(sectionsSource, /startupInjectionMode === "node_options"/);
-  assert.match(sectionsSource, /startupInjectionMode === "inspector"/);
+  assert.doesNotMatch(sectionsSource, /title: "启动兼容"/);
+  assert.match(sectionsSource, />启动兼容<\/h4>/);
   assert.match(sectionsSource, /startupInjectionMode === "cli"/);
   assert.match(typesSource, /startupInjectionMode\?: string/);
   assert.match(launcherRootSource, /pub startup_injection_mode: String/);

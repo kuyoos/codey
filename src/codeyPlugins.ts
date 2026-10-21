@@ -66,6 +66,7 @@ export function pluginConfigBusinessValuesEqual(leftText: string, rightText: str
   } catch { return false; }
 }
 
+/** @internal 仅供测试使用 */
 export function pluginStatusLabel(plugin: CodeyPlugin): string {
   if (plugin.status === "enabling") return "正在启用";
   if (plugin.lastError || plugin.status === "failed" || plugin.status === "error") return "运行异常";

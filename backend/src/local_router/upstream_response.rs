@@ -380,12 +380,16 @@ pub(crate) async fn write_proxy_response(
     if let Some(probe) = probe {
         probe.mark_response_started(status);
     }
-    let xai_fix = current_xai_response_fix();
-    let mut sse_rewriter =
-        (upstream_is_sse && (validate_responses || xai_fix.is_some())).then(|| {
-            ResponsesSseRewriter::new(xai_fix.as_ref(), validate_responses, retry_advice.as_ref())
+    let response_fix = current_native_response_fix();
+    let mut sse_rewriter = (upstream_is_sse && (validate_responses || response_fix.is_some()))
+        .then(|| {
+            ResponsesSseRewriter::new(
+                response_fix.as_ref(),
+                validate_responses,
+                retry_advice.as_ref(),
+            )
         });
-    let mut buffered_json = xai_fix
+    let mut buffered_json = response_fix
         .as_ref()
         .filter(|_| !upstream_is_sse)
         .map(|_| Vec::new());
@@ -410,27 +414,23 @@ pub(crate) async fn write_proxy_response(
             buffered.extend_from_slice(&chunk);
             continue;
         }
-        let rewritten;
-        let output: &[u8] = if let Some(rewriter) = sse_rewriter.as_mut() {
-            rewritten = rewriter.push(&chunk)?;
-            if rewritten.is_empty() {
-                continue;
-            }
-            &rewritten
-        } else {
-            &chunk
-        };
+        let rewritten = sse_rewriter
+            .as_mut()
+            .map(|rewriter| rewriter.push(&chunk))
+            .transpose()?;
+        let output = rewritten.as_deref().unwrap_or(&chunk);
+        if output.is_empty() {
+            continue;
+        }
         finished = match terminal.as_mut() {
             Some(terminal) => terminal.observe(output)?,
             None => false,
         };
         write_chunked_frame(stream, output, "写入上游响应块失败").await?;
         if let Some(tap) = log_tap.as_mut() {
-            if sse_rewriter.is_some() {
-                tap.observe(&Bytes::copy_from_slice(output));
-            } else {
-                tap.observe(&chunk);
-            }
+            // 下游写入完成后再共享缓冲区，关闭日志时无需创建共享所有权。
+            let observed = rewritten.map(Bytes::from).unwrap_or(chunk);
+            tap.observe(&observed);
         }
         if !upstream_is_sse && let Some(probe) = probe {
             probe.mark_first_downstream_content();
@@ -447,14 +447,14 @@ pub(crate) async fn write_proxy_response(
             }
             write_chunked_frame(stream, &tail, "写入上游响应块失败").await?;
             if let Some(tap) = log_tap.as_mut() {
-                tap.observe(&Bytes::copy_from_slice(&tail));
+                tap.observe(&Bytes::from(tail));
             }
         }
     }
     if let Some(buffered) = buffered_json {
-        let output = xai_fix
+        let output = response_fix
             .as_ref()
-            .expect("xAI JSON rewrite is only armed with a response fix")
+            .expect("JSON rewrite is only armed with a response fix")
             .rewrite_json_bytes(&buffered);
         if !output.is_empty() {
             write_chunked_frame(stream, &output, "写入上游响应块失败").await?;

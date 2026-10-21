@@ -131,11 +131,12 @@ impl CodexSessionDbDiscoveryCache {
 }
 
 pub fn codex_sqlite_sidecar_paths(db_path: &Path) -> [PathBuf; 3] {
-    [
-        db_path.to_path_buf(),
-        PathBuf::from(format!("{}-wal", db_path.to_string_lossy())),
-        PathBuf::from(format!("{}-shm", db_path.to_string_lossy())),
-    ]
+    let sidecar = |suffix: &str| {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    [db_path.to_path_buf(), sidecar("-wal"), sidecar("-shm")]
 }
 
 fn legacy_state_db_path(home: &Path) -> PathBuf {
@@ -199,6 +200,54 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{CodexSessionDbDiscoveryCache, codex_session_db_paths_from_home};
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_paths_preserve_non_utf8_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = tempdir().unwrap();
+        let path = home
+            .path()
+            .join(OsString::from_vec(b"state-\xff.db".to_vec()));
+        let paths = super::codex_sqlite_sidecar_paths(&path);
+        assert_eq!(paths[0], path);
+        for (sidecar, suffix) in paths[1..].iter().zip(["-wal", "-shm"]) {
+            let mut expected = path.as_os_str().to_os_string();
+            expected.push(suffix);
+            assert_eq!(sidecar.as_os_str(), expected);
+        }
+    }
+
+    // APFS rejects non-UTF-8 names with EILSEQ before they can be created.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn sidecar_scan_finds_non_utf8_wal_files() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = tempdir().unwrap();
+        let path = home
+            .path()
+            .join(OsString::from_vec(b"state-\xff.db".to_vec()));
+        std::fs::write(&path, b"database").unwrap();
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::fs::write(&wal, b"wal").unwrap();
+        assert!(
+            super::codex_sqlite_sidecar_paths(&path)
+                .into_iter()
+                .filter(|candidate| candidate.is_file())
+                .any(|candidate| candidate.as_os_str() == wal)
+        );
+        assert!(
+            super::SessionDbCandidateSignature::read(&path)
+                .unwrap()
+                .wal
+                .is_some()
+        );
+    }
 
     #[test]
     fn discovery_does_not_cache_failed_schema_reads() {

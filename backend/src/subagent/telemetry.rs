@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -164,26 +165,20 @@ impl<'a> TraceRecorder<'a> {
 }
 
 fn acquire_trace_lock(lock: &std::fs::File, lock_path: &Path, timeout: Duration) -> Result<()> {
-    let started = Instant::now();
-    loop {
-        match lock.try_lock_exclusive() {
-            Ok(()) => return Ok(()),
-            Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
-                if started.elapsed() >= timeout {
-                    anyhow::bail!(
-                        "获取子代理 trace 锁超时（{} ms，遥测已丢弃）：{}",
-                        timeout.as_millis(),
-                        lock_path.display()
-                    );
-                }
-                thread::sleep(Duration::from_millis(TRACE_LOCK_RETRY_MILLIS));
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("锁定子代理 trace 失败：{}", lock_path.display()));
-            }
-        }
-    }
+    crate::fs_util::acquire_exclusive_lock_with_timeout(
+        lock,
+        lock_path,
+        timeout,
+        Duration::from_millis(TRACE_LOCK_RETRY_MILLIS),
+        || {
+            format!(
+                "获取子代理 trace 锁超时（{} ms，遥测已丢弃）：{}",
+                timeout.as_millis(),
+                lock_path.display()
+            )
+        },
+        || format!("锁定子代理 trace 失败：{}", lock_path.display()),
+    )
 }
 
 fn rotate_if_needed(state_root: &Path, path: &Path, incoming_bytes: u64) -> Result<()> {

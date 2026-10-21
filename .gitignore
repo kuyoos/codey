@@ -5,6 +5,7 @@
 # Rust and frontend build output
 /target/
 /target-legacy/
+/.cargo-check-target/
 /backend/target/
 /vendor/CodeyRuntime/target/
 /dist/
@@ -45,4 +46,6 @@ Desktop.ini
 **/*.rs.bk
 
 
+# Local plugin projects stay outside version control; SDK, templates and skills remain tracked.
 /plugins
+*.codey-plugin

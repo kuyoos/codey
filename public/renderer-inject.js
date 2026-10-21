@@ -6,19 +6,15 @@
   window.__codeyRendererModuleReady = true;
 
   const sessionToolsLoadPath = "/internal/codey/session-tools/load";
-  const updateCheckPath = "/api/check_for_updates";
-  const backendStatusPath = "/backend/status";
   const backendHealthPath = "/backend/health";
   const accountUsagePath = "/account/usage";
   const buttonId = "codey-settings-button";
   const buttonMeasureId = "codey-settings-button-measure";
   const accountUsageId = "codey-account-usage";
   const styleId = "codey-core-injected-style";
-  const updateAvailableEvent = "codey-update-availability-changed";
   const runtimeHealthEvent = "codey-runtime-health-changed";
   const configChangedEvent = "codey:config-changed";
-  const updateCheckIntervalMs = 30 * 60 * 1000;
-  const updateCheckTimeoutMs = 10_000;
+  const bridgeRequestTimeoutMs = 10_000;
   const runtimeHealthCheckIntervalMs = 30_000;
   const runtimeHealthCheckTimeoutMs = 3_000;
   const runtimeHealthFailureRetryMs = 1_000;
@@ -54,10 +50,6 @@
   `;
   let sessionToolsLoadPromise = null;
   let scanTimer = 0;
-  let updateCheckTimer = 0;
-  let updateCheckInFlight = false;
-  let autoUpdateChecksEnabled = null;
-  let updateCheckGeneration = 0;
   let runtimeHealthTimer = 0;
   let runtimeHealthCheckInFlight = false;
   let runtimeHealthFailures = 0;
@@ -112,7 +104,6 @@
       #${buttonId}[data-codey-rail-slot="true"] { --codey-icon-size: 20px; box-sizing: border-box; flex: 0 0 auto; width: 36px; height: 36px; margin: 0; border-radius: 12.5px; color: color-mix(in srgb, CanvasText 52%, transparent); }
       #${buttonId}[data-codey-rail-slot="true"] svg { width: 20px; height: 20px; }
       #${buttonId}[data-codey-rail-slot="true"]:hover { color: CanvasText; }
-      #${buttonId}[data-codey-rail-slot="true"]::after { top: 4px; right: 4px; }
       #${buttonMeasureId} { display: inline-block; pointer-events: none; }
       #${buttonId}:hover { background: rgba(127, 127, 127, .14); opacity: 1; }
       #${buttonId}:active { transform: translateY(1px); }
@@ -123,10 +114,6 @@
       #${buttonId}[data-codey-runtime-state="unavailable"] { background: rgba(255, 69, 58, .12); color: #ff453a; opacity: 1; }
       #${buttonId}[data-codey-runtime-state="unavailable"]:hover { background: rgba(255, 69, 58, .2); }
       #${buttonId}[data-codey-runtime-state="unavailable"] .codey-runtime-badge { opacity: 1; transform: scale(1); }
-      #${buttonId}::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 999px; background: #ff3b30; box-shadow: 0 0 0 2px Canvas; opacity: 0; transform: scale(.7); transition: opacity .15s ease, transform .15s ease; pointer-events: none; }
-      #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
-      #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
-      #${buttonId}[data-codey-runtime-state="unavailable"][data-codey-update-available="true"]::after { top: auto; right: 3px; bottom: 3px; width: 5px; height: 5px; }
       #${accountUsageId} { -webkit-app-region: no-drag !important; position: relative; display: block; box-sizing: border-box; width: 100%; min-width: 0; padding: 7px 16px 8px; background: transparent; color: CanvasText; container-type: inline-size; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; line-height: 1.15; pointer-events: auto !important; transition: opacity .16s ease; user-select: none; }
       #${accountUsageId}[data-state="stale"] { opacity: .58; }
       #${accountUsageId}[data-state="error"] { padding-block: 8px; color: color-mix(in srgb, CanvasText 58%, transparent); font-size: 10px; }
@@ -136,6 +123,9 @@
       #${accountUsageId} .codey-usage-overview { display: flex; min-width: 0; align-items: baseline; gap: 6px; }
       #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; color: color-mix(in srgb, CanvasText 58%, transparent); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
       #${accountUsageId} .codey-usage-plan-tag { flex: 0 0 auto; overflow: hidden; max-width: 44%; border: 1px solid color-mix(in srgb, #0a84ff 32%, transparent); border-radius: 4px; padding: 0 4px; background: color-mix(in srgb, #0a84ff 13%, transparent); color: color-mix(in srgb, #0a84ff 82%, CanvasText); font-size: 8px; font-weight: 700; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="100"] { border-color: light-dark(#cbd5e1, #64748b); background: linear-gradient(135deg, light-dark(#f8fafc, #394452), light-dark(#e2e8f0, #262e39)); color: light-dark(#475569, #dbe4ef); box-shadow: inset 0 1px 0 rgb(255 255 255 / .18); }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="200"] { border-color: light-dark(#d6b86b, #8f7035); background: linear-gradient(135deg, light-dark(#fff8e7, #4b3b1f), light-dark(#f2dfb0, #302719)); color: light-dark(#78530e, #f2d58d); box-shadow: inset 0 1px 0 rgb(255 255 255 / .24); }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="500"] { border-color: light-dark(#b89654, #c6a663); background: linear-gradient(135deg, light-dark(#49305f, #59406e), light-dark(#25182f, #302039)); color: light-dark(#f8e5af, #ffe9b0); box-shadow: inset 0 1px 0 rgb(255 234 184 / .24), 0 1px 3px rgb(37 28 54 / .15); }
       #${accountUsageId} .codey-usage-value { margin-inline-start: auto; font-size: 12px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
       #${accountUsageId} .codey-usage-meter { display: block; box-sizing: border-box; width: 100%; height: 2px; min-height: 2px; max-height: 2px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 8%, transparent); contain: size; line-height: 0; }
       #${accountUsageId} .codey-usage-meter > span { display: block; box-sizing: border-box; width: 100%; height: 2px; min-height: 2px; max-height: 2px; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
@@ -168,44 +158,20 @@
     document.documentElement.appendChild(style);
   };
 
-  const hasDetectedUpdate = () =>
-    window.__codeyUpdateAvailability?.updateAvailable === true;
-
-  const dispatchUpdateAvailability = () => {
-    if (
-      typeof window.dispatchEvent !== "function"
-      || typeof CustomEvent !== "function"
-    ) return;
-    window.dispatchEvent(new CustomEvent(updateAvailableEvent, {
-      detail: hasDetectedUpdate() ? window.__codeyUpdateAvailability : null,
-    }));
-  };
-
-  const applyUpdateBadge = (button = document.getElementById(buttonId)) => {
+  const applyButtonState = (button = document.getElementById(buttonId)) => {
     if (!(button instanceof HTMLElement)) return;
     button.setAttribute("data-codey-runtime-state", runtimeHealthState);
-    if (hasDetectedUpdate()) {
-      button.setAttribute("data-codey-update-available", "true");
-    } else {
-      button.removeAttribute?.("data-codey-update-available");
-    }
     if (runtimeHealthState === "unavailable") {
       const detail = runtimeHealthMessage || "Codey 后端未响应";
-      const updateLabel = hasDetectedUpdate() ? "，另有可用更新" : "";
       button.setAttribute(
         "aria-label",
-        `Codey 连接中断，点击查看处理提示${updateLabel}`,
+        "Codey 连接中断，点击查看处理提示",
       );
-      button.title = `Codey 连接中断：${detail}（点击查看处理提示）${updateLabel}`;
+      button.title = `Codey 连接中断：${detail}（点击查看处理提示）`;
       return;
     }
-    if (hasDetectedUpdate()) {
-      button.setAttribute("aria-label", "打开 Codey 配置，有可用更新");
-      button.title = "打开 Codey 配置（发现新版本）";
-    } else {
-      button.setAttribute("aria-label", "打开 Codey 配置");
-      button.title = "打开 Codey 配置";
-    }
+    button.setAttribute("aria-label", "打开 Codey 配置");
+    button.title = "打开 Codey 配置";
   };
 
   const runtimeHealthSnapshot = () => ({
@@ -225,7 +191,7 @@
     runtimeHealthMessage = nextMessage;
     runtimeHealthObservedAt = Date.now();
     window.__codeyRuntimeHealth = runtimeHealthSnapshot();
-    if (changed) applyUpdateBadge();
+    if (changed) applyButtonState();
     if (
       changed
       && typeof window.dispatchEvent === "function"
@@ -238,22 +204,10 @@
     return window.__codeyRuntimeHealth;
   };
 
-  const setUpdateAvailability = (result, { dispatch = true } = {}) => {
-    window.__codeyUpdateAvailability = result?.updateAvailable === true
-      ? result
-      : null;
-    applyUpdateBadge();
-    if (hasDetectedUpdate()) {
-      window.clearTimeout(updateCheckTimer);
-      updateCheckTimer = 0;
-    }
-    if (dispatch) dispatchUpdateAvailability();
-  };
-
   const withTimeout = (
     promise,
     timeoutMs,
-    message = "检查更新超时",
+    message = "请求超时",
   ) => new Promise((resolve, reject) => {
     const timer = window.setTimeout(
       () => reject(new Error(message)),
@@ -338,66 +292,6 @@
         ? runtimeHealthFailureRetryMs
         : runtimeHealthCheckIntervalMs;
       scheduleRuntimeHealthCheck(nextDelay);
-    }
-  };
-
-  const setAutomaticUpdateChecks = (enabled) => {
-    if (autoUpdateChecksEnabled === enabled) return;
-    autoUpdateChecksEnabled = enabled;
-    updateCheckGeneration += 1;
-    window.clearTimeout(updateCheckTimer);
-    updateCheckTimer = 0;
-  };
-
-  const scheduleUpdateCheck = (delayMs = updateCheckIntervalMs) => {
-    window.clearTimeout(updateCheckTimer);
-    updateCheckTimer = 0;
-    if (autoUpdateChecksEnabled === false || hasDetectedUpdate()) return;
-    updateCheckTimer = window.setTimeout(() => {
-      updateCheckTimer = 0;
-      // 尚未读取到设置时先重试状态查询，避免关闭后仍发起更新请求。
-      if (autoUpdateChecksEnabled === null) void hydrateUpdateAvailability();
-      else void checkForUpdatesSilently();
-    }, delayMs);
-  };
-
-  const checkForUpdatesSilently = async () => {
-    if (autoUpdateChecksEnabled !== true || updateCheckInFlight || hasDetectedUpdate()) return;
-    updateCheckInFlight = true;
-    const generation = updateCheckGeneration;
-    try {
-      const result = await withTimeout(
-        callBridge(updateCheckPath, {}, { timeoutMs: updateCheckTimeoutMs }),
-        updateCheckTimeoutMs,
-      );
-      if (autoUpdateChecksEnabled !== true || generation !== updateCheckGeneration) return;
-      if (result?.status !== "failed" && result?.updateAvailable === true) {
-        setUpdateAvailability(result);
-        return;
-      }
-    } catch {
-      // 更新地址不可达或检查超时时直接跳过，不阻塞 Codex 页面。
-    } finally {
-      updateCheckInFlight = false;
-      if (!hasDetectedUpdate()) scheduleUpdateCheck();
-    }
-  };
-
-  const hydrateUpdateAvailability = async () => {
-    const generation = updateCheckGeneration;
-    try {
-      const status = await withTimeout(
-        callBridge(backendStatusPath, {}, { timeoutMs: updateCheckTimeoutMs }),
-        updateCheckTimeoutMs,
-        "读取更新状态超时",
-      );
-      if (generation !== updateCheckGeneration || !status || status.status === "failed") return;
-      setAutomaticUpdateChecks(status.autoCheckCodeyUpdates !== false);
-      setUpdateAvailability(status?.availableUpdate || null);
-    } catch {
-      if (generation === updateCheckGeneration) setUpdateAvailability(null);
-    } finally {
-      if (!hasDetectedUpdate()) scheduleUpdateCheck();
     }
   };
 
@@ -498,18 +392,19 @@
   const accountUsagePlanLabel = (planType) => {
     const raw = String(planType || "").trim();
     if (!raw) return "";
-    const compact = raw.toLowerCase().replace(/[\s_$-]+/g, "");
-    if (compact === "5x" || compact.includes("pro5x") || compact.includes("pro100")) {
-      return "Pro 5x";
-    }
-    if (compact === "pro" || compact.includes("pro20x") || compact.includes("pro200")) {
-      return "Pro 20x";
-    }
-    if (compact.includes("plus")) return "Plus";
-    if (compact.includes("free")) return "Free";
-    return raw
-      .replace(/[_-]+/g, " ")
-      .replace(/\b\w/g, (character) => character.toUpperCase());
+    const normalized = raw.toLowerCase();
+    if (normalized === "prolite") return "Pro 100";
+    if (normalized === "pro") return "Pro 200";
+    if (normalized === "promax") return "Pro 500";
+    const compact = normalized.replace(/[\s_$-]+/g, "");
+    if (compact === "pro100") return "Pro 100";
+    if (compact === "pro200") return "Pro 200";
+    if (compact === "pro500") return "Pro 500";
+    if (compact === "5x" || compact === "pro5x") return "Pro 5x";
+    if (compact === "pro20x") return "Pro 20x";
+    if (normalized === "plus") return "Plus";
+    if (normalized === "free") return "Free";
+    return raw;
   };
 
   const accountUsageResetLabel = (resetsAt) => {
@@ -606,6 +501,7 @@
 
   const accountUsageWindowSegment = (window, kind, plan = "") => {
     if (!window || accountUsageWindowKind(window) !== kind) return null;
+    const proTier = /^Pro (100|200|500)$/.exec(plan)?.[1];
     const remaining = Math.max(0, Math.min(100, 100 - Number(window.usedPercent)));
     const roundedRemaining = Math.round(remaining);
     const label = kind === "weekly" ? "周额度" : "5 小时";
@@ -624,7 +520,7 @@
       html: `
         <span class="codey-usage-segment" data-window="${kind}" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
           <span class="codey-usage-overview">
-            ${plan ? `<span class="codey-usage-plan-tag">${escapeAccountUsageText(plan)}</span>` : ""}
+            ${plan ? `<span class="codey-usage-plan-tag"${proTier ? ` data-pro-tier="${proTier}"` : ""}>${escapeAccountUsageText(plan)}</span>` : ""}
             <span class="codey-usage-window-label">${label}</span>
             <span class="codey-usage-value">${roundedRemaining}%</span>
           </span>
@@ -835,7 +731,7 @@
     const response = await window.__codeyReadAccountRateLimits();
     const snapshot = normalizeAppServerAccountUsage(response);
     if (snapshot.status !== "ok") return snapshot;
-    // Publish Codex's managed-auth result so the independent log window can reuse it.
+    // 同步 Codex 管理的账号额度，让官方账号面板可以复用当前快照。
     if (Number.isSafeInteger(backendResult?.authGeneration)) {
       const stored = await callBridge("/api/store_official_account_usage", {
         authGeneration: backendResult.authGeneration, snapshot,
@@ -844,37 +740,6 @@
       snapshot.authGeneration = backendResult.authGeneration;
     }
     return snapshot;
-  };
-
-  let quotaUsageRequest = null;
-  window.__codeyReadQuotaAccountUsage = ({ forceRefresh = false } = {}) => {
-    const displayed = accountUsagePollingEnabled && accountUsageLastResult?.status === "ok"
-      ? accountUsageLastResult : null;
-    const now = Date.now();
-    const age = now - Number(displayed?.fetchedAt) * 1000;
-    const weekly = [displayed?.primary, displayed?.secondary]
-      .find((value) => Number(value?.windowMinutes) === 10080);
-    if (!forceRefresh && displayed && age >= 0 && age < accountUsageRefreshIntervalMs
-      && Number(weekly?.resetsAt) * 1000 > now) return Promise.resolve(displayed);
-    if (quotaUsageRequest) return quotaUsageRequest;
-    quotaUsageRequest = (async () => {
-      let result = await withTimeout(
-        callBridge("/api/query_official_account_usage", { forceRefresh }, { timeoutMs: accountUsageTimeoutMs }),
-        accountUsageTimeoutMs, "读取官方周额度超时",
-      );
-      if (result?.status === "error" || result?.stale) {
-        try {
-          const fallback = await withTimeout(readAccountUsageFromAppServer(result), accountUsageTimeoutMs, "读取 Codex 周额度超时");
-          if (fallback?.status === "ok") result = fallback;
-        } catch { /* Keep the backend error when the fallback is unavailable. */ }
-      }
-      // A dialog query never enables the account display or its polling.
-      if (displayed && accountUsagePollingEnabled && accountUsageLastResult === displayed && result?.status === "ok") {
-        renderAccountUsage(result);
-      }
-      return result;
-    })().finally(() => { quotaUsageRequest = null; });
-    return quotaUsageRequest;
   };
 
   const checkAccountUsage = async () => {
@@ -937,9 +802,8 @@
       : "Codey 内嵌配置面板尚未加载，请退出 Codex 后重新启动 Codey");
   };
 
-  const visibleMountRect = (element) => {
+  const mountableRect = (element) => {
     if (!(element instanceof HTMLElement)) return null;
-    if (element.closest("[hidden], [aria-hidden=true]")) return null;
     const style = window.getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return style.display !== "none"
@@ -949,6 +813,18 @@
       ? rect
       : null;
   };
+
+  const visibleMountRect = (element) =>
+    element instanceof HTMLElement && element.closest("[hidden], [aria-hidden=true]")
+      ? null
+      : mountableRect(element);
+
+  // Codex 打开模态对话框时只给图标栏等背景内容补 aria-hidden，布局不变；
+  // 把它当成隐藏会让对话框弹出期间的扫描把入口当成失效挂载卸载。
+  const railMountRect = (element) =>
+    element instanceof HTMLElement && element.closest("[hidden]")
+      ? null
+      : mountableRect(element);
 
   const isTopChromeMountTarget = (element) => {
     const rect = visibleMountRect(element);
@@ -1026,14 +902,14 @@
     const rail = document.querySelector(navigationRailSelector);
     if (!(rail instanceof HTMLElement)) return null;
     navigationRailSeen = true;
-    if (!visibleMountRect(rail)) return null;
+    if (!railMountRect(rail)) return null;
     const cluster = [...rail.children]
-      .filter((child) => visibleMountRect(child))
+      .filter((child) => railMountRect(child))
       .at(-1);
     const stack = cluster?.firstElementChild;
     if (!(stack instanceof HTMLElement)) return null;
     const controls = [...stack.querySelectorAll("button")]
-      .filter((candidate) => candidate.id !== buttonId && visibleMountRect(candidate));
+      .filter((candidate) => candidate.id !== buttonId && railMountRect(candidate));
     const anchor = controls.find((candidate) => railHelpLabelPattern.test(candidate.getAttribute("aria-label") || ""))
       || controls.find((candidate) => railProfileLabelPattern.test(candidate.getAttribute("aria-label") || ""));
     if (!(anchor instanceof HTMLElement)) return null;
@@ -1049,15 +925,20 @@
       return false;
     }
     const parent = button.parentElement;
-    if (!(parent instanceof HTMLElement) || button.closest("[hidden], [aria-hidden=true]")) {
+    if (!(parent instanceof HTMLElement)) {
       return false;
     }
     if (button.dataset.codeyRailSlot === "true") {
+      // 模态对话框给背景补的 aria-hidden 不算真实隐藏，与 railMountRect 一致。
+      if (button.closest("[hidden]")) return false;
       const rail = button.closest?.(navigationRailSelector);
       return !!rail
         && rail.isConnected !== false
         && parent === button.__codeyRailStack
         && button.nextElementSibling === button.__codeyRailAnchor;
+    }
+    if (button.closest("[hidden], [aria-hidden=true]")) {
+      return false;
     }
     // 页面先渲染顶部、后渲染侧栏时，已挂载的顶部入口也需要迁移。
     if (document.querySelector(navigationRailSelector)) return false;
@@ -1119,7 +1000,7 @@
       if (button.parentElement !== mount.target || button.nextElementSibling !== mount.before) {
         mount.target.insertBefore(button, mount.before);
       }
-      applyUpdateBadge(button);
+      applyButtonState(button);
       headerMountDirty = false;
       return;
     }
@@ -1163,7 +1044,7 @@
       mount.target.appendChild(button);
     }
     button.__codeyHeaderAnchor = mount.before || null;
-    applyUpdateBadge(button);
+    applyButtonState(button);
     headerMountDirty = false;
   };
 
@@ -1181,7 +1062,7 @@
     sessionToolsLoadPromise = Promise.resolve(callBridge(
       sessionToolsLoadPath,
       {},
-      { timeoutMs: updateCheckTimeoutMs },
+      { timeoutMs: bridgeRequestTimeoutMs },
     ))
       .then((result) => {
         if (!result || result.status !== "ok") {
@@ -1308,19 +1189,7 @@
   }
 
   if (rendererCoreAlreadyLoaded) return;
-  window.addEventListener?.(updateAvailableEvent, (event) => {
-    const result = "detail" in event
-      ? event.detail
-      : window.__codeyUpdateAvailability;
-    setUpdateAvailability(result, { dispatch: false });
-    if (!hasDetectedUpdate()) scheduleUpdateCheck();
-  });
-  window.addEventListener?.(configChangedEvent, (event) => {
-    const enabled = event.detail?.config?.autoCheckCodeyUpdates;
-    if (typeof enabled === "boolean" && autoUpdateChecksEnabled !== enabled) {
-      setAutomaticUpdateChecks(enabled);
-      if (enabled) scheduleUpdateCheck(0);
-    }
+  window.addEventListener?.(configChangedEvent, () => {
     accountUsageLastResult = null;
     accountUsagePollingEnabled = true;
     scheduleAccountUsageCheck(0);
@@ -1331,7 +1200,6 @@
   armSessionToolsInteraction();
   scheduleSessionToolsIdleLoad();
   scan();
-  void hydrateUpdateAvailability();
   void checkRuntimeHealth();
   scheduleAccountUsageCheck(250);
 

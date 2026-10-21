@@ -1,7 +1,11 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconCheck as Check,
+  IconAdjustmentsHorizontal,
+  IconArchive,
+  IconBolt,
   IconChartDonut,
+  IconClipboard,
   IconCpu,
   IconEdit as Edit,
   IconEye,
@@ -12,16 +16,17 @@ import {
   IconInfoCircle,
   IconListDetails,
   IconPlus as Plus,
+  IconPlugConnected,
   IconRefresh as RefreshCw,
   IconRoute,
   IconServer as Server,
   IconShieldCheck,
   IconSparkles,
   IconTrash as Trash,
+  IconWorld,
 } from "@tabler/icons-react";
 
-import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
-import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
+import type { Config, ModelContextConfig, ModelState, OfficialAccount, Profile, ProviderStatus, RuntimeStatus } from "./App.types";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { ModelCombobox } from "./components/ModelCombobox";
 import { ModelSettingsFields } from "./components/ModelSettingsFields";
@@ -41,6 +46,7 @@ import {
   PasswordInput,
   Select,
   Switch,
+  TextArea,
   Tooltip,
 } from "./components/ui";
 import { modelIdsEqual, modelKey, moveModelId, uniqueModelIds } from "./modelIds";
@@ -54,20 +60,28 @@ import { globalDefaultForRoute, routeProviderId, sortRoutesByEnabled } from "./m
 import { maskEmail, maskUrl } from "./sensitiveText";
 import {
   MAX_ROUTE_SHORT_NAME_CHARACTERS,
+  fallbackRouteShortName,
+  prefixedRouteName,
   validateThirdPartyRouteShortName,
 } from "./routeShortNames";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
+import {
+  parseNewApiConnectionInfo,
+  suggestRouteNamesFromUrl,
+  type NewApiConnectionInfo,
+} from "./routeConnectionImport";
 import { invoke } from "./api";
-import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
+import { errorText, withTimeout } from "./appUtils";
+import { listOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
+import { getRouteCompactionStatus } from "./remoteCompactionStatus";
 
 type ModelSectionProps = {
   config: Config;
+  runtimeStatus?: RuntimeStatus;
   currentProvider: ProviderStatus["provider"] | null;
   officialAccountAvailable: boolean;
   popupContainer: HTMLElement | null;
-  /** 该页是否正显示在设置里：额度等官方数据只在打开「线路与模型」时获取。 */
-  active: boolean;
   modelState: ModelState;
   dirty: boolean;
   canSyncCurrentProvider: boolean;
@@ -84,7 +98,6 @@ type ModelSectionProps = {
   onReorderRouteModels: (routeId: string, models: string[]) => Promise<void>;
   onDeleteRoute: (routeId: string) => void;
   onFetchRouteModels: (route: Profile) => void;
-  onOfficialAccountsChanged: (result: OfficialAccountsResult) => void;
   onNotice: (notice: { tone: "success" | "info" | "error"; text: string }) => void;
   onSaveOfficialRouteSettings?: (
     routeId: string,
@@ -98,11 +111,11 @@ type ModelSectionProps = {
       routeName: string;
       routeShortName: string;
       baseUrl: string;
+      maxConcurrency: number;
     },
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
   onConfigChange?: (config: Config) => void;
-  onRequestConfirmation?: (confirmation: Confirmation) => void;
 };
 
 type RouteModelRef = { routeId: string; model: string };
@@ -115,19 +128,12 @@ type RouteModelGroup = {
   official: boolean;
 };
 
-function newRouteName(profiles: Profile[]) {
-  let index = profiles.length + 1;
-  const names = new Set(profiles.map((profile) => profile.name));
-  while (names.has(`新线路 ${index}`)) index += 1;
-  return `新线路 ${index}`;
-}
-
-function createRoute(profiles: Profile[]): Profile {
+function createRoute(): Profile {
   const id = `route-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   return {
     id,
     enabled: true,
-    name: newRouteName(profiles),
+    name: "",
     shortName: "",
     baseUrl: "",
     apiKey: "",
@@ -139,6 +145,7 @@ function createRoute(profiles: Profile[]): Profile {
     clearApiKey: false,
     officialAccount: false,
     supportsRemoteCompaction: false,
+    remoteCompactionProtocol: "responses",
     supportsWebsockets: false,
     supportsNativeWebSearch: false,
   };
@@ -152,10 +159,8 @@ type RouteDraftErrors = {
   upstreamProxy: string;
 };
 
-// 官方线路的编辑入口只改线路名、短名称、网关和代理，模型列举交给同步入口。
+// 官方线路的编辑入口调整连接与并发设置，模型列举交给同步入口。
 type OfficialRouteDialogScope = "settings" | "models";
-
-export { MAX_ROUTE_NAME_CHARACTERS };
 
 const UPSTREAM_PROXY_TOOLTIP_CONTENT = (
   <div className="space-y-1.5 text-xs text-left leading-relaxed">
@@ -191,9 +196,7 @@ function validateRouteDraft(route: Profile, profiles: readonly Profile[]): Route
     };
   }
   const errors: RouteDraftErrors = {
-    name: !route.name.trim()
-      ? "请输入线路名称"
-      : Array.from(route.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS
+    name: Array.from(route.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS
         ? `线路名最多 ${MAX_ROUTE_NAME_CHARACTERS} 个字符`
         : "",
     shortName: validateThirdPartyRouteShortName(route.shortName, profiles, route.id),
@@ -215,12 +218,14 @@ const routeProtocolOptions: Array<{
   { label: "Anthropic Messages", value: "anthropicMessages" },
 ];
 
+const REQUIRED_FIELD_MARKER = <span aria-hidden="true" className="text-[var(--codey-red,#d70015)]">*</span>;
+
 function ModelSectionComponent({
   config,
+  runtimeStatus,
   currentProvider,
   officialAccountAvailable,
   popupContainer,
-  active,
   modelState,
   dirty,
   canSyncCurrentProvider,
@@ -237,12 +242,10 @@ function ModelSectionComponent({
   onReorderRouteModels,
   onDeleteRoute,
   onFetchRouteModels,
-  onOfficialAccountsChanged,
   onNotice,
   onSaveOfficialRouteSettings,
   onSetDefaultModel,
   onConfigChange,
-  onRequestConfirmation,
 }: ModelSectionProps) {
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [draggedRouteId, setDraggedRouteId] = useState<string | null>(null);
@@ -250,6 +253,8 @@ function ModelSectionComponent({
   // 模型只能在所属线路内拖动排序，因此拖动状态同时记录线路和模型。
   const [draggedModel, setDraggedModel] = useState<RouteModelRef | null>(null);
   const [dropModel, setDropModel] = useState<RouteModelRef | null>(null);
+  // 同一时刻只允许探测一个模型，避免并发请求同一线路的上游模型列表。
+  const [testingModel, setTestingModel] = useState<string | null>(null);
   const [pendingRouteToggle, setPendingRouteToggle] = useState<{
     id: string;
     enabled: boolean;
@@ -270,7 +275,23 @@ function ModelSectionComponent({
     useState<OfficialRouteSettingsDraft | null>(null);
   const [officialDialogScope, setOfficialDialogScope] =
     useState<OfficialRouteDialogScope | null>(null);
+  // 「快速导入」粘贴面板与一次性状态；新建第三方线路时可用。
+  const [routeImportOpen, setRouteImportOpen] = useState(false);
+  const [routeImportText, setRouteImportText] = useState("");
+  const [routeImportError, setRouteImportError] = useState("");
+  const [routeImportApplied, setRouteImportApplied] = useState(false);
+  const routeImportGeneration = useRef(0);
   const routeConfigReadOnly = !config.localRouterEnabled;
+
+  const resetRouteImport = useCallback(() => {
+    routeImportGeneration.current += 1;
+    setRouteImportOpen(false);
+    setRouteImportText("");
+    setRouteImportError("");
+    setRouteImportApplied(false);
+  }, []);
+
+  useEffect(() => () => { routeImportGeneration.current += 1; }, []);
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
@@ -279,7 +300,8 @@ function ModelSectionComponent({
     setOfficialRouteDraft(null);
     setOfficialDialogScope(null);
     setRouteApiKeyVisible(false);
-  }, [routeConfigReadOnly]);
+    resetRouteImport();
+  }, [resetRouteImport, routeConfigReadOnly]);
 
   // 官方线路的线路名、短名称、网关和代理保存在所属账号记录里，保存入口在线路卡片上。
   const refreshOfficialAccounts = useCallback(async () => {
@@ -291,18 +313,7 @@ function ModelSectionComponent({
     }
   }, []);
 
-  const handleOfficialAccountsChanged = useCallback(
-    (result: OfficialAccountsResult) => {
-      if (Array.isArray(result.accounts)) {
-        rememberOfficialAccounts(result);
-        setOfficialAccounts(result.accounts);
-      }
-      onOfficialAccountsChanged(result);
-    },
-    [onOfficialAccountsChanged],
-  );
-
-  // 账号面板只在开启本地路由时挂载，只读模式下线路卡片仍要显示所属账号邮箱。
+  // 本地路由关闭时线路卡片仍要显示所属账号邮箱，因此只读模式补取一次账号列表。
   useEffect(() => {
     if (!routeConfigReadOnly) return;
     void refreshOfficialAccounts();
@@ -354,11 +365,10 @@ function ModelSectionComponent({
     if (matchingProfile?.enabled === false) return null;
     return {
       id: matchingProfile?.id || currentProvider.id,
-      name:
-        currentProvider.name.trim() ||
-        matchingProfile?.name.trim() ||
-        currentProvider.id,
-      shortName: matchingProfile?.shortName || (official ? "官" : ""),
+      name: matchingProfile
+        ? matchingProfile.name.trim()
+        : currentProvider.name.trim() || currentProvider.id,
+      shortName: matchingProfile?.shortName || "",
       baseUrl: currentProvider.baseUrl || matchingProfile?.baseUrl || "",
       apiKey: "",
       upstreamProtocol:
@@ -485,13 +495,14 @@ function ModelSectionComponent({
   );
 
   const openNewRouteDialog = () => {
-    setRouteDraft(createRoute(config.profiles));
+    setRouteDraft(createRoute());
     setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     setRouteHeadersText(JSON.stringify({}, null, 2));
     setHeaderError("");
     setOfficialModelDraft([]);
     setOfficialDialogScope(null);
+    resetRouteImport();
     setRouteDialogOpen(true);
   };
   const openRouteDialog = (
@@ -499,7 +510,7 @@ function ModelSectionComponent({
     officialScope: OfficialRouteDialogScope | null = null,
   ) => {
     const official = profile.authMode === "officialAccount";
-    setRouteDraft({ ...profile });
+    setRouteDraft({ ...profile, shortName: profile.shortName || fallbackRouteShortName(profile.name) });
     setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     setRouteHeadersText(headersTextFromMap(profile.modelRequestHeaders));
@@ -508,10 +519,11 @@ function ModelSectionComponent({
     setOfficialRouteDraft(
       official && officialScope === "settings"
         ? {
-            routeName: routeAccount?.routeName ?? "",
-            routeShortName: routeAccount?.routeShortName ?? "",
+            routeName: routeAccount?.routeName ?? profile.name,
+            routeShortName: routeAccount?.routeShortName || profile.shortName || fallbackRouteShortName(profile.name),
             baseUrl: routeAccount?.baseUrl ?? "",
             upstreamProxy: profile.upstreamProxy ?? "",
+            maxConcurrency: String(profile.maxConcurrency ?? routeAccount?.maxConcurrency ?? 0),
           }
         : null,
     );
@@ -531,6 +543,7 @@ function ModelSectionComponent({
       setOfficialModelContextDraft({});
     }
     setOfficialDialogScope(official ? officialScope : null);
+    resetRouteImport();
     setRouteDialogOpen(true);
   };
   const updateRouteDraft = (patch: Partial<Profile>) => {
@@ -538,6 +551,74 @@ function ModelSectionComponent({
   };
   const updateOfficialRouteDraft = (patch: Partial<OfficialRouteSettingsDraft>) => {
     setOfficialRouteDraft((current) => current ? { ...current, ...patch } : current);
+  };
+  // 解析成功即写入草稿；空缺的线路名和短名称按连接地址补建议值。
+  const applyRouteConnectionInfo = (info: NewApiConnectionInfo) => {
+    const suggestions = suggestRouteNamesFromUrl(
+      info.url,
+      MAX_ROUTE_NAME_CHARACTERS,
+      MAX_ROUTE_SHORT_NAME_CHARACTERS,
+    );
+    setRouteDraft((current) => {
+      if (!current) return current;
+      const suggestedShortName =
+        suggestions.shortName &&
+        !validateThirdPartyRouteShortName(
+          suggestions.shortName,
+          config.profiles,
+          current.id,
+        )
+          ? suggestions.shortName
+          : "";
+      return {
+        ...current,
+        baseUrl: info.url,
+        apiKey: info.key,
+        name: current.name || suggestions.name,
+        shortName: current.shortName || suggestedShortName,
+      };
+    });
+    setRouteImportOpen(false);
+    setRouteImportText("");
+    setRouteImportError("");
+    setRouteImportApplied(true);
+  };
+  // 优先读剪贴板，命中连接信息直接填入；读不到或不匹配时展开手动粘贴面板。
+  const handleRouteQuickImport = async () => {
+    const generation = ++routeImportGeneration.current;
+    if (routeImportOpen) {
+      setRouteImportOpen(false);
+      return;
+    }
+    setRouteImportApplied(false);
+    let clipboardText: string | null = null;
+    try {
+      clipboardText = await navigator.clipboard.readText();
+    } catch {
+      clipboardText = null;
+    }
+    if (generation !== routeImportGeneration.current) return;
+    const info = parseNewApiConnectionInfo(clipboardText);
+    if (info) {
+      applyRouteConnectionInfo(info);
+      return;
+    }
+    setRouteImportError(
+      clipboardText?.trim()
+        ? "剪贴板内容不是有效的 New API 连接信息，请手动粘贴"
+        : "",
+    );
+    setRouteImportOpen(true);
+  };
+  const handleRouteImportTextChange = (value: string) => {
+    routeImportGeneration.current += 1;
+    setRouteImportText(value);
+    const info = parseNewApiConnectionInfo(value);
+    if (info) {
+      applyRouteConnectionInfo(info);
+    } else {
+      setRouteImportError(value.trim() ? "不是有效的 New API 连接信息" : "");
+    }
   };
   const openHeadersDialog = (profile: Profile) => {
     setHeaderDialogProfile(profile);
@@ -620,6 +701,7 @@ function ModelSectionComponent({
                     routeName: officialRouteDraft.routeName.trim(),
                     routeShortName: officialRouteDraft.routeShortName.trim(),
                     baseUrl: officialRouteDraft.baseUrl.trim(),
+                    maxConcurrency: Number(officialRouteDraft.maxConcurrency.trim()),
                   }
                 : undefined,
             )
@@ -627,6 +709,7 @@ function ModelSectionComponent({
       : await onSaveRoute({ ...routeDraft, modelRequestHeaders });
     if (saved) {
       if (routeDraft.authMode === "officialAccount") void refreshOfficialAccounts();
+      resetRouteImport();
       setRouteDialogOpen(false);
       setRouteDraft(null);
       setOfficialRouteDraft(null);
@@ -645,12 +728,42 @@ function ModelSectionComponent({
     }
   };
 
+  // 只读探测线路的模型列表，判断连接与模型是否存在；不发对话请求，不产生计费。
+  const testModelConnection = async (
+    routeId: string,
+    model: string,
+    displayName: string,
+  ) => {
+    setTestingModel(model);
+    try {
+      const result = await withTimeout(
+        invoke<{ modelCount: number; found: boolean }>("test_route_model", { routeId, model }),
+        15_000,
+        "测试连接超时，请稍后重试。",
+      );
+      onNotice(
+        result.found
+          ? { tone: "success", text: `${displayName} 连接正常：线路返回 ${result.modelCount} 个模型，包含该模型` }
+          : { tone: "info", text: `${displayName} 连接正常，但返回的 ${result.modelCount} 个模型里没有它` },
+      );
+    } catch (error) {
+      onNotice({ tone: "error", text: errorText(error) });
+    } finally {
+      setTestingModel(null);
+    }
+  };
+
   const draftOfficialAccount = accountForRoute(routeDraft);
   const draggedProfile = draggedRouteId
     ? visibleProfiles.find((profile) => profile.id === draggedRouteId)
     : undefined;
   const draftOfficialAccountLabel =
     displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
+  const isNewRouteDraft = Boolean(
+    routeDraft &&
+    routeDraft.authMode !== "officialAccount" &&
+    !config.profiles.some((profile) => profile.id === routeDraft.id),
+  );
 
   const preferredProfile =
     config.profiles.find((profile) => profile.id === config.activeProfileId) ??
@@ -768,20 +881,6 @@ function ModelSectionComponent({
       <div className="route-content">
         <div className={`route-manager${routeConfigReadOnly ? " route-manager-current" : ""}`}>
           <div className="route-catalog-pane">
-            {!routeConfigReadOnly && (
-              <OfficialAccountsPanel
-                officialAccountAvailable={officialAccountAvailable}
-                isBusy={isBusy}
-                active={active}
-                maskSensitive={maskSensitive}
-                popupContainer={popupContainer}
-                onAccountsLoaded={setOfficialAccounts}
-                onAccountsChanged={handleOfficialAccountsChanged}
-                onNotice={onNotice}
-                onRequestConfirmation={onRequestConfirmation}
-              />
-            )}
-
             <div className="catalog-aggregate-heading">
               <div className="catalog-aggregate-title-wrap">
                 <div className="catalog-aggregate-title">
@@ -823,6 +922,7 @@ function ModelSectionComponent({
                 const group = modelGroupByProviderId.get(providerId);
                 const isOfficial = profile.authMode === "officialAccount";
                 const disabled = profile.enabled === false;
+                const compaction = getRouteCompactionStatus(profile, runtimeStatus, officialAccountAvailable);
                 const acceptsRouteDrop = draggedProfile && draggedProfile.id !== profile.id
                   && (draggedProfile.enabled === false) === disabled;
                 const officialLoginLabel = officialLoginLabelFor(
@@ -900,7 +1000,7 @@ function ModelSectionComponent({
                                 />
                               </span>
                             )}
-                            <strong id={`provider-model-${profile.id}`} title={profile.name}>{profile.name || "未命名线路"}</strong>
+                            <strong id={`provider-model-${profile.id}`} title={profile.name}>{prefixedRouteName(profile)}</strong>
                             <div className="route-item-badges">
                               {pendingRouteToggle?.id === profile.id && <Badge variant="secondary">保存中…</Badge>}
                               {disabled ? <Badge variant="destructive">已禁用</Badge> : (
@@ -910,6 +1010,13 @@ function ModelSectionComponent({
                                     <Badge variant="secondary">待配置模型</Badge>
                                   )}
                                   {(isOfficial || profile.supportsWebsockets) && <Badge variant="brand">WS</Badge>}
+                                  <Tooltip content={compaction.tooltip}>
+                                    <span className="inline-flex">
+                                      <Badge variant={compaction.badgeVariant} title={compaction.tooltip}>
+                                        {compaction.badgeText}
+                                      </Badge>
+                                    </span>
+                                  </Tooltip>
                                 </>
                               )}
                               {disabled && <span className="route-disabled-hint">启用后可使用此线路的模型</span>}
@@ -974,8 +1081,8 @@ function ModelSectionComponent({
                                 size="icon-sm"
                                 disabled={routeConfigReadOnly || isBusy || dirty || config.profiles.length <= 1}
                                 onClick={() => onDeleteRoute(profile.id)}
-                                aria-label={`删除线路 ${profile.name}`}
-                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${profile.name}`}
+                                aria-label={`删除线路 ${prefixedRouteName(profile)}`}
+                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${prefixedRouteName(profile)}`}
                               >
                                 <Trash size={14} aria-hidden="true" />
                               </Button>
@@ -1070,6 +1177,18 @@ function ModelSectionComponent({
                                   <span className="model-tag-name">{displayName}</span>
                                   {isDefault && <span className="model-tag-badge">默认</span>}
                                 </button>
+                                <button
+                                  type="button"
+                                  className="model-tag-test"
+                                  disabled={routeConfigReadOnly || isBusy || dirty || testingModel !== null}
+                                  title={`测试连接：${displayName}`}
+                                  aria-label={`测试连接 ${displayName}`}
+                                  onClick={() => void testModelConnection(profile.id, model, displayName)}
+                                >
+                                  {testingModel === model
+                                    ? <RefreshCw size={13} className="animate-spin" aria-hidden="true" />
+                                    : <IconPlugConnected size={13} aria-hidden="true" />}
+                                </button>
                               </div>
                             );
                           })}
@@ -1102,7 +1221,10 @@ function ModelSectionComponent({
         <div className="route-auxiliary-bar">
           <div className="route-auxiliary-header">
             <div className="route-auxiliary-title-wrap">
-              <span className="route-auxiliary-title">高级路由与重试设置</span>
+              <div className="route-auxiliary-title-row">
+                <IconAdjustmentsHorizontal size={15} className="route-auxiliary-icon" aria-hidden="true" />
+                <span className="route-auxiliary-title">高级路由与重试设置</span>
+              </div>
               <small className="route-auxiliary-subtitle">配置辅助任务专用模型与长会话中断后的自动恢复策略</small>
             </div>
           </div>
@@ -1198,6 +1320,7 @@ function ModelSectionComponent({
               setOfficialRouteDraft(null);
               setOfficialDialogScope(null);
               setRouteApiKeyVisible(false);
+              resetRouteImport();
             }
           }
         }}
@@ -1224,6 +1347,20 @@ function ModelSectionComponent({
                       ? "编辑线路"
                       : "新增线路"}
                 </DialogTitle>
+                {isNewRouteDraft && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="ml-auto shrink-0"
+                    disabled={isBusy}
+                    title="粘贴 New API「复制连接串」内容，自动填入 URL 与 Key"
+                    aria-expanded={routeImportOpen}
+                    onClick={() => void handleRouteQuickImport()}
+                  >
+                    <IconClipboard size={13} aria-hidden="true" />
+                    <span>快速导入</span>
+                  </Button>
+                )}
               </div>
               <DialogDescription>
                 {routeDraft.authMode === "officialAccount"
@@ -1232,8 +1369,8 @@ function ModelSectionComponent({
                       ? `当前官方账号：${draftOfficialAccountLabel}。未勾选的模型不会在模型目录和选择器中显示。`
                       : "未勾选的模型不会在模型目录和选择器中显示。"
                     : draftOfficialAccount
-                      ? `当前官方账号：${draftOfficialAccountLabel}。此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。`
-                      : "此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。"
+                      ? `当前官方账号：${draftOfficialAccountLabel}。调整线路连接与并发设置，模型列表请使用线路卡片上的同步按钮。`
+                      : "调整线路连接与并发设置，模型列表请使用线路卡片上的同步按钮。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
             </DialogHeader>
@@ -1244,7 +1381,45 @@ function ModelSectionComponent({
                   <>
                     <div className="route-editor-row route-editor-row-names">
                       <label className="route-field">
-                        <span>线路名</span>
+                        <span>短名称 {REQUIRED_FIELD_MARKER}</span>
+                        <Input
+                          id="official-route-short-name-input"
+                          aria-label="短名称"
+                          required
+                          aria-required="true"
+                          error={Boolean(
+                            officialRouteDraftErrors?.shortName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeShortName.length ?? 0) > 0),
+                          )}
+                          aria-errormessage={
+                            officialRouteDraftErrors?.shortName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeShortName.length ?? 0) > 0)
+                              ? "official-route-short-name-error"
+                              : undefined
+                          }
+                          value={officialRouteDraft?.routeShortName ?? ""}
+                          disabled={isBusy || !draftOfficialAccount}
+                          placeholder="如：官1、主"
+                          maxLength={MAX_ROUTE_SHORT_NAME_CHARACTERS}
+                          onChange={(event) =>
+                            updateOfficialRouteDraft({ routeShortName: event.target.value })}
+                        />
+                        {officialRouteDraftErrors?.shortName &&
+                        (routeValidationAttempted ||
+                          (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
+                          <small
+                            id="official-route-short-name-error"
+                            className="text-[var(--codey-red,#d70015)]"
+                            role="alert"
+                          >
+                            {officialRouteDraftErrors.shortName}
+                          </small>
+                        ) : null}
+                      </label>
+                      <label className="route-field">
+                        <span>线路名（可选）</span>
                         <Input
                           id="official-route-name-input"
                           aria-label="线路名"
@@ -1263,7 +1438,7 @@ function ModelSectionComponent({
                           }
                           value={officialRouteDraft?.routeName ?? ""}
                           disabled={isBusy || !draftOfficialAccount}
-                          placeholder={routeDraft.name || "OpenAI 官方直登"}
+                          placeholder="留空仅显示短名称"
                           onChange={(event) =>
                             updateOfficialRouteDraft({ routeName: event.target.value })}
                         />
@@ -1283,44 +1458,33 @@ function ModelSectionComponent({
                           </small>
                         ) : null}
                       </label>
-                      <label className="route-field">
-                        <span>短名称</span>
-                        <Input
-                          id="official-route-short-name-input"
-                          aria-label="短名称"
-                          error={Boolean(
-                            officialRouteDraftErrors?.shortName &&
-                            (routeValidationAttempted ||
-                              (officialRouteDraft?.routeShortName.length ?? 0) > 0),
-                          )}
-                          aria-errormessage={
-                            officialRouteDraftErrors?.shortName &&
-                            (routeValidationAttempted ||
-                              (officialRouteDraft?.routeShortName.length ?? 0) > 0)
-                              ? "official-route-short-name-error"
-                              : undefined
-                          }
-                          value={officialRouteDraft?.routeShortName ?? ""}
-                          disabled={isBusy || !draftOfficialAccount}
-                          placeholder="官"
-                          maxLength={MAX_ROUTE_SHORT_NAME_CHARACTERS}
-                          onChange={(event) =>
-                            updateOfficialRouteDraft({ routeShortName: event.target.value })}
-                        />
-                        {officialRouteDraftErrors?.shortName &&
-                        (routeValidationAttempted ||
-                          (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
-                          <small
-                            id="official-route-short-name-error"
-                            className="text-[var(--codey-red,#d70015)]"
-                            role="alert"
-                          >
-                            {officialRouteDraftErrors.shortName}
-                          </small>
-                        ) : null}
-                      </label>
                     </div>
 
+                    <label className="route-field">
+                      <span>最高并发数</span>
+                      <Input
+                        id="official-route-max-concurrency-input"
+                        aria-label="最高并发数"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        value={officialRouteDraft?.maxConcurrency ?? "0"}
+                        disabled={isBusy || !draftOfficialAccount}
+                        aria-invalid={Boolean(officialRouteDraftErrors?.maxConcurrency)}
+                        aria-describedby={officialRouteDraftErrors?.maxConcurrency
+                          ? "official-route-max-concurrency-error official-route-max-concurrency-hint"
+                          : "official-route-max-concurrency-hint"}
+                        onChange={(event) => updateOfficialRouteDraft({ maxConcurrency: event.target.value })}
+                      />
+                      {officialRouteDraftErrors?.maxConcurrency ? (
+                        <small id="official-route-max-concurrency-error" className="text-[var(--codey-red,#d70015)]" role="alert">
+                          {officialRouteDraftErrors.maxConcurrency}
+                        </small>
+                      ) : null}
+                      <small id="official-route-max-concurrency-hint" className="route-field-hint">
+                        0 表示不限制；达到上限后等待。降低上限不影响正在执行的请求。
+                      </small>
+                    </label>
                     <label className="route-field">
                       <span>网关地址（可选）</span>
                       <Input
@@ -1460,40 +1624,54 @@ function ModelSectionComponent({
               </div>
             ) : (
               <div className="route-editor-form">
+                {isNewRouteDraft && routeImportOpen && (
+                  <div className="route-import-panel">
+                    <label className="route-field">
+                      <span>New API 连接信息</span>
+                      <TextArea
+                        aria-label="New API 连接信息"
+                        aria-invalid={Boolean(routeImportError)}
+                        aria-describedby={
+                          routeImportError ? "route-import-error" : "route-import-hint"
+                        }
+                        value={routeImportText}
+                        disabled={isBusy}
+                        rows={2}
+                        autoFocus
+                        className="route-import-input font-mono text-xs"
+                        placeholder='{"_type":"newapi_channel_conn","key":"sk-…","url":"https://api.example.com"}'
+                        onChange={(event) => handleRouteImportTextChange(event.target.value)}
+                      />
+                      {routeImportError ? (
+                        <small
+                          id="route-import-error"
+                          className="text-[var(--codey-red,#d70015)]"
+                          role="alert"
+                        >
+                          {routeImportError}
+                        </small>
+                      ) : (
+                        <small id="route-import-hint" className="route-field-hint">
+                          粘贴 New API 令牌的「复制连接串」内容，识别后自动填入 URL 与 Key
+                        </small>
+                      )}
+                    </label>
+                  </div>
+                )}
+                {isNewRouteDraft && routeImportApplied && (
+                  <div className="route-import-status" role="status">
+                    <Check size={13} aria-hidden="true" />
+                    <span>已从连接信息填入 URL 与 Key，确认短名称后保存</span>
+                  </div>
+                )}
                 <div className="route-editor-row route-editor-row-names">
                   <label className="route-field">
-                    <span>线路名</span>
-                    <Input
-                      id="route-name-input"
-                      aria-label="线路名"
-                      maxLength={MAX_ROUTE_NAME_CHARACTERS}
-                      aria-invalid={Boolean(
-                        routeDraftErrors?.name &&
-                        (routeValidationAttempted || routeDraft.name.length > 0),
-                      )}
-                      aria-describedby={
-                        routeDraftErrors?.name &&
-                        (routeValidationAttempted || routeDraft.name.length > 0)
-                          ? "route-name-error"
-                          : undefined
-                      }
-                      value={routeDraft.name}
-                      disabled={isBusy}
-                      placeholder="如：主线路、备用中转"
-                      onChange={(event) => updateRouteDraft({ name: event.target.value })}
-                    />
-                    {routeDraftErrors?.name &&
-                    (routeValidationAttempted || routeDraft.name.length > 0) ? (
-                      <small id="route-name-error" className="text-[var(--codey-red,#d70015)]" role="alert">
-                        {routeDraftErrors.name}
-                      </small>
-                    ) : null}
-                  </label>
-                  <label className="route-field">
-                    <span>短名称</span>
+                    <span>短名称 {REQUIRED_FIELD_MARKER}</span>
                     <Input
                       id="route-short-name-input"
                       aria-label="短名称"
+                      required
+                      aria-required="true"
                       error={Boolean(
                         routeDraftErrors?.shortName &&
                         (routeValidationAttempted || routeDraft.shortName.length > 0),
@@ -1522,13 +1700,42 @@ function ModelSectionComponent({
                       </small>
                     ) : null}
                   </label>
+                  <label className="route-field">
+                    <span>线路名（可选）</span>
+                    <Input
+                      id="route-name-input"
+                      aria-label="线路名"
+                      maxLength={MAX_ROUTE_NAME_CHARACTERS}
+                      aria-invalid={Boolean(
+                        routeDraftErrors?.name &&
+                        (routeValidationAttempted || routeDraft.name.length > 0),
+                      )}
+                      aria-describedby={
+                        routeDraftErrors?.name &&
+                        (routeValidationAttempted || routeDraft.name.length > 0)
+                          ? "route-name-error"
+                          : undefined
+                      }
+                      value={routeDraft.name}
+                      disabled={isBusy}
+                      placeholder="留空仅显示短名称"
+                      onChange={(event) => updateRouteDraft({ name: event.target.value })}
+                    />
+                    {routeDraftErrors?.name &&
+                    (routeValidationAttempted || routeDraft.name.length > 0) ? (
+                      <small id="route-name-error" className="text-[var(--codey-red,#d70015)]" role="alert">
+                        {routeDraftErrors.name}
+                      </small>
+                    ) : null}
+                  </label>
                 </div>
 
                 <div className="route-field">
-                  <span id="route-protocol-label">上游协议</span>
+                  <span id="route-protocol-label">上游协议 {REQUIRED_FIELD_MARKER}</span>
                   <Select
                     aria-label="上游协议"
                     aria-labelledby="route-protocol-label"
+                    aria-required={true}
                     value={routeDraft.upstreamProtocol}
                     disabled={isBusy}
                     onChange={(value) => {
@@ -1555,84 +1762,152 @@ function ModelSectionComponent({
                 </div>
 
                 {routeDraft.upstreamProtocol === "openaiResponses" && (
-                  <div className="route-protocol-options route-editor-span-all">
-                    <div className="route-option-item">
-                      <div className="route-option-header">
-                        <div className="route-option-title-group">
-                          <strong className="route-option-title">原生远程压缩</strong>
-                          <Tooltip content="仅在上游实现 OpenAI Responses 原生压缩协议时开启；所有启用线路都支持时 Codex 才会使用，能力变更需重启。">
-                            <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
-                              <IconInfoCircle size={13} />
-                            </span>
-                          </Tooltip>
-                        </div>
-                        <Switch
-                          size="sm"
-                          checked={Boolean(routeDraft.supportsRemoteCompaction)}
-                          disabled={isBusy}
-                          onCheckedChange={(checked) =>
-                            updateRouteDraft({ supportsRemoteCompaction: checked })}
-                          aria-label="原生远程压缩"
-                        />
-                      </div>
-                      <small className="route-field-hint">
-                        仅在上游明确支持时开启；所有启用线路都支持时才会使用
-                      </small>
+                  <div className="route-field route-editor-span-all">
+                    <div className="route-protocol-section-header">
+                      <span className="route-protocol-section-title">
+                        <IconAdjustmentsHorizontal size={14} className="text-muted" aria-hidden="true" />
+                        协议特性（OpenAI Responses）
+                      </span>
+                      <span className="route-protocol-section-badge">按需扩展</span>
                     </div>
-                    <div className="route-option-item">
-                      <div className="route-option-header">
-                        <div className="route-option-title-group">
-                          <strong className="route-option-title">WebSocket</strong>
-                          <Tooltip content="优先尝试复用长连接；使用代理或连接失败时转为流式 HTTP。能力变更需重启 Codex，实际速度取决于上游和网络。">
-                            <span className="route-option-info-trigger" aria-label="WebSocket 详细说明">
-                              <IconInfoCircle size={13} />
+                    <div className="route-protocol-options">
+                      {/* 第一行：原生远程压缩（独立占行，支持展开子面板） */}
+                      <div
+                        className="route-option-item route-option-item-full"
+                        data-active={Boolean(routeDraft.supportsRemoteCompaction)}
+                      >
+                        <div className="route-option-header">
+                          <div className="route-option-title-group">
+                            <span className="route-option-icon" aria-hidden="true">
+                              <IconArchive size={14} />
                             </span>
-                          </Tooltip>
+                            <strong className="route-option-title">原生远程压缩</strong>
+                            <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；未声明原生支持的线路由网关按等价方式压缩。">
+                              <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
+                                <IconInfoCircle size={13} />
+                              </span>
+                            </Tooltip>
+                          </div>
+                          <Switch
+                            size="sm"
+                            checked={Boolean(routeDraft.supportsRemoteCompaction)}
+                            disabled={isBusy}
+                            onCheckedChange={(checked) =>
+                              updateRouteDraft({ supportsRemoteCompaction: checked })}
+                            aria-label="原生远程压缩"
+                          />
                         </div>
-                        <Switch
-                          size="sm"
-                          checked={Boolean(routeDraft.supportsWebsockets)}
-                          disabled={isBusy}
-                          onCheckedChange={(checked) =>
-                            updateRouteDraft({ supportsWebsockets: checked })}
-                          aria-label="WebSocket"
-                        />
+                        <p className="route-field-hint">
+                          声明该线路是否原生支持远程压缩；未声明的线路由网关按等价方式压缩
+                        </p>
+                        {routeDraft.supportsRemoteCompaction && (
+                          <div className="route-option-subpanel">
+                            <div className="route-option-subpanel-title-row">
+                              <span id="route-compaction-protocol-label" className="route-option-subpanel-label">
+                                压缩接口
+                              </span>
+                              <span className="route-option-subpanel-badge">
+                                {routeDraft.remoteCompactionProtocol === "compactEndpoint"
+                                  ? "兼容接口"
+                                  : "原生默认"}
+                              </span>
+                            </div>
+                            <Select
+                              aria-labelledby="route-compaction-protocol-label"
+                              value={routeDraft.remoteCompactionProtocol ?? "responses"}
+                              disabled={isBusy}
+                              onChange={(value) => {
+                                if (value === "responses" || value === "compactEndpoint") {
+                                  updateRouteDraft({ remoteCompactionProtocol: value });
+                                }
+                              }}
+                              optionList={[
+                                { label: "原生 Responses（默认）", value: "responses" },
+                                { label: "独立压缩接口（兼容）", value: "compactEndpoint" },
+                              ]}
+                            />
+                            <p className="route-option-subpanel-hint">
+                              {routeDraft.remoteCompactionProtocol === "compactEndpoint"
+                                ? "将新式压缩请求转换到 /responses/compact；上游须返回加密压缩结果。接口选择保存后生效。"
+                                : "按 Codex 原始压缩协议发送；若服务商仅支持 /responses/compact，请选择兼容接口。"}
+                            </p>
+                          </div>
+                        )}
                       </div>
-                      <small className="route-field-hint">
-                        优先长连接，失败转流式 HTTP
-                      </small>
-                    </div>
-                    <div className="route-option-item">
-                      <div className="route-option-header">
-                        <div className="route-option-title-group">
-                          <strong className="route-option-title">原生网页搜索</strong>
-                          <Tooltip content="仅在上游和所选模型都明确支持时开启。">
-                            <span className="route-option-info-trigger" aria-label="原生网页搜索详细说明">
-                              <IconInfoCircle size={13} />
-                            </span>
-                          </Tooltip>
+
+                      {/* 第二行：并排两个轻量开关（WebSocket + 原生网页搜索） */}
+                      <div className="route-option-grid-row">
+                        <div
+                          className="route-option-item route-option-col"
+                          data-active={Boolean(routeDraft.supportsWebsockets)}
+                        >
+                          <div className="route-option-header">
+                            <div className="route-option-title-group">
+                              <span className="route-option-icon" aria-hidden="true">
+                                <IconBolt size={14} />
+                              </span>
+                              <strong className="route-option-title">WebSocket</strong>
+                              <Tooltip content="优先尝试复用长连接；使用代理或连接失败时转为流式 HTTP。能力变更需重启 Codex，实际速度取决于上游和网络。">
+                                <span className="route-option-info-trigger" aria-label="WebSocket 详细说明">
+                                  <IconInfoCircle size={13} />
+                                </span>
+                              </Tooltip>
+                            </div>
+                            <Switch
+                              size="sm"
+                              checked={Boolean(routeDraft.supportsWebsockets)}
+                              disabled={isBusy}
+                              onCheckedChange={(checked) =>
+                                updateRouteDraft({ supportsWebsockets: checked })}
+                              aria-label="WebSocket"
+                            />
+                          </div>
+                          <p className="route-field-hint">
+                            优先长连接，失败转流式 HTTP
+                          </p>
                         </div>
-                        <Switch
-                          size="sm"
-                          checked={Boolean(routeDraft.supportsNativeWebSearch)}
-                          disabled={isBusy}
-                          onCheckedChange={(checked) =>
-                            updateRouteDraft({ supportsNativeWebSearch: checked })}
-                          aria-label="原生网页搜索"
-                        />
+
+                        <div
+                          className="route-option-item route-option-col"
+                          data-active={Boolean(routeDraft.supportsNativeWebSearch)}
+                        >
+                          <div className="route-option-header">
+                            <div className="route-option-title-group">
+                              <span className="route-option-icon" aria-hidden="true">
+                                <IconWorld size={14} />
+                              </span>
+                              <strong className="route-option-title">原生网页搜索</strong>
+                              <Tooltip content="仅在上游和所选模型都明确支持时开启。">
+                                <span className="route-option-info-trigger" aria-label="原生网页搜索详细说明">
+                                  <IconInfoCircle size={13} />
+                                </span>
+                              </Tooltip>
+                            </div>
+                            <Switch
+                              size="sm"
+                              checked={Boolean(routeDraft.supportsNativeWebSearch)}
+                              disabled={isBusy}
+                              onCheckedChange={(checked) =>
+                                updateRouteDraft({ supportsNativeWebSearch: checked })}
+                              aria-label="原生网页搜索"
+                            />
+                          </div>
+                          <p className="route-field-hint">
+                            仅在上游与模型支持时开启
+                          </p>
+                        </div>
                       </div>
-                      <small className="route-field-hint">
-                        仅在上游与模型支持时开启
-                      </small>
                     </div>
                   </div>
                 )}
 
                 <label className="route-field">
-                  <span>URL</span>
+                  <span>URL {REQUIRED_FIELD_MARKER}</span>
                   <Input
                     id="route-url-input"
                     aria-label="URL"
+                    required
+                    aria-required="true"
                     aria-invalid={Boolean(
                       routeDraftErrors?.baseUrl &&
                       (routeValidationAttempted || routeDraft.baseUrl.trim()),
@@ -1661,10 +1936,12 @@ function ModelSectionComponent({
                 </label>
 
                 <label className="route-field">
-                  <span>Key</span>
+                  <span>Key {REQUIRED_FIELD_MARKER}</span>
                   <PasswordInput
                     id="route-key-input"
                     aria-label="Key"
+                    required={!routeDraft.apiKeyConfigured}
+                    aria-required={!routeDraft.apiKeyConfigured}
                     aria-invalid={Boolean(
                       routeValidationAttempted && routeDraftErrors?.apiKey,
                     )}
@@ -1753,6 +2030,7 @@ function ModelSectionComponent({
                   setOfficialDialogScope(null);
                   setRouteValidationAttempted(false);
                   setRouteApiKeyVisible(false);
+                  resetRouteImport();
                 }}
               >
                 取消

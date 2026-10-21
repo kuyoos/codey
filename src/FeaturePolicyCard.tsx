@@ -1,14 +1,16 @@
-import { memo, useState, type CSSProperties } from "react";
+import { memo, type CSSProperties } from "react";
 import {
   IconAdjustments,
-  IconAlertTriangle,
-  IconCode,
   IconDeviceDesktopCode,
   IconFocus2,
+  IconHelpCircle,
   IconInfoCircle,
+  IconNetwork,
   IconPhotoSearch,
+  IconTerminal2,
   IconUsersGroup,
   IconWorldSearch,
+  IconX,
 } from "@tabler/icons-react";
 
 import type {
@@ -19,6 +21,7 @@ import type {
 import {
   Button,
   Badge,
+  Input,
   Select,
   Switch,
   Tooltip,
@@ -30,8 +33,7 @@ import {
   type SubagentModelOption,
 } from "./subagentModels";
 import { SettingsPageHeader } from "./SettingsPageHeader";
-import { invoke } from "./api";
-import { errorText } from "./appUtils";
+import { validateCodexLaunchProxy } from "./urlValidation";
 import type { DiagnosticStorageTarget } from "./diagnosticStorage";
 import { NotificationChannelsCard } from "./notifications/NotificationChannelsCard";
 import type { NotificationChannel } from "./notifications/types";
@@ -52,10 +54,6 @@ const REASONING_EFFORT_LABELS: Record<string, string> = {
   max: "最大",
   ultra: "超高",
 };
-const SUBAGENT_ACCESS_LABELS = {
-  readOnly: "只读",
-  write: "可写",
-} as const;
 const DEFAULT_SUBAGENT_TASK = {
   id: "default",
   name: "默认子代理",
@@ -66,50 +64,45 @@ const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
     name: "快速定位",
-    access: "readOnly",
+    kind: "analysis",
     icon: IconFocus2,
-    description: "默认只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
+    description: "用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
   },
   {
     id: "codey_deep_research",
     name: "深度检索",
-    access: "readOnly",
+    kind: "analysis",
     icon: IconWorldSearch,
-    description: "默认只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
+    description: "用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
   },
   {
     id: "codey_visual_analysis",
-    name: "视觉分析",
-    access: "readOnly",
+    name: "界面核验",
+    kind: "analysis",
     icon: IconPhotoSearch,
-    description: "默认只读；仅用于必须读取截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
+    description: "用于截图、页面、GUI、PDF 的视觉证据观察，以及前端改动的独立核验。",
   },
   {
     id: "codey_worker",
-    name: "代码实施",
-    access: "write",
-    icon: IconCode,
-    description: "默认可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
+    name: "逻辑开发",
+    kind: "implementation",
+    icon: IconTerminal2,
+    description: "用于后端、数据、算法、命令行和脚本等不改变可见界面的逻辑实现。",
   },
   {
     id: "codey_visual_worker",
-    name: "视觉实施",
-    access: "write",
+    name: "前端开发",
+    kind: "implementation",
     icon: IconDeviceDesktopCode,
-    description: "默认可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
+    description: "用于界面、布局、样式与交互实现，客户端可截图时附渲染证据。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
   name: string;
-  access: "readOnly" | "write";
+  kind: "analysis" | "implementation";
   icon: typeof IconFocus2;
   description: string;
 }>;
-
-const WRITABLE_SUBAGENT_ROLE_IDS = [
-  "codey_worker",
-  "codey_visual_worker",
-] as const satisfies ReadonlyArray<SubagentRoleId>;
 
 export type SubagentPolicyCardProps = {
   config: Config;
@@ -136,28 +129,16 @@ export function SubagentPolicyCardComponent({
   const enabledRoleCount = SUBAGENT_TASK_TYPES.filter(
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
-  const writableRolesDisabled = WRITABLE_SUBAGENT_ROLE_IDS.every(
-    (role) => config.subagentRoles[role]?.enabled === false,
+  const analysisTasks = SUBAGENT_TASK_TYPES.filter(
+    (task) => task.kind === "analysis",
   );
-  const enabledReadOnlyRoleNames = SUBAGENT_TASK_TYPES.filter(
-    ({ id, access }) =>
-      access === "readOnly" && config.subagentRoles[id]?.enabled !== false,
-  ).map(({ name }) => name);
-  const writableRolesDisabledMessage =
-    enabledReadOnlyRoleNames.length > 0
-      ? `可写子代理已全部关闭；${enabledReadOnlyRoleNames.join("、")}仍可使用。`
-      : "可写子代理已全部关闭；请先启用至少一个只读角色。";
-
-  const readOnlyTasks = SUBAGENT_TASK_TYPES.filter(
-    (task) => task.access === "readOnly",
+  const implementationTasks = SUBAGENT_TASK_TYPES.filter(
+    (task) => task.kind === "implementation",
   );
-  const writeTasks = SUBAGENT_TASK_TYPES.filter(
-    (task) => task.access === "write",
-  );
-  const enabledReadOnlyCount = readOnlyTasks.filter(
+  const enabledAnalysisCount = analysisTasks.filter(
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
-  const enabledWriteCount = writeTasks.filter(
+  const enabledImplementationCount = implementationTasks.filter(
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
 
@@ -345,66 +326,52 @@ export function SubagentPolicyCardComponent({
                     <span className="subagent-group-title">分析角色</span>
                     <div className="subagent-stat-badge subagent-stat-badge--readonly">
                       <span className="subagent-stat-indicator" aria-hidden="true" />
-                      <span>{SUBAGENT_ACCESS_LABELS.readOnly}分析</span>
+                      <span>已启用</span>
                       <strong>
-                        {enabledReadOnlyCount} / {readOnlyTasks.length}
+                        {enabledAnalysisCount} / {analysisTasks.length}
                       </strong>
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责小范围定位、宽范围跨文件检索及视觉证据分析，不产生写入操作
+                    负责定位、跨文件检索及界面核验，可按任务授权调用工具
                   </span>
                 </div>
                 <div className="subagent-group-items">
-                  {readOnlyTasks.map(renderRoleCard)}
+                  {analysisTasks.map(renderRoleCard)}
                 </div>
               </div>
 
               <div className="subagent-group-card codey-card">
                 <div className="subagent-group-header">
                   <div className="subagent-group-title-wrap">
-                    <span className="subagent-group-title">实施角色</span>
+                    <span className="subagent-group-title">开发角色</span>
                     <div className="subagent-stat-badge subagent-stat-badge--write">
                       <span className="subagent-stat-indicator" aria-hidden="true" />
-                      <span>{SUBAGENT_ACCESS_LABELS.write}实施</span>
+                      <span>已启用</span>
                       <strong>
-                        {enabledWriteCount} / {writeTasks.length}
+                        {enabledImplementationCount} / {implementationTasks.length}
                       </strong>
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责代码修改、文件写入与页面渲染验证，受父任务权限约束
+                    负责前端界面与逻辑实现，受父任务权限约束
                   </span>
                 </div>
                 <div className="subagent-group-items">
-                  {writeTasks.map(renderRoleCard)}
+                  {implementationTasks.map(renderRoleCard)}
                 </div>
               </div>
 
-              <div
-                className={`subagent-policy-callout ${
-                  writableRolesDisabled ? "subagent-policy-callout--warning" : ""
-                }`}
-              >
-                {writableRolesDisabled ? (
-                  <IconAlertTriangle
-                    size={16}
-                    className="subagent-callout-icon subagent-callout-icon--warning"
-                    aria-hidden="true"
-                  />
-                ) : (
-                  <IconInfoCircle
-                    size={16}
-                    className="subagent-callout-icon"
-                    aria-hidden="true"
-                  />
-                )}
+              <div className="subagent-policy-callout">
+                <IconInfoCircle
+                  size={16}
+                  className="subagent-callout-icon"
+                  aria-hidden="true"
+                />
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : writableRolesDisabled
-                      ? `${writableRolesDisabledMessage}角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。`
-                      : "可搜索并选择任意可用线路模型；角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。角色权限仍受父任务权限模式约束。"}
+                    : "各角色工具权限一致，按任务分工选择模型。角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；实际操作受父任务权限约束。"}
                 </div>
               </div>
             </>
@@ -445,6 +412,29 @@ type FeaturePolicyCardProps = {
   onRequestRemoveChannel?: (channel: NotificationChannel) => void;
 };
 
+const LAUNCH_PROXY_TOOLTIP_CONTENT = (
+  <div className="space-y-1.5 text-xs text-left leading-relaxed">
+    <div className="font-semibold">Codex 启动代理格式与说明</div>
+    <div>
+      支持协议：<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">http://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">https://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5h://</code>
+    </div>
+    <div>
+      限制说明：认证可用 http://用户名:密码@主机:端口 形式；SOCKS 代理必须指定端口；https:// 表示用 TLS 连接代理本身。
+    </div>
+    <div className="pt-0.5">
+      <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
+      <div className="mt-0.5 space-y-0.5 font-mono text-[11px] opacity-90">
+        <div>http://127.0.0.1:7890</div>
+        <div>http://user:pass@127.0.0.1:7890</div>
+        <div>socks5://127.0.0.1:1080</div>
+      </div>
+    </div>
+    <div className="border-t border-current/15 pt-1 text-[11px] opacity-80">
+      客户端与 app-server 经此代理访问网络，重启 Codex 后生效；本地路由与额度查询不受影响。
+    </div>
+  </div>
+);
+
 function FeaturePolicyCardComponent({
   config,
   fastContextToolsStatus,
@@ -459,20 +449,8 @@ function FeaturePolicyCardComponent({
   onChannelChange,
   onRequestRemoveChannel,
 }: FeaturePolicyCardProps) {
-  const [repairingOverlay, setRepairingOverlay] = useState(false);
-  const [overlayRepairMessage, setOverlayRepairMessage] = useState("");
-  async function repairOverlay() {
-    setRepairingOverlay(true);
-    setOverlayRepairMessage("请松开鼠标，等待浮窗恢复完成。");
-    try {
-      const result = await invoke<{ message: string }>("repair_codex_overlays");
-      setOverlayRepairMessage(result.message);
-    } catch (error) {
-      setOverlayRepairMessage(errorText(error));
-    } finally {
-      setRepairingOverlay(false);
-    }
-  }
+  const launchProxy = config.codexLaunchProxy ?? "";
+  const launchProxyError = validateCodexLaunchProxy(launchProxy);
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
   );
@@ -508,6 +486,80 @@ function FeaturePolicyCardComponent({
 
   return (
     <>
+      <section className="secondary-section launch-proxy-section" aria-labelledby="launch-proxy-title">
+        <div className="feature-policy-heading">
+          <div className="flex items-center gap-2">
+            <span className="section-title-icon" aria-hidden="true">
+              <IconNetwork size={14} />
+            </span>
+            <h3 id="launch-proxy-title" className="settings-section-heading">Codex 启动代理</h3>
+            <Tooltip content={LAUNCH_PROXY_TOOLTIP_CONTENT} position="top">
+              <span
+                className="inline-flex shrink-0 cursor-help items-center text-[var(--codey-muted,#6e6e73)] transition-colors hover:text-[var(--codey-text,#1d1d1f)]"
+                aria-label="Codex 启动代理格式与说明"
+              >
+                <IconHelpCircle size={14} aria-hidden="true" />
+              </span>
+            </Tooltip>
+          </div>
+          <p>客户端与 app-server 经此代理访问网络，重启 Codex 后生效；本地路由与额度查询不受影响。</p>
+        </div>
+        <div className={`feature-card launch-proxy-card ${launchProxy.trim() ? "active" : ""}`}>
+          <div className="feature-card-body">
+            <Input
+              id="codex-launch-proxy-input"
+              aria-label="Codex 启动代理"
+              aria-invalid={Boolean(launchProxyError)}
+              aria-describedby={
+                launchProxyError
+                  ? "codex-launch-proxy-error"
+                  : "codex-launch-proxy-description"
+              }
+              value={launchProxy}
+              disabled={isBusy}
+              placeholder="例如 http://127.0.0.1:7890"
+              rightSection={
+                launchProxy ? (
+                  <button
+                    type="button"
+                    className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-full text-[var(--codey-muted,#8e8e93)] hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 hover:text-[var(--codey-text,#1d1d1f)] transition-colors"
+                    onClick={() =>
+                      onConfigChange({
+                        ...config,
+                        codexLaunchProxy: "",
+                      })
+                    }
+                    aria-label="清空代理设置"
+                    title="清空代理设置"
+                  >
+                    <IconX size={12} aria-hidden="true" />
+                  </button>
+                ) : undefined
+              }
+              onChange={(event) =>
+                onConfigChange({
+                  ...config,
+                  codexLaunchProxy: event.target.value,
+                })
+              }
+            />
+            {launchProxyError ? (
+              <small
+                id="codex-launch-proxy-error"
+                className="text-[var(--codey-red,#d70015)]"
+                role="alert"
+              >
+                {launchProxyError}
+              </small>
+            ) : (
+              <small id="codex-launch-proxy-description">
+                留空不走代理
+              </small>
+            )}
+          </div>
+        </div>
+      </section>
+
       <section className="secondary-section" aria-labelledby="runtime-title">
         <div className="feature-policy-heading">
           <div className="flex items-center gap-2">
@@ -593,26 +645,6 @@ function FeaturePolicyCardComponent({
                 </small>
               </div>
             </div>
-
-            {isWindowsClient && (
-              <div className="feature-card">
-                <div className="feature-card-header">
-                  <strong>浮窗点击与拖动恢复</strong>
-                  <Button
-                    className="feature-action-btn"
-                    size="xs"
-                    disabled={isBusy || repairingOverlay}
-                    onClick={() => void repairOverlay()}
-                  >
-                    {repairingOverlay ? "正在恢复…" : "立即恢复"}
-                  </Button>
-                </div>
-                <div className="feature-card-body">
-                  <small>适用于 Windows 商店版。只保留需要恢复的一个宠物或语音浮窗；恢复时请松开鼠标，浮窗可能短暂闪烁。</small>
-                  <small role="status">{overlayRepairMessage}</small>
-                </div>
-              </div>
-            )}
 
             <div
               className={`feature-card ${fastContextToolsEnabled ? "active" : ""}`}

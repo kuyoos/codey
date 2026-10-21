@@ -486,7 +486,11 @@ async fn pending_websocket_requests_keep_order_and_release_budget() {
         assert!(budget.available_permits() < original_budget);
         for expected in ["first", "second"] {
             assert_eq!(
-                downstream.next_message().await.unwrap(),
+                downstream
+                    .next_message()
+                    .await
+                    .unwrap()
+                    .map(|message| message.message),
                 Some(WebSocketMessage::Text(expected.into()))
             );
         }
@@ -567,9 +571,8 @@ async fn pending_websocket_requests_are_bounded_by_count_and_shared_budget() {
         assert!(result.is_err());
         assert_eq!(
             downstream.pending_messages.len(),
-            if permits == 0 { 1 } else { 8 }
+            if permits == 0 { 0 } else { 8 }
         );
-        assert_eq!(downstream.pending_budget_blocked, permits == 0);
         downstream.pending_messages.clear();
         assert_eq!(budget.available_permits(), permits);
     }

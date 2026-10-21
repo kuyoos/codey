@@ -353,6 +353,8 @@ where
             }
         }
         lifecycle.apply_api_key(headers)?;
+        await_upstream(downstream, lifecycle.mint_turn_state(client)).await??;
+        lifecycle.apply_turn_state(headers)?;
         if let Some(probe) = downstream.request_log_probe() {
             probe.set_upstream_request_headers(&format_upstream_headers(headers));
         }
@@ -496,6 +498,24 @@ impl<D: ResponsesDownstream + ?Sized> LifecycleDownstream<'_, D> {
 
 #[async_trait]
 impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstream<'_, D> {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.inner.wait_for_admission(future).await
+    }
+    async fn write_admission_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        self.inner
+            .write_admission_error(status, code, message, route)
+            .await
+    }
     async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
     where
         T: Send,
@@ -610,6 +630,8 @@ mod tests {
             account_id: "local-account".into(),
             email: Some("member@example.com".into()),
             path: PathBuf::from("/unused/auth.json"),
+            record_path: PathBuf::from("/unused/local-account.json"),
+            siwc_path: None,
             accepts_incoming_authorization: false,
         });
         // 非官方线路即使意外携带账号元数据，也不能将邮箱交给插件。

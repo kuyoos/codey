@@ -59,9 +59,24 @@ fn failed_reconciliation_forces_a_restart_but_superseded_work_does_not() {
     assert!(failed.requires_restart());
     assert_eq!(failed.health(), "restart_required");
 
+    let pending = SubagentHotReloadOutcome::pending_restart("role registration changed");
+    assert!(pending.requires_restart());
+    assert_eq!(pending.health(), "pending_restart");
+    assert_eq!(pending.error(), Some("role registration changed"));
+
     let superseded = SubagentHotReloadOutcome::superseded("newer save won");
     assert!(!superseded.requires_restart());
     assert_eq!(superseded.health(), "superseded");
+}
+
+#[test]
+fn role_registration_changes_are_pending_restart_without_claiming_application() {
+    let outcome = SubagentHotReloadOutcome::pending_restart("roles changed");
+    assert!(outcome.requires_restart());
+    assert!(!outcome.reloaded());
+    assert!(!outcome.repaired());
+    assert_eq!(outcome.health(), "pending_restart");
+    assert_eq!(outcome.error(), Some("roles changed"));
 }
 
 #[tokio::test]

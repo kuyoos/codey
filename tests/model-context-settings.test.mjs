@@ -16,6 +16,7 @@ const modelState = {
 
 function officialPicker(localRouterEnabled = true) {
   const calls = [];
+  const notices = [];
   const config = {
     activeProfileId: "official",
     localRouterEnabled,
@@ -35,14 +36,14 @@ function officialPicker(localRouterEnabled = true) {
   const options = {
     config, currentProvider: null, officialAccountAvailable: true,
     runOperation: async (_name, action) => action(),
-    setPersistedConfig: () => {}, setStatus: () => {}, setNotice: () => {},
+    applyConfigResult: () => true, setNotice: notice => notices.push(notice),
   };
   const render = () => {
     graph.restart();
     return graph.exports.useModelSelection(options);
   };
   render().openModelPicker(modelState, "", "official");
-  return { render, calls, config };
+  return { render, calls, config, options, notices };
 }
 
 test("官方模型选择器提交预算，并过滤不属于该线路的模型", async () => {
@@ -70,23 +71,41 @@ test("官方模型恢复默认提交空预算，原生模式省略预算变更",
   assert.equal(Object.hasOwn(native.calls[0].args, "reasoningEfforts"), false);
 });
 
-test("上下文输入仅接受完整整数，非法输入不能改变预算", () => {
+test("模型保存结果过期时保留当前编辑器，不更新模型或提示", async () => {
+  const { render, options, notices } = officialPicker();
+  const accepted = [];
+  options.applyConfigResult = result => { accepted.push(result); return false; };
+  const before = render().modelState;
+  await render().saveModelSelection();
+  assert.equal(accepted.length, 1);
+  assert.equal(render().modelState, before);
+  assert.equal(render().modelPickerVisible, true);
+  assert.deepEqual(notices, []);
+});
+
+test("上下文输入以 K 为单位，非法输入不能改变预算", () => {
   const calls = [];
   const graph = createModuleGraph(new URL("../src/components/ModelContextWindowCombobox.tsx", import.meta.url), {
     stubs: { "@heroui/react": autoStubModule("heroui") },
   });
-  const props = elementProps(graph.exports.ModelContextWindowCombobox({
+  const tree = graph.exports.ModelContextWindowCombobox({
     value: 128_000, onChange: (value) => calls.push(value),
-  }));
-  for (const value of ["-128000", "128000.5", "abc", "128000abc", "12,34", "1e6", "10000001"]) {
+  });
+  const props = elementProps(tree);
+  const inputProps = elementProps(collectElements(tree, (node) =>
+    elementProps(node)?.placeholder === "256",
+  )[0]);
+  assert.equal(inputProps.inputMode, "decimal");
+  for (const value of ["-128", "128.0005", "abc", "128abc", "12,34", "1e3", "10001"]) {
     props.onInputChange(value);
   }
   assert.deepEqual(calls, []);
-  props.onInputChange("256000");
-  props.onInputChange(" 128,000 ");
+  props.onInputChange("256");
+  props.onInputChange("128.5");
+  props.onInputChange(" 1,000 ");
   props.onInputChange("");
   props.onSelectionChange("1000000");
-  assert.deepEqual(calls, [256_000, 128_000, undefined, 1_000_000]);
+  assert.deepEqual(calls, [256_000, 128_500, 1_000_000, undefined, 1_000_000]);
 });
 
 test("阈值和输出预留要求明确窗口，不能隐式创建固定窗口", () => {
@@ -102,25 +121,25 @@ test("阈值和输出预留要求明确窗口，不能隐式创建固定窗口",
     model, disabled: false, policy: currentPolicy, onChange: (value) => calls.push(value),
   });
   const input = (tree, label) => elementProps(collectElements(tree, (node) =>
-    elementProps(node)?.["aria-label"] === `${model} ${label} Token`,
+    elementProps(node)?.ariaLabel === `${model} ${label} K Token`,
   )[0]);
   for (const label of ["压缩阈值", "输出预留"]) {
     const field = input(render(undefined), label);
     assert.equal(field.disabled, true);
-    field.onChange({ target: { value: "16000" } });
+    field.onChange(16_000);
   }
   assert.deepEqual(calls, []);
   const explicit = { contextWindowTokens: 272_000 };
   const threshold = input(render(explicit), "压缩阈值");
   assert.equal(threshold.disabled, false);
-  threshold.onChange({ target: { value: "220000" } });
-  input(render(explicit), "输出预留").onChange({ target: { value: "16000" } });
+  threshold.onChange(220_000);
+  input(render(explicit), "输出预留").onChange(500);
   assert.deepEqual(calls, [
     { ...explicit, autoCompactTokenLimit: 220_000 },
-    { ...explicit, reserveOutputTokens: 16_000 },
+    { ...explicit, reserveOutputTokens: 500 },
   ]);
   const window = elementProps(collectElements(render(undefined), (node) =>
-    elementProps(node)?.ariaLabel === `${model} 窗口 Token`,
+    elementProps(node)?.ariaLabel === `${model} 窗口 K Token`,
   )[0]);
   assert.equal(window.placeholder, "跟随模型目录");
   window.onChange(1_000_000);
@@ -128,4 +147,29 @@ test("阈值和输出预留要求明确窗口，不能隐式创建固定窗口",
   window.onChange(undefined);
   assert.equal(calls.at(-1), undefined);
   assert.equal(input(render(undefined), "压缩阈值").disabled, true);
+});
+
+test("阈值与输出预留输入以 K 为单位并校验范围", () => {
+  const graph = createModuleGraph(new URL("../src/components/ModelSettingsFields.tsx", import.meta.url), {
+    stubs: {
+      "@heroui/react": autoStubModule("heroui"),
+      "@tabler/icons-react": autoStubModule("icons"),
+      "./ui": autoStubModule("ui"),
+    },
+  });
+  const calls = [];
+  const input = elementProps(graph.exports.TokenKInput({
+    ariaLabel: "压缩阈值 K Token", disabled: false, maxTokens: 10_000_000,
+    minTokens: 1, placeholder: "自动", value: 16_000,
+    onChange: (tokens) => calls.push(tokens),
+  }));
+  assert.equal(input.inputMode, "decimal");
+  input.onChange({ target: { value: "220" } });
+  input.onChange({ target: { value: "0.5" } });
+  input.onChange({ target: { value: "" } });
+  assert.deepEqual(calls, [220_000, 500, undefined]);
+  for (const value of ["abc", "12.3456", "-3", "10001"]) {
+    input.onChange({ target: { value } });
+  }
+  assert.deepEqual(calls, [220_000, 500, undefined]);
 });

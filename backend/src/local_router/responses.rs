@@ -1,25 +1,18 @@
 use super::*;
 
 impl RouterServer {
-    pub(crate) async fn handle_connection(
-        &self,
-        mut stream: TcpStream,
-        connection_permit: OwnedSemaphorePermit,
-    ) -> Result<()> {
+    pub(crate) async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         // 协议探测和读取请求头共用这一次超时。慢客户端不能先占满探测窗口，
         // 再单独占满读头窗口。
         let header_started = Instant::now();
         match probe_responses_websocket(&stream).await? {
             ResponsesWebSocketProbe::Upgrade => {
-                return self
-                    .handle_responses_websocket(stream, connection_permit)
-                    .await;
+                return self.handle_responses_websocket(stream).await;
             }
             ResponsesWebSocketProbe::Http => {}
             ResponsesWebSocketProbe::Silent => {
                 // 空闲或半开连接不会发出请求，和普通 HTTP 路径的读取超时一样
                 // 回一个 408 即可；对端可能已经断开，这里只做尽力回复。
-                let _connection_permit = connection_permit;
                 let _ = write_error_response(
                     &mut stream,
                     408,
@@ -31,7 +24,6 @@ impl RouterServer {
                 return Ok(());
             }
         }
-        let _connection_permit = connection_permit;
         let header_budget = REQUEST_READ_TIMEOUT.saturating_sub(header_started.elapsed());
         let pending =
             match tokio::time::timeout(header_budget, read_http_request_head(&mut stream)).await {
@@ -141,6 +133,10 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
+        if pending.request.method == "GET" && pending.request.path == REQUEST_LOG_ICON_PATH {
+            write_static_response(&mut stream, "image/png", REQUEST_LOG_ICON).await?;
+            return Ok(());
+        }
         if !self.authorized(&pending.request) {
             self.record_rejected_request(
                 &pending.request,
@@ -166,6 +162,9 @@ impl RouterServer {
         };
         let route_path = request.path.as_str();
         match (request.method.as_str(), route_path) {
+            ("GET", "/codey/concurrency") => {
+                write_json_response(&mut stream, 200, &self.official_concurrency.status()).await?;
+            }
             ("GET", "/v1/models") | ("GET", "/models") => {
                 let snapshot = Arc::clone(
                     &self
@@ -260,9 +259,8 @@ impl RouterServer {
                 };
                 write_json_response(&mut stream, 200, &value).await?;
             }
-            // 系统浏览器里的请求日志页只能经由本地路由访问后端；账号筛选、账号名
-            // 显示和按账号推算额度都依赖同一份账号目录。这里只读取账号文档，不再
-            // 同步 Codex 登录，避免浏览器的只读页面改动登录状态。
+            // 系统浏览器里的请求日志页通过本地路由获取账号目录，用于账号筛选和
+            // 账号名显示。这里只读取账号文档，避免只读页面同步 Codex 登录状态。
             ("POST", "/codey/api/list_official_accounts") => {
                 let store = crate::official_accounts::OfficialAccountStore::for_config_path(
                     &crate::config::default_config_path(),
@@ -301,50 +299,6 @@ impl RouterServer {
                     .request_log_catalog
                     .clone();
                 write_json_response(&mut stream, 200, &json!({"config": catalog})).await?;
-            }
-            ("POST", "/codey/api/query_route_request_log_quota_usage") => {
-                let query = match serde_json::from_slice::<
-                    crate::route_request_log::RouteRequestLogQuotaQuery,
-                >(&request.body)
-                {
-                    Ok(query) => query,
-                    Err(error) => {
-                        write_error_response(
-                            &mut stream,
-                            400,
-                            "invalid_request_log_query",
-                            format!("额度用量查询参数无效：{error}"),
-                            None,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-                let backend = self
-                    .snapshot
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .request_log_backend;
-                let root = self.request_log.root().to_path_buf();
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::route_request_log::query_route_request_log_quota_usage(
-                        &root, backend, query,
-                    )
-                })
-                .await;
-                let message = match result {
-                    Ok(Ok(usage)) => {
-                        let mut value = serde_json::to_value(usage)?;
-                        value["recordingHealth"] =
-                            serde_json::to_value(self.request_log.health().await)?;
-                        write_json_response(&mut stream, 200, &value).await?;
-                        return Ok(());
-                    }
-                    Ok(Err(error)) => format!("查询额度用量失败：{error:#}"),
-                    Err(error) => format!("额度用量查询任务异常退出：{error}"),
-                };
-                write_error_response(&mut stream, 500, "request_log_query_failed", message, None)
-                    .await?;
             }
             ("POST", "/codey/api/query_route_request_log_models") => {
                 let query = match serde_json::from_slice::<
@@ -713,6 +667,18 @@ impl RouterServer {
         if editing {
             upstream_url = format!("{}/edits", upstream_url.trim_end_matches("/generations"));
         }
+        let mut admission_downstream = HttpResponsesDownstream::new(stream);
+        let admission = {
+            let mut observed =
+                ObservedResponsesDownstream::new(&mut admission_downstream, probe.clone());
+            self.admit_official(&route, &mut observed).await
+        };
+        stream = admission_downstream.stream;
+        let _official_permit = match admission {
+            Ok(permit) => permit,
+            Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let headers = match self
             .prepare_upstream_request_headers(&request, &route)
             .await
@@ -939,38 +905,79 @@ impl RouterServer {
                 .map_err(|message| (401, "plugin_account_unavailable", message));
         }
         if route.official_account {
-            let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
-                Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
-                None => (self.official_auth_path.as_path(), true),
-            };
-            let official_auth = resolve_official_upstream_auth(
-                request,
-                &self.bearer_token,
-                auth_path,
-                &self.official_auth_cache,
-                accepts_incoming_authorization,
-            )
-            .await
-            .ok_or_else(|| {
-                (
-                    401,
-                    "openai_auth_missing",
-                    "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+            if let Some(auth) = route.official_auth.as_ref() {
+                validate_managed_official_account(auth)
+                    .await
+                    .map_err(|error| (401, "official_account_unavailable", format!("{error:#}")))?;
+            }
+            if let Some((siwc_path, account_id)) = route.official_auth.as_ref().and_then(|auth| {
+                auth.siwc_path
+                    .as_deref()
+                    .zip(Some(auth.account_id.as_str()))
+            }) {
+                // SIWC 直连平面：令牌来自账号的 SIWC 槽位，不接受下游自带的
+                // Codex 令牌；backend-api 专属头一律剥掉。
+                let siwc_auth = resolve_siwc_upstream_auth(
+                    siwc_path,
+                    account_id,
+                    &self.siwc_auth_cache,
+                    &self.client,
+                    &self.proxied_clients,
                 )
-            })?;
-            let value = HeaderValue::from_str(&official_auth.authorization).map_err(|_| {
-                (
-                    401,
-                    "openai_auth_invalid",
-                    "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
-                )
-            })?;
-            headers.insert(AUTHORIZATION, value);
-            headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
-            if let Some(account_id) = official_auth.account_id.as_deref()
-                && let Ok(value) = HeaderValue::from_str(account_id)
-            {
-                headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+                .await
+                .map_err(|error| (401, "siwc_auth_unavailable", format!("{error:#}")))?;
+                let value = HeaderValue::from_str(&siwc_auth.authorization).map_err(|_| {
+                    (
+                        401,
+                        "siwc_auth_invalid",
+                        "官方直连凭据无效，请在账号卡片重新授权".to_string(),
+                    )
+                })?;
+                headers.insert(AUTHORIZATION, value);
+                strip_siwc_forbidden_headers(&mut headers);
+            } else {
+                let official_auth = match &route.official_auth {
+                    Some(auth) => {
+                        resolve_managed_official_upstream_auth(
+                            request,
+                            &self.bearer_token,
+                            auth,
+                            &self.official_auth_cache,
+                        )
+                        .await
+                    }
+                    None => {
+                        resolve_official_upstream_auth(
+                            request,
+                            &self.bearer_token,
+                            &self.official_auth_path,
+                            &self.official_auth_cache,
+                            true,
+                        )
+                        .await
+                    }
+                };
+                let official_auth = official_auth.ok_or_else(|| {
+                    (
+                        401,
+                        "openai_auth_missing",
+                        "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+                    )
+                })?;
+                let value = HeaderValue::from_str(&official_auth.authorization).map_err(|_| {
+                    (
+                        401,
+                        "openai_auth_invalid",
+                        "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
+                    )
+                })?;
+                headers.insert(AUTHORIZATION, value);
+                headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
+                if let Some(account_id) = official_auth.account_id.as_deref()
+                    && let Ok(value) = HeaderValue::from_str(account_id)
+                {
+                    headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+                }
             }
         }
         Ok(headers)
@@ -988,30 +995,18 @@ impl RouterServer {
     // Tungstenite's handshake callback fixes the error type to an HTTP
     // response value; its size is imposed by the external Callback contract.
     #[allow(clippy::result_large_err)]
-    pub(crate) async fn handle_responses_websocket(
-        &self,
-        stream: TcpStream,
-        connection_permit: OwnedSemaphorePermit,
-    ) -> Result<()> {
-        // 握手完成前一直占着并发名额。空闲等待在循环里释放，避免预连接和
-        // 已结束的回合把名额占满；下一条需要转发的消息会重新获取。
-        let mut connection_permit = Some(connection_permit);
+    pub(crate) async fn handle_responses_websocket(&self, stream: TcpStream) -> Result<()> {
+        // 连接总预算覆盖握手与空闲阶段，生成执行预算在每轮选路后获取。
         let handshake_context = Arc::new(Mutex::new(None));
         let captured_context = Arc::clone(&handshake_context);
         let token = self.token.clone();
         let bearer_token = self.bearer_token.clone();
         let request_id = current_router_request_id();
-        let websocket_config = WebSocketConfig::default()
-            // Responses events are latency-sensitive and already framed. Do
-            // not wait for tungstenite's default 128 KiB write threshold.
-            .write_buffer_size(0)
-            .max_write_buffer_size(MAX_UPSTREAM_RESPONSE_BYTES)
-            .max_message_size(Some(MAX_REQUEST_BYTES))
-            .max_frame_size(Some(MAX_REQUEST_BYTES));
+        let websocket_config = downstream_websocket_config();
         let socket = tokio::time::timeout(
             REQUEST_READ_TIMEOUT,
             accept_hdr_async_with_config(
-                stream,
+                WebSocketIngress::new(stream, Arc::clone(&self.request_body_budget)),
                 move |request: &WebSocketRequest, mut response: WebSocketResponse| {
                     if !RESPONSES_WEBSOCKET_PATHS.contains(&request.uri().path()) {
                         return Err(websocket_handshake_error(
@@ -1054,7 +1049,7 @@ impl RouterServer {
             .take()
             .context("Codey Responses WebSocket 缺少握手上下文")?;
         let mut downstream = WebSocketResponsesDownstream::with_shared_backoffs(
-            socket,
+            BudgetedWebSocket::new(socket),
             Arc::clone(&self.websocket_backoffs),
             Arc::clone(&self.request_body_budget),
             Arc::clone(&self.idle_downstreams),
@@ -1065,63 +1060,26 @@ impl RouterServer {
         );
 
         loop {
-            drop(connection_permit.take());
             let Some(message) = downstream.next_message().await? else {
                 break;
             };
-            if matches!(message, WebSocketMessage::Text(_)) {
-                match acquire_connection_permit_within(
-                    &self.connection_limit,
-                    REQUEST_BODY_BUDGET_WAIT,
-                )
-                .await
-                {
-                    Ok(permit) => connection_permit = Some(permit),
-                    Err(ConnectionPermitError::Busy) => {
-                        downstream
-                            .write_error(
-                                503,
-                                "router_busy",
-                                "Codey 本地路由当前请求过多，请稍后重试".to_string(),
-                                None,
-                            )
-                            .await?;
-                        continue;
-                    }
-                    Err(ConnectionPermitError::Closed) => {
-                        anyhow::bail!("等待本地路由连接名额失败");
-                    }
-                }
+            if downstream.handle_steering_message(&message).await? {
+                downstream.write_steering_notifications().await?;
+                continue;
             }
+            if downstream.handle_idle_response_interrupt(&message)? {
+                continue;
+            }
+            let BudgetedWebSocketMessage {
+                message,
+                parsed_body,
+                permit: body_budget_permit,
+            } = message;
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
-                    let body_budget_permit = match acquire_request_body_budget_within(
-                        &self.request_body_budget,
-                        text.len(),
-                        REQUEST_BODY_BUDGET_WAIT,
-                    )
-                    .await
+                    let mut body = match parsed_body.expect("admitted text must have a JSON result")
                     {
-                        Ok(permit) => permit,
-                        Err(error)
-                            if error
-                                .downcast_ref::<RequestBodyBudgetUnavailable>()
-                                .is_some() =>
-                        {
-                            downstream
-                                .write_error(
-                                    503,
-                                    "router_memory_busy",
-                                    "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
-                                    None,
-                                )
-                                .await?;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let mut body = match serde_json::from_str::<Value>(text.as_str()) {
                         Ok(Value::Object(body)) => Value::Object(body),
                         Ok(_) => {
                             downstream
@@ -1148,16 +1106,31 @@ impl RouterServer {
                     };
                     let request_body_bytes = Some(text.len() as u64);
                     drop(text);
-                    let message_type = body
-                        .as_object_mut()
-                        .and_then(|body| body.remove("type"))
-                        .and_then(|value| value.as_str().map(str::to_string));
-                    if message_type.as_deref() != Some("response.create") {
+                    let message_type = body.as_object_mut().and_then(|body| body.remove("type"));
+                    if message_type.as_ref().and_then(Value::as_str) != Some("response.create") {
+                        // 仅显示有界的协议标识，不把任意字段内容写入错误信息。
+                        let received = match message_type.as_ref() {
+                            None => "缺少 type 字段".to_string(),
+                            Some(Value::String(value))
+                                if !value.is_empty()
+                                    && value.len() <= 64
+                                    && value.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric()
+                                            || matches!(byte, b'.' | b'_' | b'-')
+                                    }) =>
+                            {
+                                format!("收到事件类型 {value}")
+                            }
+                            Some(Value::String(_)) => "type 不是有效的事件标识".to_string(),
+                            Some(_) => "type 字段必须为字符串".to_string(),
+                        };
                         downstream
                             .write_error(
                                 400,
                                 "unsupported_websocket_message",
-                                "Codey Responses WebSocket 仅支持 response.create".to_string(),
+                                format!(
+                                    "Codey Responses WebSocket 支持 response.create、response.steer 和 response.interrupt；{received}"
+                                ),
                                 None,
                             )
                             .await?;
@@ -1211,6 +1184,34 @@ impl RouterServer {
                         // fallback and never forwards either field over WS.
                         body.remove("stream");
                         body.remove("background");
+                    }
+                    match downstream
+                        .steering
+                        .begin_request(&mut body, &self.request_body_budget)
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                downstream.write_steering_event(&event).await?;
+                            }
+                        }
+                        Err(error) => {
+                            // 这次 create 校验失败，不改变仍在等待工具结果的原响应。
+                            let mut event = ResponsesFailure::new(
+                                400,
+                                "steering_required_input",
+                                error.to_string(),
+                                None,
+                            )
+                            .normalized_event();
+                            downstream.steering.sequence_response_event(&mut event);
+                            downstream
+                                .write_text(encode_responses_websocket_event(
+                                    &event,
+                                    stream_id.as_deref(),
+                                )?)
+                                .await?;
+                            continue;
+                        }
                     }
                     downstream.set_stream_id(stream_id);
                     let request = HttpRequest {
@@ -1272,6 +1273,7 @@ impl RouterServer {
                                 .await?;
                         }
                     }
+                    downstream.write_steering_notifications().await?;
                 }
                 WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
                 WebSocketMessage::Pong(_) => {}
@@ -1580,6 +1582,20 @@ impl RouterServer {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let mut portable_attempt =
+            match PortableAttempt::acquire(self, &request, compacting, &snapshot) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            409,
+                            "portable_compaction_unavailable",
+                            error.to_string(),
+                            None,
+                        )
+                        .await;
+                }
+            };
         let model_was_defaulted = requested_model.is_empty();
         let model = if model_was_defaulted {
             snapshot.default_model.trim().to_string()
@@ -1628,8 +1644,18 @@ impl RouterServer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let bound_route = bindings.route_for_keys(&binding_keys);
-            let resolved =
-                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref());
+            let resolved = if let Some(attempt) = &portable_attempt {
+                Ok(RouteSelection {
+                    provider_id: attempt.source.provider_id.clone(),
+                    protocol: attempt.source.protocol,
+                    requested_model: model.clone(),
+                    route: Arc::clone(&attempt.source),
+                    upstream_model: attempt.model.clone(),
+                    fallback_reason: None,
+                })
+            } else {
+                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref())
+            };
             (resolved, bound_route)
         };
         let resolved = match resolved {
@@ -1643,7 +1669,17 @@ impl RouterServer {
         };
         let route_changed = previous_route
             .as_deref()
-            .is_some_and(|provider_id| provider_id != resolved.provider_id);
+            .is_some_and(|provider_id| provider_id != resolved.provider_id)
+            || self
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .routes
+                .get(binding_keys.first().map(String::as_str).unwrap_or_default())
+                .is_some_and(|binding| {
+                    !binding.upstream_model.is_empty()
+                        && binding.context_config != Some(resolved.route.context_config)
+                });
         if model != resolved.upstream_model {
             body.as_object_mut()
                 .expect("validated Responses body must remain an object")
@@ -1653,7 +1689,30 @@ impl RouterServer {
                 );
             body_mutated = true;
         }
+        let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
+        // 原生 Responses 上游可能为模型保留 `collaboration` 命名空间并逐字校验 schema，
+        // 先改到空闲的普通命名空间，归一化和摘标记才不会再动到保留 schema；
+        // 回包由 COLLABORATION_ALIAS 还原。
+        let collaboration_alias = (bridge == ProtocolBridge::NativeResponses)
+            .then(|| alias_reserved_collaboration_namespace(&mut body))
+            .flatten();
+        if collaboration_alias.is_some() {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        // 没能改名的请求里 `collaboration` 仍是保留名，其内部 schema 必须逐字保留。
+        let collaboration_reserved = bridge == ProtocolBridge::NativeResponses
+            && body_has_reserved_collaboration_namespace(&body);
         if !resolved.route.official_account && normalize_responses_tool_parameter_roots(&mut body) {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        // 官方上游看到协作工具的加密标记就会把任务正文换成只有它能解开的令牌，
+        // 第三方子代理线路没有该密钥。摘掉标记让正文以明文返回，跨线路派发才能送达。
+        if strip_collaboration_message_encryption(
+            &mut body,
+            resolved.route.official_account || collaboration_reserved,
+        ) {
             body_mutated = true;
             encoded_body = None;
         }
@@ -1674,39 +1733,6 @@ impl RouterServer {
                 probe.mark_fallback(reason);
             }
         }
-        let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
-        if compacting && !resolved.route.supports_remote_compaction {
-            return downstream
-                .write_error(
-                    400,
-                    "compaction_unsupported",
-                    "当前线路未启用原生远程压缩，请使用 Codex 本地摘要".into(),
-                    Some(&resolved.route),
-                )
-                .await;
-        }
-        if bridge != ProtocolBridge::NativeResponses {
-            if compacting {
-                return downstream
-                    .write_error(
-                        400,
-                        "compaction_unsupported",
-                        "当前线路不支持原生远程压缩，请使用 Codex 本地摘要".into(),
-                        Some(&resolved.route),
-                    )
-                    .await;
-            }
-            if let Err(error) = validate_portable_context(&body) {
-                return downstream
-                    .write_error(
-                        400,
-                        "context_not_portable",
-                        error.to_string(),
-                        Some(&resolved.route),
-                    )
-                    .await;
-            }
-        }
         if let Some(probe) = downstream.request_log_probe() {
             probe.resolve_route(
                 &resolved.provider_id,
@@ -1723,6 +1749,62 @@ impl RouterServer {
                 bridge.label(),
                 subagent_request,
             );
+        }
+        let native_compaction = compacting
+            && portable_attempt.is_none()
+            && resolved.route.supports_remote_compaction
+            && bridge == ProtocolBridge::NativeResponses;
+        match restore_codey_compaction_summaries(&mut body) {
+            Ok(true) => {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return downstream
+                    .write_error(
+                        400,
+                        "context_not_portable",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+        }
+        if compacting && !native_compaction {
+            let metadata =
+                crate::model_catalog::runtime_context_metadata(crate::codex_config::codex_home());
+            let model_metadata = gateway_compaction_model_metadata(
+                &metadata,
+                &resolved.provider_id,
+                &resolved.upstream_model,
+            );
+            if let Err(error) = gateway_compaction_output_budget(&body, model_metadata)
+                .and_then(|budget| prepare_gateway_compaction(&mut body, budget))
+            {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_responses_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+        }
+        if bridge != ProtocolBridge::NativeResponses
+            && let Err(error) = validate_portable_context(&body)
+        {
+            return downstream
+                .write_error(
+                    400,
+                    "context_not_portable",
+                    error.to_string(),
+                    Some(&resolved.route),
+                )
+                .await;
         }
         downstream.select_route(&resolved.route);
         if bridge != ProtocolBridge::NativeResponses
@@ -1758,6 +1840,31 @@ impl RouterServer {
             // Expansion changed the input too; do not reuse its original raw
             // JSON slice, which would contain only the latest delta.
             encoded_body = None;
+            // 展开恢复的历史里仍带着 Codex 侧的 `collaboration` 调用与工具声明，
+            // 与请求初次改名后的命名空间保持一致。
+            if collaboration_alias
+                .as_ref()
+                .is_some_and(|alias| alias.alias_history(&mut body))
+            {
+                encoded_body = None;
+            }
+        }
+        match restore_codey_compaction_summaries(&mut body) {
+            Ok(true) => {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return downstream
+                    .write_error(
+                        400,
+                        "context_not_portable",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
         }
         if bridge == ProtocolBridge::NativeResponses
             && route_changed
@@ -1772,6 +1879,9 @@ impl RouterServer {
                 )
                 .await;
         }
+        // Only a full, restored request can establish portability. An unresolved
+        // previous_response_id carries history that is absent from this input.
+        let history_portable = portable_compaction::resolved_history_portability(&body);
         let discard_opaque_reasoning = route_changed || restoring_adapted_history;
         if bridge == ProtocolBridge::NativeResponses {
             if normalize_native_responses_context(&mut body, discard_opaque_reasoning) {
@@ -1813,9 +1923,17 @@ impl RouterServer {
                 .insert("stream".to_string(), Value::Bool(true));
             body_mutated = true;
         }
-        let upstream_url = match request_kind {
-            ResponsesRequestKind::Create => &resolved.route.upstream_url,
-            ResponsesRequestKind::Compact => &resolved.route.upstream_compact_url,
+        let compact_endpoint_compat = native_compaction
+            && request_kind == ResponsesRequestKind::Create
+            && !resolved.route.official_account
+            && resolved.route.remote_compaction_protocol
+                == crate::config::RemoteCompactionProtocol::CompactEndpoint;
+        let upstream_url = match (request_kind, compact_endpoint_compat) {
+            (ResponsesRequestKind::Compact, _) if native_compaction => {
+                &resolved.route.upstream_compact_url
+            }
+            (_, true) => &resolved.route.upstream_compact_url,
+            _ => &resolved.route.upstream_url,
         };
         let upstream_url = match upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
@@ -1943,6 +2061,11 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        let _official_permit = match self.admit_official(&resolved.route, downstream).await {
+            Ok(permit) => permit,
+            Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let mut headers = match self
             .prepare_upstream_request_headers(&request, &resolved.route)
             .await
@@ -1972,15 +2095,19 @@ impl RouterServer {
         let auto_review_request =
             model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
                 || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
-        if !auto_review_request {
-            let refresh_session_binding = route_hint.is_some() && !subagent_request;
+        if !auto_review_request && portable_attempt.is_none() {
+            let refresh_session_binding = !subagent_request
+                && incoming_header(&request, "x-codex-parent-thread-id").is_none()
+                && (route_hint.is_some() || incoming_header(&request, "thread-id").is_none());
             self.bindings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remember(
+                .remember_resolved(
                     &binding_keys,
-                    &resolved.provider_id,
+                    &resolved,
                     refresh_session_binding,
+                    native_compaction,
+                    history_portable,
                 );
         }
         let cache_key_deleted = resolved
@@ -2023,7 +2150,7 @@ impl RouterServer {
             && !resolved.route.official_account
             && chat_reasoning_summaries.iter().any(Option::is_some))
         .then_some(chat_reasoning_summaries);
-        let (result, stream_failure) = CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
+        let (result, stream_failure) = COLLABORATION_ALIAS.scope(collaboration_alias.clone(), CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -2052,9 +2179,10 @@ impl RouterServer {
                         discard_opaque_reasoning,
                     )
                     .await?;
-                if websocket_attempt == UpstreamWebSocketAttempt::Completed {
-                    return Ok(());
-                }
+                let fallback_reason = match websocket_attempt {
+                    UpstreamWebSocketAttempt::Completed => return Ok(()),
+                    UpstreamWebSocketAttempt::UseHttp(reason) => reason,
+                };
                 if had_previous_response && responses_previous_response_id(&upstream_body).is_none()
                 {
                     // Reconnection may have expanded history before its handshake failed.
@@ -2064,7 +2192,7 @@ impl RouterServer {
                 if resolved.route.supports_websockets
                     && let Some(probe) = downstream.request_log_probe()
                 {
-                    probe.mark_fallback("websocket_to_http_sse");
+                    probe.mark_fallback(fallback_reason);
                 }
             }
             match downstream.prepare_native_http_fallback(
@@ -2094,9 +2222,46 @@ impl RouterServer {
                         .await;
                 }
             }
+            // `generate` 是 Responses WebSocket 的传输层字段:false 表示预热
+            // 请求,只暂存上下文换取续接用的 response_id,不要求产出内容。
+            // HTTP Responses 不认识该参数,剥掉再发又会把预热变成一次真实
+            // 生成,所以回退 HTTP 时由本地应答空响应;其他取值只剥除字段。
+            // 应答的 response_id 沿用上游形态:已暂存的历史记在这个 id 下,
+            // 客户端续接时由原生历史展开;resp_codey_ 前缀会误触发旧线路
+            // 历史恢复,不能用。
+            match upstream_body
+                .as_object_mut()
+                .and_then(|object| object.remove("generate"))
+            {
+                Some(Value::Bool(false)) => {
+                    let model = upstream_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or(resolved.upstream_model.as_str());
+                    let response = json!({
+                        "id": format!("resp_{}", Uuid::new_v4().simple()),
+                        "object": "response",
+                        "status": "completed",
+                        "model": model,
+                        "output": [],
+                        "usage": {"input_tokens":0,"output_tokens":0,"total_tokens":0},
+                    });
+                    return downstream.write_json(200, &response).await;
+                }
+                Some(_) => {
+                    body_mutated = true;
+                    encoded_body = None;
+                }
+                None => {}
+            }
             // A failed/reconnected WebSocket can restore full history after the
             // first normalization pass. Validate and normalize the exact body
             // that will be sent through the HTTP fallback as well.
+            match restore_codey_compaction_summaries(&mut upstream_body) {
+                Ok(true) => { body_mutated = true; encoded_body = None; }
+                Ok(false) => {}
+                Err(error) => return downstream.write_error(400, "context_not_portable", error.to_string(), Some(&resolved.route)).await,
+            }
             if route_changed && let Err(error) = validate_cross_route_context(&upstream_body) {
                 return downstream
                     .write_error(
@@ -2115,6 +2280,14 @@ impl RouterServer {
                 body_mutated = true;
                 encoded_body = None;
             }
+            // 恢复的历史沿用 Codex 侧的 `collaboration` 调用，与改名后的工具保持一致。
+            if collaboration_alias
+                .as_ref()
+                .is_some_and(|alias| alias.alias_history(&mut upstream_body))
+            {
+                body_mutated = true;
+                encoded_body = None;
+            }
         }
         // 原生请求可能刚被 WebSocket 回退展开，摘要要在这份最终正文上还原。
         // Chat 已在转换前还原；转换后的 messages 里没有 summary，再扫一次没有结果。
@@ -2125,7 +2298,29 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
-        let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
+        if compact_endpoint_compat {
+            if let Err(error) = adapt_compaction_trigger_to_compact(&mut upstream_body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_compaction_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+            headers.insert(
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+            if let Some(probe) = downstream.request_log_probe() {
+                probe.mark_fallback("compaction_compact_endpoint");
+            }
+        }
+        let xai_response_fix = if !compacting
+            && bridge == ProtocolBridge::NativeResponses
             && !resolved.route.official_account
             && native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
         {
@@ -2154,6 +2349,15 @@ impl RouterServer {
         } else {
             None
         };
+        // SIWC 直连只接受公开 Responses 字段：续接状态、采样参数和托管工具
+        // 在这里剥掉。净化改写正文就必须整段重编码，透传字节里残留的字段
+        // 不能再发出去。
+        if resolved.route.uses_siwc()
+            && sanitize_siwc_responses_request(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
         let upstream_stream_requested = upstream_body
             .get("stream")
             .and_then(Value::as_bool)
@@ -2400,6 +2604,14 @@ impl RouterServer {
         }
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {
+            if compacting && !native_compaction {
+                return write_gateway_compaction_http_error(downstream, preloaded_error_body.as_deref().unwrap_or_default(), &resolved.route).await;
+            }
+            observe_siwc_upstream_rejection(
+                &resolved.route,
+                upstream_status,
+                preloaded_error_body.as_deref().unwrap_or_default(),
+            );
             return write_upstream_http_error(
                 downstream,
                 UpstreamHttpErrorResponse {
@@ -2427,6 +2639,10 @@ impl RouterServer {
                 .await
                 {
                     Ok(Ok(body)) => {
+                        if compacting && !native_compaction {
+                            return write_gateway_compaction_http_error(downstream, &body, &resolved.route).await;
+                        }
+                        observe_siwc_upstream_rejection(&resolved.route, upstream_status, &body);
                         write_upstream_http_error(
                             downstream,
                             UpstreamHttpErrorResponse {
@@ -2449,14 +2665,25 @@ impl RouterServer {
                 }
             }
             _ if compacting => {
+                if !native_compaction {
+                    write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
+                        stream_requested, &resolved.route, &tool_bridge, portable_attempt.as_mut()).await
+                } else {
                 write_validated_compaction(
                     downstream,
                     response,
-                    request_kind == ResponsesRequestKind::Create,
+                    if compact_endpoint_compat {
+                        CompactionResponseFormat::CompactToResponses
+                    } else if request_kind == ResponsesRequestKind::Create {
+                        CompactionResponseFormat::Responses
+                    } else {
+                        CompactionResponseFormat::Compact
+                    },
                     stream_requested,
                     &resolved.route,
                 )
                 .await
+                }
             }
             ProtocolBridge::ResponsesToAnthropicMessages
             | ProtocolBridge::ResponsesToChatCompletions => {
@@ -2511,7 +2738,7 @@ impl RouterServer {
         result
         }.await;
         (result, CURRENT_LIFECYCLE_FAILURE.with(|failure| failure.borrow_mut().take()))
-        }).await;
+        })).await;
         if let Some((status, code)) = stream_failure {
             observed.status = Some(status);
             observed.error = Some(code);

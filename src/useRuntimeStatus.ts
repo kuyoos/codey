@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { invoke } from "./api";
 import { withTimeout } from "./appUtils";
-import type { RuntimeStatus } from "./App.types";
+import type { ConfigApplyStatus, RuntimeStatus } from "./App.types";
+import { configApplyPending, reconcileConfigApply } from "./configApply";
 import {
   createStatusPollScheduler,
   createStatusPollTask,
@@ -36,6 +37,8 @@ export function useRuntimeStatus({
 }: UseRuntimeStatusOptions) {
   const [status, setStatus] = useState<RuntimeStatus>({ running: false });
   const [restartStatusError, setRestartStatusError] = useState<string | null>(null);
+  const [configApplyError, setConfigApplyError] = useState<string | null>(null);
+  const configApplyRef = useRef<ConfigApplyStatus | null | undefined>(undefined);
   const runtimeStatusFlightRef = useRef<RuntimeStatusFlight | null>(null);
   const statusPollSchedulerRef = useRef<StatusPollScheduler | null>(null);
   const settingsOpenRefreshRequestedRef = useRef(false);
@@ -67,6 +70,7 @@ export function useRuntimeStatus({
           refreshInjectionStatus: refreshesInjectionStatus,
         }), 10_000, "运行状态查询超时，请重新查询").then((next) => {
           if (requestCanCommit(requestGeneration)) {
+            configApplyRef.current = reconcileConfigApply(configApplyRef.current, next.configApply);
             setStatus((current) => reconcileRuntimeStatus(current, next));
             setRestartStatusError(null);
           }
@@ -131,12 +135,45 @@ export function useRuntimeStatus({
     [requestRuntimeStatus],
   );
 
+  const acceptConfigApply = useCallback((incoming?: ConfigApplyStatus | null) => {
+    if (!incoming) return incoming;
+    const accepted = reconcileConfigApply(configApplyRef.current, incoming);
+    configApplyRef.current = accepted;
+    setStatus((current) => ({ ...current, configApply: reconcileConfigApply(current.configApply, accepted) }));
+    return accepted;
+  }, []);
+
+  const retryConfigApply = useCallback(async () => {
+    try {
+      await refreshStatus();
+      setConfigApplyError(null);
+    } catch {
+      setConfigApplyError("暂时无法确认配置是否应用，请重新查询状态");
+    }
+  }, [refreshStatus]);
+
   if (statusPollSchedulerRef.current === null) {
     statusPollSchedulerRef.current = createStatusPollScheduler(
       requestRuntimeStatus,
     );
   }
   const statusPollScheduler = statusPollSchedulerRef.current;
+
+  const applyRevision = status.configApply?.revision;
+  const applyPending = status.configApply?.state === "pending";
+  useEffect(() => setConfigApplyError(null), [applyRevision]);
+  useEffect(() => {
+    if (!active || !applyPending || applyRevision === undefined || configApplyError) return;
+    const task = createStatusPollTask({
+      kind: "configApply",
+      delays: [500, 1_000, 2_000, 5_000],
+      pending: (next) => configApplyPending(next.configApply, applyRevision),
+      refreshesInjectionStatus: false,
+      onExhausted: () => setConfigApplyError("配置已保存，暂时无法确认是否应用，请重新查询状态"),
+    }, STATUS_POLL_MAX_DURATION_MS);
+    statusPollScheduler.add(task);
+    return () => statusPollScheduler.remove(task);
+  }, [active, applyPending, applyRevision, configApplyError, statusPollScheduler]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -244,5 +281,8 @@ export function useRuntimeStatus({
     refreshStatusForLoad,
     restartStatusError,
     setRestartStatusError,
+    acceptConfigApply,
+    configApplyError: applyPending ? configApplyError : null,
+    retryConfigApply,
   };
 }

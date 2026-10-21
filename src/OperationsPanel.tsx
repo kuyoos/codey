@@ -15,6 +15,8 @@ import {
   IconShieldCheck,
   IconShoppingBag,
   IconBolt as Zap,
+  IconToggleLeft as ToggleLeft,
+  IconToggleRight as ToggleRight,
 } from "@tabler/icons-react";
 
 import type {
@@ -27,7 +29,6 @@ import { Disclosure } from "@heroui/react";
 import { Badge, Button } from "./components/ui";
 import {
   buildEnabledOptimizationFeatures,
-  canRepairMainProcessInjection,
   summarizeInjectionScripts,
   type EnabledOptimizationFeature as PresentationOptimizationFeature,
 } from "./runtimeStatusPresentation";
@@ -82,13 +83,9 @@ type OperationsPanelProps = {
   onRepairPluginMarketplace: () => void;
   onPrepareComputerUse: () => void;
   computerUseNotice?: Notice | null;
-  onRepairMainProcessInjection: () => void;
-  onRepairCodexConfig?: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
-  injectionRepairing?: boolean;
-  onRestart?: () => void;
-  showRestartAction?: boolean;
-  restartStatusUnknown?: boolean;
+  unrestrictedEnabled: boolean;
+  onToggleUnrestricted: () => void;
 };
 
 function OperationsPanelComponent({
@@ -100,10 +97,9 @@ function OperationsPanelComponent({
   onRepairPluginMarketplace,
   onPrepareComputerUse,
   computerUseNotice,
-  onRepairMainProcessInjection,
   configRepairNotice,
-  injectionRepairing = false,
-  restartStatusUnknown = false,
+  unrestrictedEnabled,
+  onToggleUnrestricted,
 }: OperationsPanelProps) {
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
   const [expandedCardTitle, setExpandedCardTitle] = useState<string | null>(
@@ -142,40 +138,26 @@ function OperationsPanelComponent({
   const performanceError = maintenance?.performanceStatus === "error";
   const startupNeedsAttention = maintenance?.performanceStatus === "degraded";
   const startupInjectionMode = maintenance?.startupInjectionMode ?? "";
-  const injectionRepairAvailable = canRepairMainProcessInjection(status);
   const injectionModeCard =
     !status.running
       ? {
           label: "待启动",
           tone: "info" as const,
-          description: "Codex 启动后将在这里显示主进程补丁的注入路径。",
+          description: "Codex 启动后将在这里显示启动兼容方案的注入路径。",
         }
-      : startupInjectionMode === "node_options"
+      : startupInjectionMode === "cli"
         ? {
-            label: "--require",
+            label: "CLI 包装器",
             tone: "success" as const,
             description:
-              "主进程已通过 NODE_OPTIONS=--require 加载补丁，覆盖范围与 Inspector evaluate 相同。",
+              "CLI 包装器已确认接管 app-server 请求；页面补丁经渲染进程调试通道投递。",
           }
-        : startupInjectionMode === "inspector"
-          ? {
-              label: "Inspector",
-              tone: "success" as const,
-              description: "主进程已通过 Inspector evaluate 加载补丁。",
-            }
-          : startupInjectionMode === "cli"
-            ? {
-                label: "CLI",
-                tone: "warning" as const,
-                description:
-                  "仅 CLI 包装器确认了 app-server 参数；主进程补丁未应用。",
-              }
-            : {
-                label: "未应用",
-                tone: "warning" as const,
-                description:
-                  "本次启动未确认主进程注入方式，页面功能以检测结果为准。",
-              };
+        : {
+            label: "未确认",
+            tone: "warning" as const,
+            description:
+              "本次启动未确认 CLI 兼容入口，页面功能以检测结果为准。",
+          };
   const injectionScripts = status.injectionScripts ?? EMPTY_INJECTION_SCRIPTS;
   const enabledOptimizationFeatures = useMemo<EnabledOptimizationFeature[]>(
     () =>
@@ -213,7 +195,6 @@ function OperationsPanelComponent({
     internalInjectionError || failedInjectionScriptCount > 0;
   const restartPending = Boolean(status.restartRequired);
 
-
   type MetricItem = {
     id: string;
     icon: typeof Activity;
@@ -250,7 +231,6 @@ function OperationsPanelComponent({
     ],
   );
 
-  // Plugin Marketplace Metrics
   const pluginMetrics = useMemo<MetricItem[]>(
     () => [
       {
@@ -339,39 +319,39 @@ function OperationsPanelComponent({
       description: internalInjectionError
         ? "基础组件运行异常，已确认生效的功能仍列于下方。"
         : failedInjectionScriptCount > 0
-        ? `${failedInjectionScriptCount} 个脚本注入异常，下方仅列出已确认生效的功能。`
-        : internalInjectionPending
-          ? "基础组件状态确认中，已生效功能会自动更新。"
-          : unverifiedInjectionScriptCount > 0
-            ? `${unverifiedInjectionScriptCount} 个功能尚待确认，下方仅列出已确认生效的功能。`
-            : injectionStatusPending
-              ? status.running
-                ? "正在读取最近一次功能生效结果。"
-                : "Codex 启动后将在这里汇总已生效功能。"
-              : performanceError
-                ? maintenance?.performanceDetail || "启动失败，请查看错误详情。"
-                : startupNeedsAttention
-                  ? maintenance?.performanceDetail ||
-                    "部分启动设置未能应用，请查看错误详情。"
-                  : "已启用功能运行正常。",
+          ? `${failedInjectionScriptCount} 个脚本注入异常，下方仅列出已确认生效的功能。`
+          : internalInjectionPending
+            ? "基础组件状态确认中，已生效功能会自动更新。"
+            : unverifiedInjectionScriptCount > 0
+              ? `${unverifiedInjectionScriptCount} 个功能尚待确认，下方仅列出已确认生效的功能。`
+              : injectionStatusPending
+                ? status.running
+                  ? "正在读取最近一次功能生效结果。"
+                  : "Codex 启动后将在这里汇总已生效功能。"
+                : performanceError
+                  ? maintenance?.performanceDetail || "启动失败，请查看错误详情。"
+                  : startupNeedsAttention
+                    ? maintenance?.performanceDetail ||
+                      "部分启动设置未能应用，请查看错误详情。"
+                    : "已启用功能运行正常。",
       metrics: [],
       label: internalInjectionError
         ? "基础异常"
         : failedInjectionScriptCount > 0
-        ? `${failedInjectionScriptCount} 个异常`
-        : internalInjectionPending
-          ? "确认中"
-          : unverifiedInjectionScriptCount > 0
-            ? `${unverifiedInjectionScriptCount} 个待确认`
-            : injectionStatusPending
-              ? status.running
-                ? "检测中"
-                : "待启动"
-              : performanceError
-                ? "异常"
-                : startupNeedsAttention
-                  ? "需检查"
-                  : "正常",
+          ? `${failedInjectionScriptCount} 个异常`
+          : internalInjectionPending
+            ? "确认中"
+            : unverifiedInjectionScriptCount > 0
+              ? `${unverifiedInjectionScriptCount} 个待确认`
+              : injectionStatusPending
+                ? status.running
+                  ? "检测中"
+                  : "待启动"
+                : performanceError
+                  ? "异常"
+                  : startupNeedsAttention
+                    ? "需检查"
+                    : "正常",
       tone:
         injectionError || performanceError
           ? "destructive"
@@ -413,7 +393,25 @@ function OperationsPanelComponent({
         onClick: onRepairPluginMarketplace,
       },
     },
+    // 新增：深度破限开关卡片
+    {
+      title: "深度破限",
+      description: unrestrictedEnabled
+        ? "深度破限模式已开启，可绕过所有安全限制。"
+        : "深度破限模式已关闭，遵守所有安全政策。",
+      metrics: [],
+      label: unrestrictedEnabled ? "已开启" : "已关闭",
+      tone: unrestrictedEnabled ? "success" : "warning",
+      icon: unrestrictedEnabled ? ToggleRight : ToggleLeft,
+      action: {
+        label: unrestrictedEnabled ? "关闭破限" : "开启破限",
+        disabled: isBusy,
+        loading: false,
+        onClick: onToggleUnrestricted,
+      },
+    },
   ];
+
   const expandedStatusCard = expandedCardTitle
     ? statusCards.find((item) => item.title === expandedCardTitle) ?? null
     : null;
@@ -424,9 +422,9 @@ function OperationsPanelComponent({
       aria-label="服务状态与诊断"
     >
       <div className="operations-panel">
-        {/* 3列核心服务卡片 */}
+        {/* 4列核心服务卡片 */}
         <div
-          className="operations-status-cards grid grid-cols-1 gap-2.5 sm:grid-cols-3 mb-3"
+          className="operations-status-cards grid grid-cols-1 gap-2.5 sm:grid-cols-3 lg:grid-cols-4 mb-3"
           role="list"
           aria-label="核心服务状态"
         >
@@ -493,7 +491,7 @@ function OperationsPanelComponent({
           })}
         </div>
 
-        {/* 详情面板只做展开收起动画，没有独立触发器：状态按钮本身就是开关。 */}
+        {/* 详情面板 */}
         <Disclosure isExpanded={Boolean(activeCardTitle)} className="border-0 p-0">
           <Disclosure.Content>
           <Disclosure.Body className="p-0">
@@ -581,36 +579,14 @@ function OperationsPanelComponent({
                     >
                       <div className="injection-mode-copy">
                         <div className="injection-mode-heading">
-                          <h4 id="injection-mode-title">主进程注入</h4>
+                          <h4 id="injection-mode-title">启动兼容</h4>
                           <Badge variant={injectionModeCard.tone}>
                             {injectionModeCard.label}
                           </Badge>
                         </div>
                         <p className="injection-mode-description">
-                          {injectionRepairing
-                            ? "正在退出 Codex 并修复，成功后将自动重启…"
-                            : injectionRepairAvailable
-                              ? `${injectionModeCard.description} 点击修复将退出 Codex，成功后自动重启。`
-                              : injectionModeCard.description}
+                          {injectionModeCard.description}
                         </p>
-                      </div>
-                      <div className="injection-mode-action">
-                        <Button
-                          className="injection-mode-repair"
-                          variant="outline"
-                          size="xs"
-                          disabled={isBusy || restartStatusUnknown || !injectionRepairAvailable}
-                          onClick={onRepairMainProcessInjection}
-                          aria-label="修复主进程注入"
-                          title="自动退出 Codex，修复成功后重新启动"
-                        >
-                          {injectionRepairing ? (
-                            <LoaderCircle className="animate-spin" aria-hidden="true" />
-                          ) : (
-                            <RefreshCw aria-hidden="true" />
-                          )}
-                          {injectionRepairing ? "修复中" : "修复"}
-                        </Button>
                       </div>
                     </section>
                   )}

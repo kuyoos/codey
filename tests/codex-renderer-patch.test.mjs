@@ -1,245 +1,230 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
 import { loadStartupPatchTemplate } from "./helpers/startup-patch.mjs";
 
-test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
-  const Module = process.getBuiltinModule("module");
-  const nativeLoad = Module._load;
-  const nativeJsExtension = Module._extensions[".js"];
-  let installedHandler = null;
-  class FakeEmitter {
-    constructor() {
-      this.listeners = new Map();
-    }
+// Keep the native draft merge and persistence branches in the fixture. The
+// optional extracted production asset runs through the same behavior harness.
+const newDraftFixture = [
+  "let Hva=wo(U,e=>({isManuallyChanged:!1,modelSettings:null,serviceTier:null}));",
+  "function Jbo({userSavedModelString:e,userSavedReasoningEffort:t,listModelsData:n}){let r=n?.models.find(m=>m.model===e),i=r?.supportedReasoningEfforts?.map(e=>e.reasoningEffort),a=t!=null&&i!=null&&i.includes(t)?t:r?.defaultReasoningEffort;return{model:r?r.model:e,reasoningEffort:a??t??`medium`,profile:null,isLoading:!1}}",
+  "function nxo(e){let{managedNewThreadModelSettings:s,waitForModelList:c}=e;let{data:N,isLoading:P}=Za(M);let{data:R,isLoading:z}=wvo(L),B=Xbo(T?.settings,R),ne=Jbo({userSavedModelString:V,userSavedReasoningEffort:H,listModelsData:R});return ne}",
+  "function uxo(e,t){let n=(0,fxo.c)(29),r=e===void 0?null:e,d={enabled:r==null};let{draftSettings:f,isNewThreadDraft:p,updateDraftSettings:m}=Lva(d),h=sxo(r,p),{isLunaReserveActive:g}=h,_=r==null&&p,v=_&&h.hasManagedNewThreadSettings,y=_&&h.isUsingCopilotApi,b=_&&f.modelSettings!=null,x=h.modelSettings;if(b){x={...x,...f.modelSettings}}if(g)x={...x,model:YNt};let C=async(e,t,n)=>{let i=e,a=_&&n?.persistAsDefault===!1;if(a||v||y&&t===`ultra`?m(e=>({...e,isManuallyChanged:!0,modelSettings:{model:i,profile:h.modelSettings.profile,reasoningEffort:t},modelSettingsPersistAsDefault:!a,serviceTier:n?.serviceTier===void 0?e.serviceTier:{value:xir(n.serviceTier)}})):_&&f.modelSettings!=null&&m(dxo),a)return!0;return h.setModelAndReasoningEffort(i,t,n)};return{...h,modelSettings:x,setModelAndReasoningEffort:C}}function dxo(e){return{...e,modelSettings:null,modelSettingsPersistAsDefault:void 0}}",
+  "function vwo(e,t){let r=e===void 0?null:e,i=t===void 0?null:t,a=hi(U),{draftSettings:o,isNewThreadDraft:s,updateDraftSettings:c}=Lva(),l=_wo(r,uxo(r),o.serviceTier,s,i),{serviceTierAccess:d,...u}=l;return{...u,setServiceTier:async(e,t)=>{if(!We(e,d))return!1;let n=r==null&&s&&(u.hasManagedNewThreadSettings||i!=null||o.serviceTier!=null);n&&c(t=>({...t,isManuallyChanged:!0,serviceTier:{value:xir(e)}}));let[l]=await Promise.all([u.setServiceTier(e,t),n?Vh(a,u.hostId).clearPrewarmedThreads():void 0]);return l}}}function afterSpeed(){}",
+].join("");
 
-    on(name, listener) {
-      const listeners = this.listeners.get(name) || [];
-      listeners.push({ listener, once: false });
-      this.listeners.set(name, listeners);
-      return this;
-    }
-
-    once(name, listener) {
-      const listeners = this.listeners.get(name) || [];
-      listeners.push({ listener, once: true });
-      this.listeners.set(name, listeners);
-      return this;
-    }
-
-    removeListener(name, listener) {
-      const listeners = this.listeners.get(name) || [];
-      this.listeners.set(
-        name,
-        listeners.filter((entry) => entry.listener !== listener),
-      );
-      return this;
-    }
-
-    emit(name, ...args) {
-      const listeners = [...(this.listeners.get(name) || [])];
-      this.listeners.set(
-        name,
-        listeners.filter((entry) => !entry.once),
-      );
-      listeners.forEach((entry) => entry.listener(...args));
-    }
-  }
-  class FakeWebContents extends FakeEmitter {
-    constructor() {
-      super();
-      this.currentUrl = "";
-      this.loadedUrls = [];
-      this.destroyed = false;
-      this.backgroundThrottling = [];
-    }
-
-    getURL() {
-      return this.currentUrl;
-    }
-
-    loadURL(url) {
-      this.currentUrl = url;
-      this.loadedUrls.push(url);
-      this.emit("did-start-navigation", {}, url);
-      return Promise.resolve();
-    }
-
-    setBackgroundThrottling(enabled) {
-      this.backgroundThrottling.push(enabled);
-    }
-  }
-  class FakeBrowserWindow extends FakeEmitter {
-    constructor(options = {}) {
-      super();
-      this.options = options;
-      this.webContents = new FakeWebContents();
-      this.destroyed = false;
-      this.destroyCalls = 0;
-    }
-
-    destroy() {
-      if (this.destroyed) return;
-      this.destroyed = true;
-      this.destroyCalls += 1;
-      this.webContents.destroyed = true;
-      this.webContents.emit("destroyed");
-      this.emit("closed");
-    }
-
-    isDestroyed() {
-      return this.destroyed;
-    }
-
-    loadURL(url) {
-      return this.webContents.loadURL(url);
-    }
-  }
-  const fakeElectron = {
-    app: { getVersion: () => "26.826.1724" },
-    BrowserWindow: FakeBrowserWindow,
-    protocol: {
-      handle(scheme, handler) {
-        assert.equal(scheme, "app");
-        installedHandler = handler;
-      },
+function exerciseDraftHooks(source) {
+  const takeFunction = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, `${name} exists`);
+    const end = Math.min(...[source.indexOf("}function ", start), source.indexOf("}var ", start)].filter((index) => index >= 0));
+    assert.ok(end > start, `${name} has a bounded next declaration`);
+    return source.slice(start, end + 1);
+  };
+  const factory = source.match(/=>\(\{isManuallyChanged:!1,modelSettings:null,serviceTier:\{value:`default`\}\}\)/)?.[0];
+  assert.ok(factory, "each draft has its own ordinary-speed initializer");
+  const makeDraft = Function(`return e${factory}`)();
+  const state = {
+    draft: makeDraft(),
+    isDraft: true,
+    cache: [],
+    speedCache: [],
+    savedSpeed: "fast",
+    existingSpeed: "fast",
+    catalog: {
+      models: [
+        { model: "chosen-model", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
+        { model: "high-only", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+      ],
     },
+    settings: { model: "chosen-model", reasoningEffort: "high", profile: "saved-profile", isLoading: false },
+    writes: [],
+    hooks: 0,
   };
-  const fakeAvatarOverlayNative = { createController: () => ({}) };
-  Module._load = function testElectronLoader(request) {
-    if (request === "electron") return fakeElectron;
-    if (request === "C:\\Codex\\avatar_overlay.node") {
-      return fakeAvatarOverlayNative;
-    }
-    return Reflect.apply(nativeLoad, this, arguments);
+  const scope = { set() {}, get() {} };
+  const base = {
+    hostId: "local",
+    hasManagedNewThreadSettings: false,
+    isUsingCopilotApi: false,
+    isLunaReserveActive: false,
+    setModelAndReasoningEffort: async (...args) => { state.writes.push(args); return true; },
+    setModelAndReasoningEffortForNextTurn: async () => true,
   };
+  const bindings = {
+    fxo: { c: (size) => {
+      if (state.cache.length === 0) state.cache = Array(size).fill(Symbol.for("react.memo_cache_sentinel"));
+      return state.cache;
+    } },
+    ywo: { c: (size) => {
+      if (state.speedCache.length === 0) state.speedCache = Array(size).fill(Symbol.for("react.memo_cache_sentinel"));
+      return state.speedCache;
+    } },
+    Lva: () => ({ draftSettings: state.draft, isNewThreadDraft: state.isDraft, updateDraftSettings: (update) => { state.draft = update(state.draft); } }),
+    sxo: () => ({ ...base, modelSettings: state.settings }),
+    wvo: () => { state.hooks += 1; return { data: state.catalog }; },
+    hi: () => scope,
+    U: {},
+    J_o() {},
+    IJ: {},
+    Vh: () => ({ clearPrewarmedThreads: async () => {} }),
+    xir: (tier) => tier ?? "default",
+    qbo: (models, model) => models?.find((entry) => entry.model === model),
+    YNt: "gpt-reserve",
+    We: () => true,
+    _wo: (threadId, _model, draftTier) => ({
+      hostId: "local",
+      hasManagedNewThreadSettings: false,
+      serviceTierAccess: {},
+      // Native speed resolver gives existing-thread settings precedence, then
+      // the draft value, then saved global preferences.
+      serviceTierSettings: { selectedServiceTier: threadId != null ? state.existingSpeed : draftTier?.value ?? state.savedSpeed },
+      setServiceTier: async (tier) => { state.savedSpeed = tier; return true; },
+    }),
+  };
+  const { useModel, useSpeed } = Function(...Object.keys(bindings), `${takeFunction("Jbo")}${takeFunction("uxo")}${takeFunction("vwo")}function dxo(e){return{...e,modelSettings:null,modelSettingsPersistAsDefault:void 0}}return{useModel:uxo,useSpeed:vwo}`)(...Object.values(bindings));
+  return { state, makeDraft, useModel, useSpeed };
+}
 
-  const nativeConsoleError = console.error;
-  const childProcess = process.getBuiltinModule("child_process");
-  const nativeSpawn = childProcess.spawn;
-  const nativeSpawnSync = childProcess.spawnSync;
-  const asyncLogSpawns = [];
-  const syncLogSpawns = [];
-  childProcess.spawn = (command, args, options) => {
-    const child = new FakeEmitter();
-    const stdin = new FakeEmitter();
-    const call = { command, args, options, input: null, encoding: null };
-    stdin.end = (input, encoding) => {
-      call.input = input;
-      call.encoding = encoding;
-      queueMicrotask(() => child.emit("exit", 0));
-    };
-    child.stdin = stdin;
-    child.kill = () => true;
-    child.unref = () => child;
-    asyncLogSpawns.push(call);
-    return child;
-  };
-  childProcess.spawnSync = (command, args, options) => {
-    syncLogSpawns.push({ command, args, options });
-    return { status: 0, stderr: "" };
-  };
+test("new drafts initialize ordinary speed and supported medium reasoning without replacing manual choices", async (t) => {
+  (0, eval)(await loadStartupPatchTemplate());
+  const sources = [["fixture", newDraftFixture]];
+  if (process.env.CODEY_NEW_CHAT_RENDERER_ASSET) {
+    sources.push(["installed renderer", await readFile(process.env.CODEY_NEW_CHAT_RENDERER_ASSET, "utf8")]);
+  }
+  for (const [label, source] of sources) {
+    await t.test(label, async (t) => {
+      const errors = [];
+      const savedLog = globalThis.__codeyPatchLog;
+      const savedError = console.error;
+      let patched;
+      globalThis.__codeyPatchLog = (record) => errors.push(JSON.parse(record));
+      console.error = () => {};
+      try {
+        patched = globalThis.__codeyRendererPatchEntry("app://-/assets/app-initial-new-drafts.js", source) ?? source;
+      } finally {
+        globalThis.__codeyPatchLog = savedLog;
+        console.error = savedError;
+      }
+      assert.ok(patched.includes("/*codey-new-thread-draft-defaults*/"));
+      assert.deepEqual(errors.filter(({ operation }) => operation === "renderer_patch:new thread draft defaults"), []);
+      const syntax = spawnSync(process.execPath, ["--check", "--input-type=module"], { input: patched, encoding: "utf8" });
+      assert.equal(syntax.status, 0, syntax.stderr);
+      const { state, makeDraft, useModel, useSpeed } = exerciseDraftHooks(patched);
+      await t.test("two new drafts reset independently and keep the chosen default model", async () => {
+        const first = useModel();
+        assert.equal(first.modelSettings.reasoningEffort, "medium");
+        assert.equal(first.modelSettings.model, "chosen-model");
+        assert.equal(first.modelSettings.profile, "saved-profile");
+        assert.equal(state.draft.serviceTier.value, "default");
+        assert.equal(useModel().modelSettings, first.modelSettings, "default object stays memoized");
+        await first.setModelAndReasoningEffort("chosen-model", "high", { serviceTier: "fast" });
+        assert.equal(useModel().modelSettings.reasoningEffort, "high");
+        assert.equal(state.draft.serviceTier.value, "fast");
+        assert.equal(state.writes.length, 1, "native default-model persistence is preserved");
+        const previousDraft = state.draft;
+        state.draft = makeDraft();
+        state.cache = [];
+        assert.equal(useModel().modelSettings.reasoningEffort, "medium");
+        assert.equal(state.draft.serviceTier.value, "default");
+        assert.equal(previousDraft.serviceTier.value, "fast");
+      });
+      await t.test("independent speed choices remain local to the current draft", async () => {
+        assert.equal(useSpeed().serviceTierSettings.selectedServiceTier, "default");
+        await useSpeed().setServiceTier("fast", "picker");
+        assert.equal(useSpeed().serviceTierSettings.selectedServiceTier, "fast");
+        assert.equal(useModel().modelSettings.reasoningEffort, "medium", "a speed change does not restore old reasoning");
+        state.draft = makeDraft();
+        assert.equal(useSpeed().serviceTierSettings.selectedServiceTier, "default");
+        assert.equal(useSpeed("existing-thread").serviceTierSettings.selectedServiceTier, "fast");
+      });
+      await t.test("unsupported medium uses the native model fallback", () => {
+        state.settings = { ...state.settings, model: "high-only" };
+        assert.equal(useModel().modelSettings.reasoningEffort, "high");
+      });
+      await t.test("missing or loading catalogs retain valid settings and keep hook order", () => {
+        state.settings = { ...state.settings, model: "not-in-catalog", reasoningEffort: "low" };
+        assert.equal(useModel().modelSettings, state.settings);
+        state.catalog = undefined;
+        const before = state.hooks;
+        assert.equal(useModel().modelSettings, state.settings);
+        assert.equal(state.hooks, before + 1);
+      });
+      await t.test("existing and restoring threads retain reasoning and ignore draft speed", async () => {
+        state.isDraft = false;
+        state.settings = { ...state.settings, reasoningEffort: "high", isLoading: true };
+        assert.equal(useModel("existing-thread").modelSettings, state.settings);
+        const previous = state.draft;
+        await useModel("existing-thread").setModelAndReasoningEffort("high-only", "high");
+        assert.equal(state.draft, previous);
+      });
+    });
+  }
+});
+
+test("draft default patch is atomic when anchors drift and idempotent when reapplied", async () => {
+  (0, eval)(await loadStartupPatchTemplate());
+  const patch = (source) => globalThis.__codeyRendererPatchEntry("app://-/assets/app-initial-new-drafts.js", source) ?? source;
+  const patched = patch(newDraftFixture);
+  assert.equal(patch(patched), patched);
+  const savedLog = globalThis.__codeyPatchLog;
+  const savedError = console.error;
+  globalThis.__codeyPatchLog = () => {};
+  console.error = () => {};
+  try {
+    for (const source of [
+      newDraftFixture.replace("serviceTier:null", "serviceTier:void 0"),
+      newDraftFixture.replace("waitForModelList:c", "fetchModels:c"),
+      newDraftFixture.replace("a||v||y&&t===`ultra`?", "a||v?"),
+      `${newDraftFixture}let duplicate=wo(U,e=>({isManuallyChanged:!1,modelSettings:null,serviceTier:null}));`,
+    ]) assert.equal(patch(source), source);
+  } finally {
+    globalThis.__codeyPatchLog = savedLog;
+    console.error = savedError;
+  }
+});
+
+test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
+  const patchRecords = [];
   const patchErrors = [];
+  const nativePatchLog = globalThis.__codeyPatchLog;
+  const nativeConsoleError = console.error;
+  globalThis.__codeyPatchLog = (record) => {
+    patchRecords.push(JSON.parse(record));
+  };
   console.error = (...args) => {
     patchErrors.push(args);
   };
 
   try {
-    assert.equal(
-      (0, eval)(await loadStartupPatchTemplate({ disablePet: true, errorLoggerExecutable: "C:\\Codey\\codey.exe" })),
-      "codey-startup-patch-installed-v40",
-    );
-    const electron = Module._load("electron", undefined, false);
-    const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
-    assert.equal(petSurface.destroyed, false);
-    const avatarOverlayWindow = new electron.BrowserWindow({
-      width: 356,
-      height: 320,
-      alwaysOnTop: true,
-      transparent: true,
-      focusable: false,
-      show: false,
-      frame: false,
-      skipTaskbar: true,
-      webPreferences: { backgroundThrottling: false },
-    });
-    assert.equal(avatarOverlayWindow.destroyed, false);
-    assert.equal(
-      avatarOverlayWindow.options.webPreferences.backgroundThrottling,
-      true,
-    );
-    avatarOverlayWindow.emit("show");
-    avatarOverlayWindow.emit("hide");
-    assert.deepEqual(
-      avatarOverlayWindow.webContents.backgroundThrottling,
-      [false, true],
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.throttleHiddenAvatarOverlay,
-      true,
-    );
-    const overlaySource = [
-      "class AvatarOverlayManager{",
-      "async prewarm(e){",
-      "if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;",
-      "let t=this.windowVisibilitySequence,n=await this.ensureWindow(t);",
-      "n==null||t!==this.windowVisibilitySequence||this.positionWindow(n,e)}",
-      "async prewarm(){await this.get()}",
-      "}",
-    ].join("");
-    const patchedOverlay = globalThis.__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__(
-      overlaySource,
-    );
-    assert.match(patchedOverlay, /async prewarm\(e\)\{return;/);
-    assert.match(patchedOverlay, /async prewarm\(\)\{await this.get\(\)\}/);
-    assert.equal(petSurface.options.webPreferences, undefined);
-    assert.equal(
-      Module._load("C:\\Codex\\avatar_overlay.node", undefined, false),
-      fakeAvatarOverlayNative,
-    );
-    const routeWindow = new electron.BrowserWindow({ title: "Codex" });
-    await routeWindow.webContents.loadURL(
-      "app://-/index.html?initialRoute=%2Favatar-overlay",
-    );
-    assert.equal(routeWindow.destroyed, false);
-    assert.deepEqual(routeWindow.webContents.loadedUrls, [
-      "app://-/index.html?initialRoute=%2Favatar-overlay",
-    ]);
-    assert.equal(globalThis.__CODEY_CODEX_STARTUP_PATCH__.disablePet, true);
-    assert.equal(
-      Object.hasOwn(globalThis.__CODEY_CODEX_STARTUP_PATCH__, "petManagerSourceRemoved"),
-      false,
-    );
-    const upstreamHandler = async () =>
-      new Response(
-        [
-          "useHiddenModels:",
-          "availableModels:",
-          "includeUltraReasoningEffort",
-          "amazonBedrock",
-        ].join(" "),
-      );
-    electron.protocol.handle("app", upstreamHandler);
-    assert.equal(typeof installedHandler, "function");
+    (0, eval)(await loadStartupPatchTemplate({ disablePet: true }));
+    assert.equal(globalThis.__codeyRendererPatchInstalled, true);
+    // Fetch interception entry: patched text means the response is rewritten,
+    // null means the paused asset is fulfilled with its original body.
+    const patch = (url, source) =>
+      globalThis.__codeyRendererPatchEntry(url, source) ?? source;
 
-    const response = await installedHandler({
-      url: "app://-/assets/app-initial-new-codex-build.js",
-    });
-    assert.equal(response.ok, true);
-    assert.match(await response.text(), /useHiddenModels:/);
+    const incompatibleSource = [
+      "useHiddenModels:",
+      "availableModels:",
+      "includeUltraReasoningEffort",
+      "amazonBedrock",
+    ].join(" ");
+    const response = patch(
+      "app://-/assets/app-initial-new-codex-build.js",
+      incompatibleSource,
+    );
     // Each incompatible gate is skipped independently (and logged) instead of one
     // throw discarding every gate on the asset. The response is never blocked and
     // the source is returned unchanged when nothing matched.
+    assert.equal(response, incompatibleSource);
     assert.ok(patchErrors.length >= 1);
     for (const [message] of patchErrors) {
       assert.match(String(message), /incompatible Codex renderer patch/);
     }
-    assert.equal(syncLogSpawns.length, 0);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(asyncLogSpawns.length, 1);
     assert.deepEqual(
-      JSON.parse(asyncLogSpawns[0].input).map(({ operation }) => operation),
+      patchRecords.map(({ operation }) => operation),
       [
         "renderer_patch:model allowlist",
         "renderer_patch:model visibility",
@@ -248,8 +233,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     // Every skipped gate must carry printable excerpts around its neighborhood
     // anchors so an incompatible field bundle can be adapted without access to
     // that exact build.
-    for (const record of JSON.parse(asyncLogSpawns[0].input)) {
-      assert.equal(record.versions.codex, "26.826.1724");
+    for (const record of patchRecords) {
       assert.equal(record.context.matchCount, 0);
       assert.ok(
         Array.isArray(record.context.excerpts) &&
@@ -263,20 +247,20 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       );
     }
 
-    const repeatedResponse = await installedHandler({
-      url: "app://-/assets/app-initial-new-codex-build.js",
-    });
-    assert.match(await repeatedResponse.text(), /useHiddenModels:/);
-    await new Promise((resolve) => setImmediate(resolve));
+    const repeatedResponse = patch(
+      "app://-/assets/app-initial-new-codex-build.js",
+      incompatibleSource,
+    );
+    assert.equal(repeatedResponse, incompatibleSource);
     assert.equal(
       patchErrors.length,
       2,
       "the same incompatible source must not rerun failed renderer gates",
     );
     assert.equal(
-      asyncLogSpawns.length,
-      1,
-      "the same incompatible source must not spawn another patch logger",
+      patchRecords.length,
+      2,
+      "the same incompatible source must not report the same gates again",
     );
 
     const currentRendererSource = [
@@ -297,17 +281,19 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "`composer.intelligenceDropdown.model.title`;",
       "`composer.intelligenceDropdown.model.rowLabel`;",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(currentRendererSource),
+    const patchedCurrentRendererSource = patch(
+      "app://-/assets/app-initial-current-codex-build.js",
+      currentRendererSource,
     );
-    const currentRendererResponse = await installedHandler({
-      url: "app://-/assets/app-initial-current-codex-build.js",
-    });
-    const patchedCurrentRendererSource = await currentRendererResponse.text();
+    // The Fast control no longer depends on the current model exposing more
+    // than one service tier. Only the draft guard survives.
     assert.match(
       patchedCurrentRendererSource,
-      /Ee=!w&&M\.availableOptions\.length>1/,
+      /Ee=!w&&!0/,
+    );
+    assert.doesNotMatch(
+      patchedCurrentRendererSource,
+      /Ee=[^;]*availableOptions\.length>1/,
     );
     assert.match(patchedCurrentRendererSource, /Re=!w&&!K&&xe!=null/);
     assert.match(patchedCurrentRendererSource, /pe=!r/);
@@ -336,18 +322,17 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         "OQ(`composer.toggleFastMode`,()=>{},{enabled:allowed&&!loading&&fastOption!=null});",
         "return show}",
       ].join("");
-      electron.protocol.handle(
-        "app",
-        async () => new Response(reorderedServiceTierControlSource),
+      const patchedReorderedServiceTierControlSource = patch(
+        `app://-/assets/app-initial-reordered-service-tier-control-${index}.js`,
+        reorderedServiceTierControlSource,
       );
-      const reorderedServiceTierControlResponse = await installedHandler({
-        url: `app://-/assets/app-initial-reordered-service-tier-control-${index}.js`,
-      });
-      const patchedReorderedServiceTierControlSource =
-        await reorderedServiceTierControlResponse.text();
       assert.match(
         patchedReorderedServiceTierControlSource,
-        /show=(?:settings\.availableOptions\.length>1&&!draft|!draft&&settings\.availableOptions\.length>1)/,
+        /show=(?:!0&&!draft|!draft&&!0|!draft)/,
+      );
+      assert.doesNotMatch(
+        patchedReorderedServiceTierControlSource,
+        /show=[^;]*availableOptions\.length>1/,
       );
       assert.doesNotMatch(
         patchedReorderedServiceTierControlSource,
@@ -377,17 +362,17 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "t[45]===ze?Be=t[46]:(Be={enabled:ze},t[45]=ze,t[46]=Be),",
       "U$(`composer.toggleFastMode`,Re,Be);",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(electron151ServiceTierSource),
+    const patchedElectron151Source = patch(
+      "app://-/assets/app-initial-electron151-service-tier.js",
+      electron151ServiceTierSource,
     );
-    const electron151Response = await installedHandler({
-      url: "app://-/assets/app-initial-electron151-service-tier.js",
-    });
-    const patchedElectron151Source = await electron151Response.text();
     assert.match(
       patchedElectron151Source,
-      /De=!w&&N\.availableOptions\.length>1/,
+      /De=!w&&!0/,
+    );
+    assert.doesNotMatch(
+      patchedElectron151Source,
+      /De=[^,]*availableOptions\.length>1/,
     );
     assert.doesNotMatch(
       patchedElectron151Source,
@@ -422,20 +407,19 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       scopedMemoizedGap,
       "OQ(`composer.toggleFastMode`,()=>{},{enabled:show});return show}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(scopedServiceTierSource),
+    const patchedScopedServiceTierSource = patch(
+      "app://-/assets/app-initial-scoped-service-tier.js",
+      scopedServiceTierSource,
     );
-    const scopedServiceTierResponse = await installedHandler({
-      url: "app://-/assets/app-initial-scoped-service-tier.js",
-    });
-    const patchedScopedServiceTierSource =
-      await scopedServiceTierResponse.text();
     assert.match(
       patchedScopedServiceTierSource,
       /unrelated=!draft&&allowed&&settings\.availableOptions\.length>1/,
     );
     assert.match(
+      patchedScopedServiceTierSource,
+      /show=!draft/,
+    );
+    assert.doesNotMatch(
       patchedScopedServiceTierSource,
       /show=!draft&&settings\.availableOptions\.length>1/,
     );
@@ -463,14 +447,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "return e.query.setData(rx,{authMethod:n,hostId:t},r),",
       "r.requirements?.featureRequirements?.fast_mode!==!1}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(electron151EntitlementSource),
+    const patchedEntitlementSource = patch(
+      "app://-/assets/app-initial-electron151-entitlement.js",
+      electron151EntitlementSource,
     );
-    const entitlementResponse = await installedHandler({
-      url: "app://-/assets/app-initial-electron151-entitlement.js",
-    });
-    const patchedEntitlementSource = await entitlementResponse.text();
     assert.match(
       patchedEntitlementSource,
       /async function YHr\(e,t\)\{return!0\}/,
@@ -491,11 +471,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "let r=new CustomEvent(`codex-message-from-view`,{detail:e});",
       "t&&(r.__codexForwardedViaBridge=!0),window.dispatchEvent(r)}};",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(routeBridgeSource));
-    const routeBridgeResponse = await installedHandler({
-      url: "app://-/assets/app-initial-route-bridge.js",
-    });
-    const patchedRouteBridgeSource = await routeBridgeResponse.text();
+    const patchedRouteBridgeSource = patch(
+      "app://-/assets/app-initial-route-bridge.js",
+      routeBridgeSource,
+    );
     assert.match(
       patchedRouteBridgeSource,
       /globalThis\.__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage\?\.\(e\)\?\?e/,
@@ -549,6 +528,14 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       blocked: true,
       routed: true,
     }]);
+    let releaseDirect;
+    routeGlobal.__codeyModelWhitelistPatch.guardDirectBridgeMessage = (_detail, send) => new Promise((resolve) => { releaseDirect = () => resolve(send()); });
+    routeTransport.postMessage({ type: "mcp-request", request: { id: "direct" } });
+    assert.equal(sentMessages.length, 1);
+    releaseDirect();
+    await new Promise(setImmediate);
+    assert.equal(sentMessages.length, 2);
+    assert.equal(sentMessages[1].request.id, "direct");
     assert.equal(
       patchErrors.length,
       2,
@@ -567,11 +554,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "function Mjt(){return `critical`}function Ejt(){return `source`}",
       "const appServerPatchSignals=`AppServerRequestClient is missing a message dispatcher mcp_request_enqueued`;",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(appServerRequestSource));
-    const appServerRequestResponse = await installedHandler({
-      url: "app://-/assets/app-initial-app-server-request-current-build.js",
-    });
-    const patchedAppServerRequestSource = await appServerRequestResponse.text();
+    const patchedAppServerRequestSource = patch(
+      "app://-/assets/app-initial-app-server-request-current-build.js",
+      appServerRequestSource,
+    );
     assert.match(
       patchedAppServerRequestSource,
       /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/,
@@ -582,6 +568,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     const appServerGlobal = {
       __codeyModelWhitelistPatch: {
         rewriteOutgoingMessage(detail) {
+          if (detail.hostId !== "local") return detail;
           routedAppServerTypes.push(detail.type);
           if (detail.request.params.model === "blocked-route/model") {
             return { ...detail, blocked: true };
@@ -606,7 +593,8 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         trackOutgoingMessage(detail) {
           trackedAppServerMessages.push(detail);
         },
-        rewriteIncomingResult(method, result) {
+        rewriteIncomingResult(method, result, hostId) {
+          if (hostId !== "local") return result;
           return method === "model/list"
             ? { ...result, data: [...result.data, { model: "route/model" }] }
             : result;
@@ -618,6 +606,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "Date",
       `${patchedAppServerRequestSource};return AppServerRequestClient`,
     )(appServerGlobal, Date);
+    assert.equal(appServerGlobal.__codeyModelRequestSourceGateInstalled, true);
     const requestClient = new AppServerRequestClient();
     await requestClient.enqueueRequest("thread/start", {
       model: "route-mt6lv4lx-i2bfax/gpt-5.5",
@@ -654,8 +643,23 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.equal(trackedAppServerMessages.length, 2);
     assert.deepEqual(trackedAppServerMessages[0], {
       type: "mcp-request",
+      hostId: "local",
       request: requestClient.sent[0].payload.request,
     });
+    let releasePortable;
+    let reentering = false;
+    appServerGlobal.__codeyModelWhitelistPatch.guardOutgoingRequest = (_client, method, _params, proceed) => {
+      if (method !== "turn/start" || reentering) return null;
+      return new Promise((resolve) => { releasePortable = resolve; }).then(() => {
+        reentering = true;
+        try { return proceed(); } finally { reentering = false; }
+      });
+    };
+    const portableSend = requestClient.enqueueRequest("turn/start", { threadId: "portable", model: "route/model" }, {});
+    assert.equal(requestClient.sent.length, 2, "source gate waits before rewrite or transport");
+    releasePortable();
+    await portableSend;
+    assert.equal(requestClient.sent.length, 3, "source gate dispatches exactly once after preparation");
     const modelListResults = [];
     requestClient.requestPromises.set("model-list", {
       method: "model/list",
@@ -667,11 +671,48 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.deepEqual(modelListResults, [{
       data: [{ model: "gpt-5.6-sol" }, { model: "route/model" }],
     }]);
+    const remoteClient = new AppServerRequestClient();
+    remoteClient.hostId = "remote-host";
+    await remoteClient.enqueueRequest("thread/start", { model: "remote-model" }, {});
+    assert.deepEqual(remoteClient.sent[0].payload.request.params, { model: "remote-model" });
+    assert.equal(trackedAppServerMessages.at(-1).hostId, "remote-host");
+    let remoteResult;
+    remoteClient.requestPromises.set("remote-list", { method: "model/list", resolve(value) { remoteResult = value; } });
+    remoteClient.onResult("remote-list", { data: [{ model: "remote-model" }] });
+    assert.deepEqual(remoteResult, { data: [{ model: "remote-model" }] });
     assert.equal(
       patchErrors.length,
       2,
       "the AppServerRequestClient route preflight must patch without compatibility errors",
     );
+
+    // Codex 26.1007 moved AppServerRequestClient and the Electron bridge
+    // forwarder into app-shared-*.js. That chunk must stay in the patch filter
+    // or the model-request source gate never installs and startup aborts at
+    // the request-gate verification stage.
+    const patchedSharedChunk = patch(
+      "app://-/webview/assets/app-shared-8bd9d0399038.js",
+      appServerRequestSource,
+    );
+    assert.match(
+      patchedSharedChunk,
+      /__codeyModelRequestSourceGateInstalled=true/,
+    );
+    assert.match(
+      patchedSharedChunk,
+      /__codeyAppServerRequestClients/,
+    );
+    // Current Codex puts composer and request gates in app-primary too.
+    assert.equal(
+      patch("app://-/webview/assets/app-primary-6f60e9ac4103.js", appServerRequestSource),
+      patchedSharedChunk,
+    );
+    // Assets outside the patch set must pass through untouched.
+    const unrelatedChunk = patch(
+      "app://-/webview/assets/unrelated-feature-6f60e9ac4103.js",
+      appServerRequestSource,
+    );
+    assert.equal(unrelatedChunk, appServerRequestSource);
 
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
@@ -679,11 +720,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "const petSettingsId=`settings.appearance.pets.title`;",
       "function renderPetSettings(){return [P(),L.map(()=>1),petSettingsId]}",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(petSettingsSource));
-    const petSettingsResponse = await installedHandler({
-      url: "app://-/assets/general-settings-current-build.js",
-    });
-    const patchedPetSettingsSource = await petSettingsResponse.text();
+    const patchedPetSettingsSource = patch(
+      "app://-/assets/general-settings-current-build.js",
+      petSettingsSource,
+    );
     assert.doesNotMatch(patchedPetSettingsSource, /codex-avatar-/);
     assert.match(
       patchedPetSettingsSource,
@@ -702,15 +742,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "import\"./codex-avatar-next-build.js\";",
       "const petSettingsId=`settings.pets.title`;",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(sideEffectPetSettingsSource),
+    const patchedSideEffectPetSettingsSource = patch(
+      "app://-/assets/pet-settings-next-build.js",
+      sideEffectPetSettingsSource,
     );
-    const sideEffectPetSettingsResponse = await installedHandler({
-      url: "app://-/assets/pet-settings-next-build.js",
-    });
-    const patchedSideEffectPetSettingsSource =
-      await sideEffectPetSettingsResponse.text();
     assert.doesNotMatch(patchedSideEffectPetSettingsSource, /codex-avatar-/);
     assert.match(
       patchedSideEffectPetSettingsSource,
@@ -727,12 +762,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "const miniSettingsId=`settings.mini.show`;",
       "function renderMiniSettings(){return [Rt(),Ht(),Yt(),miniSettingsId]}",
     ].join("\n");
-    electron.protocol.handle("app", async () => new Response(currentPetSettingsSource));
-    const currentPetSettingsResponse = await installedHandler({
-      url: "app://-/assets/pets-settings-route-551771c3ecb9.js",
-    });
-    const patchedCurrentPetSettingsSource =
-      await currentPetSettingsResponse.text();
+    const patchedCurrentPetSettingsSource = patch(
+      "app://-/assets/pets-settings-route-551771c3ecb9.js",
+      currentPetSettingsSource,
+    );
     assert.doesNotMatch(
       patchedCurrentPetSettingsSource,
       /(avatar-mascot-button|codex-pet-assets|use-avatar-options)-/,
@@ -755,12 +788,12 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "bb0:{if(r){p=r;break bb0}if(l===`SYSTEM`){p=d;break bb0}p=u}",
       "return {enabled:c,source:l,locale:p,english:f}}",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(localePropsSource));
-    const localePropsResponse = await installedHandler({
-      url: "app://-/assets/app-initial-26903.js",
-    });
     // Codex owns the UI language, so its locale resolver must reach the renderer unchanged.
-    assert.equal(await localePropsResponse.text(), localePropsSource);
+    const localePropsResult = patch(
+      "app://-/assets/app-initial-26903.js",
+      localePropsSource,
+    );
+    assert.equal(localePropsResult, localePropsSource);
 
     const ownerDiscoverySource = [
       "async function maybeResume(Bm,f,n,t){",
@@ -771,14 +804,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "return owner}",
       "return null}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(ownerDiscoverySource),
+    const patchedOwnerDiscoverySource = patch(
+      "app://-/assets/app-initial-BHB6SClA.js",
+      ownerDiscoverySource,
     );
-    const ownerDiscoveryResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedOwnerDiscoverySource = await ownerDiscoveryResponse.text();
     assert.match(
       patchedOwnerDiscoverySource,
       /__CODEY_THREAD_OWNER_DISCOVERY_V2__/,
@@ -965,14 +994,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "discardConversationFromCache(e){return this.productPolicy.runtimePolicy.isLocalConversationInProgress(this.conversation)&&this.inactiveThreadUnsubscriber.clearConversationStreamOwnership(e)}",
       "}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(completedReconciliationSource),
+    const patchedCompletedReconciliationSource = patch(
+      "app://-/assets/app-initial-BHB6SClA.js",
+      completedReconciliationSource,
     );
-    const completedReconciliationResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedCompletedReconciliationSource = await completedReconciliationResponse.text();
     assert.match(
       patchedCompletedReconciliationSource,
       /async codeyReconcileCompletedConversation\(/,
@@ -1072,15 +1097,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "const rendererProcessCpuPercentAvg=true;",
       "function unrelated(){return beginCpuSampling()}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(interactionPerformanceSource),
+    const patchedInteractionPerformance = patch(
+      "app://-/assets/app-initial-BHB6SClA.js",
+      interactionPerformanceSource,
     );
-    const interactionPerformanceResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedInteractionPerformance =
-      await interactionPerformanceResponse.text();
     assert.match(patchedInteractionPerformance, /cpuSampling:null/);
     assert.match(patchedInteractionPerformance, /ensureHeartbeat\(\)\{\}/);
     assert.doesNotMatch(
@@ -1096,21 +1116,21 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /function unrelated\(\)\{return beginCpuSampling\(\)\}/,
     );
 
-    // Only the first (fully incompatible) bundle logged skips — two gates whose
-    // anchors were present but whose shapes did not match. The interaction
-    // bundle patched cleanly, so no further skips were logged.
-    assert.equal(patchErrors.length, 2);
+    // 首个不兼容模块触发两项跳过；上面的精简完成态 fixture 未提供
+    // threadStore 委托读取，只跳过管理器登记，完成态补丁仍正常执行。
+    assert.equal(patchErrors.length, 3);
+    assert.deepEqual(patchRecords.slice(2).map(({ operation }) => operation), [
+      "renderer_patch:app server manager registry",
+    ]);
 
     const productionRendererAsset = process.env.CODEY_RENDERER_ASSET;
     if (productionRendererAsset) {
       const productionSource = await readFile(productionRendererAsset, "utf8");
       const previousErrorCount = patchErrors.length;
-      electron.protocol.handle("app", async () => new Response(productionSource));
-      const productionResponse = await installedHandler({
-        url: "app://-/assets/app-initial-production-build.js",
-      });
-      const patchedProductionSource = await productionResponse.text();
-      await new Promise((resolve) => setImmediate(resolve));
+      const patchedProductionSource = patch(
+        "app://-/assets/app-initial-production-build.js",
+        productionSource,
+      );
       assert.notEqual(
         patchedProductionSource,
         productionSource,
@@ -1132,9 +1152,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     }
   } finally {
     console.error = nativeConsoleError;
-    childProcess.spawn = nativeSpawn;
-    childProcess.spawnSync = nativeSpawnSync;
-    Module._load = nativeLoad;
-    Module._extensions[".js"] = nativeJsExtension;
+    if (nativePatchLog === undefined) {
+      delete globalThis.__codeyPatchLog;
+    } else {
+      globalThis.__codeyPatchLog = nativePatchLog;
+    }
   }
 });

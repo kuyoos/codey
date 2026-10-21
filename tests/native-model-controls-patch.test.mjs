@@ -5,52 +5,18 @@ import { readSource } from "./helpers/read-source.mjs";
 import { loadStartupPatchTemplate } from "./helpers/startup-patch.mjs";
 
 test("API and ChatGPT auth share model-aware native service-tier controls", async () => {
-  const Module = process.getBuiltinModule("module");
-  const workerThreads = process.getBuiltinModule("worker_threads");
-  const nativeLoad = Module._load;
-  const nativeJsExtension = Module._extensions[".js"];
-  const NativeWorker = workerThreads.Worker;
-  let appProtocolHandler = null;
-
-  class FakeBrowserWindow {}
-  const fakeElectron = {
-    BrowserWindow: FakeBrowserWindow,
-    protocol: {
-      handle(scheme, handler) {
-        assert.equal(scheme, "app");
-        appProtocolHandler = handler;
-      },
-    },
-  };
-  Module._load = function nativeControlsTestLoader(request) {
-    if (request === "electron") return fakeElectron;
-    return Reflect.apply(nativeLoad, this, arguments);
-  };
-
   try {
-    assert.equal(
-      (0, eval)(await loadStartupPatchTemplate()),
-      "codey-startup-patch-installed-v40",
-    );
-    Module._load("electron", undefined, false).protocol.handle(
-      "app",
-      async (request) =>
-        request.response ??
-        new Response(request.fixture, {
-          headers: { "content-type": "text/javascript" },
-        }),
-    );
-
-    const patchAsset = async (
+    (0, eval)(await loadStartupPatchTemplate());
+    assert.equal(globalThis.__codeyRendererPatchInstalled, true);
+    // CDP Fetch interception entry: null means the paused asset keeps its
+    // original body, a string means the response is rewritten.
+    const patchAsset = (
       fixture,
       url = "app://-/assets/app-initial~native-controls-fixture.js",
-    ) => {
-      const response = await appProtocolHandler({
-        fixture,
-        url,
-      });
-      return response.text();
-    };
+    ) =>
+      Promise.resolve(
+        globalThis.__codeyRendererPatchEntry(url, fixture) ?? fixture,
+      );
 
     const modelSource = [
       "function Ue({authMethod:e,includeUltraReasoningEffort:i,useHiddenModels:o}){",
@@ -508,7 +474,7 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
         false,
         () => {},
       ).show,
-      false,
+      true,
     );
     assert.equal(
       modelAwareRuntime.speedCommand(
@@ -700,31 +666,19 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
         /async function Qs\(e,t\)\{return!0\}/,
       );
     }
+    // Assets outside the patch set return null so the paused request keeps its
+    // original body — the entry never reads or clones them.
     assert.equal(
-      await patchAsset(
-        "const unrelatedWindowsChunk = true;",
+      globalThis.__codeyRendererPatchEntry(
         "app://-/assets/unrelated-windows-chunk.js",
+        "const unrelatedWindowsChunk = true;",
       ),
-      "const unrelatedWindowsChunk = true;",
+      null,
     );
-    const unrelatedResponse = new Response(
-      "const unrelatedWindowsChunk = true;",
-      { headers: { "content-type": "text/javascript" } },
-    );
-    Object.defineProperty(unrelatedResponse, "clone", {
-      value() {
-        throw new Error("unrelated renderer assets must not be cloned");
-      },
-    });
-    const bypassedResponse = await appProtocolHandler({
-      response: unrelatedResponse,
-      url: "app://-/assets/unrelated-windows-chunk.js",
-    });
-    assert.equal(bypassedResponse, unrelatedResponse);
   } finally {
-    workerThreads.Worker = NativeWorker;
-    Module._load = nativeLoad;
-    Module._extensions[".js"] = nativeJsExtension;
+    delete globalThis.__codeyRendererPatchEntry;
+    delete globalThis.__codeyRendererPatchInstalled;
+    delete globalThis.__CODEY_RENDERER_PATCH_OPTIONS__;
   }
 });
 
@@ -766,7 +720,7 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
   );
   assert.match(
     launcherModules,
-    /stop_macos_codex\([\s\S]*?inspector_argument,[\s\S]*?&self\.codex_app_path,[\s\S]*?self\.process_id,[\s\S]*?self\.process_group_id/,
+    /stop_codex_processes\([\s\S]*?&self\.codex_app_path,[\s\S]*?self\.process_id,[\s\S]*?self\.process_group_id/,
   );
   // Any Codex install can hold Electron's single-instance lock, so the
   // pre-launch stop sweeps every instance instead of one executable path.

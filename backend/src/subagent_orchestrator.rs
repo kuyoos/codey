@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -13,27 +12,30 @@ use serde_json::Value;
 use crate::subagent::api::{TokenUsage, TraceContext};
 use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as ReservationState};
 use crate::subagent::protocol::{AgentState, InterruptAcknowledgement};
-use crate::subagent::rules::{self, RoleAccess, RuleActor, RuleContext, RuleEffect, ToolClass};
+use crate::subagent::rules::{self, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::telemetry::{
     self, ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
 };
 
 mod contract;
 mod identity;
+#[cfg(test)]
+mod migration_tests;
+#[cfg(test)]
+mod scheduling_tests;
 
 use contract::*;
 use identity::*;
 
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 15;
-// Only ledgers written by the previous two releases (both already at the
-// current schema) are accepted; older schema upgrades were removed.
-const MIN_LEDGER_SCHEMA_VERSION: u32 = LEDGER_SCHEMA_VERSION;
+const LEDGER_SCHEMA_VERSION: u32 = 19;
+// v14 already carries attempt identity and runtime fencing. Older formats lack
+// the evidence needed to preserve active work safely.
+const MIN_LEDGER_SCHEMA_VERSION: u32 = 14;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
-const READ_ONLY_CONCURRENCY_LIMIT: usize = 3;
-const WRITE_OR_MIXED_CONCURRENCY_LIMIT: usize = 2;
+const CONCURRENCY_LIMIT: usize = 2;
 const MAX_RESERVATIONS_PER_LEDGER: usize = 1_024;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
 const LEDGER_CAPACITY_ERROR_CODE: &str = "CODEY_SUBAGENT_LEDGER_CAPACITY";
@@ -96,7 +98,9 @@ struct Reservation {
     #[serde(default)]
     origin_runtime_id_hash: String,
     role: String,
-    write_capable: bool,
+    // Decode the retired permission flag once, without broadening old attempts.
+    #[serde(default, rename = "write_capable", skip_serializing)]
+    legacy_write_capable: Option<bool>,
     workspace_root: Option<String>,
     state: ReservationState,
     #[serde(default)]
@@ -174,27 +178,20 @@ impl LedgerStore {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("打开 Codey 子代理编排账本锁失败：{}", lock_path.display()))?;
-        let lock_started = Instant::now();
-        loop {
-            match lock.try_lock_exclusive() {
-                Ok(()) => break,
-                Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
-                    if lock_started.elapsed() >= Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS) {
-                        anyhow::bail!(
-                            "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
-                            LEDGER_LOCK_TIMEOUT_MILLIS,
-                            lock_path.display()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display())
-                    });
-                }
-            }
-        }
+        crate::fs_util::acquire_exclusive_lock_with_timeout(
+            &lock,
+            &lock_path,
+            Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS),
+            Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS),
+            || {
+                format!(
+                    "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
+                    LEDGER_LOCK_TIMEOUT_MILLIS,
+                    lock_path.display()
+                )
+            },
+            || format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display()),
+        )?;
         cleanup_stale_ledger_temps(&session_dir)?;
         Ok(Self {
             lock,
@@ -217,11 +214,6 @@ impl LedgerStore {
                 self.ledger_path.display()
             )
         })?;
-        anyhow::ensure!(
-            (MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION).contains(&ledger.schema_version),
-            "Codey 子代理编排账本版本不受支持：{}",
-            ledger.schema_version
-        );
         let mut changed = validate_ledger(&mut ledger)?;
         let session_id_hash = hash_component(session_id);
         anyhow::ensure!(
@@ -323,6 +315,10 @@ impl LedgerStore {
         ledger.revision = ledger.revision.saturating_add(1);
         ledger.updated_at_ms = now_ms;
         let bytes = serde_json::to_vec(ledger).context("序列化 Codey 子代理编排账本失败")?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_LEDGER_BYTES,
+            "子代理账本超过容量限制，保留原有记录"
+        );
         crate::fs_util::atomic_write_private(&self.ledger_path, &bytes).with_context(|| {
             format!(
                 "原子替换 Codey 子代理编排账本失败：{}",
@@ -411,7 +407,7 @@ impl LedgerStore {
         Ok(())
     }
 
-    // SessionEnd 不带 runtime 归属信息；代次不一致且仍有活动预留时
+    // SessionEnd 不带 runtime 归属信息；代次不一致且仍有活动 attempt 时
     // 保留账本，交给所属代次或恢复逻辑处理，其余情况照常删除。
     fn remove_for_session_end(
         &self,
@@ -634,10 +630,27 @@ impl SessionLedger {
 }
 
 /// Repairs derivable fields (issued task ids, next fencing token) and rejects
-/// ledgers that violate the identity, capacity or generation invariants. Only
-/// the current schema version is accepted, so there is no migration step.
+/// ledgers that violate the identity, capacity or generation invariants.
+/// Migration keeps active reservations, identities and capabilities intact.
 fn validate_ledger(ledger: &mut SessionLedger) -> Result<bool> {
+    anyhow::ensure!(
+        (MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION).contains(&ledger.schema_version),
+        "Codey 子代理编排账本版本不受支持：{}；请先用原版本结算活动子代理，再重试升级",
+        ledger.schema_version
+    );
     let mut changed = false;
+    for reservation in ledger.reservations.values_mut() {
+        anyhow::ensure!(
+            ledger.schema_version >= 16 || reservation.legacy_write_capable.is_some(),
+            "旧版子代理账本缺少权限元数据，无法安全迁移"
+        );
+        if reservation.legacy_write_capable == Some(false) {
+            reservation
+                .capabilities
+                .retain(|capability| capability != "workspace.write");
+        }
+        changed |= reservation.legacy_write_capable.take().is_some();
+    }
     let before = ledger.issued_task_ids.len();
     ledger
         .issued_task_ids
@@ -730,39 +743,19 @@ fn is_canonical_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn concurrency_denial(
-    ledger: &SessionLedger,
-    prepared: &PreparedContract,
-    active_agents: usize,
-) -> Option<String> {
+fn concurrency_denial(ledger: &SessionLedger, active_agents: usize) -> Option<String> {
     let tracked_active = ledger
         .reservations
         .values()
         .filter(|reservation| reservation.state.is_active() && !reservation.spawn_failed)
         .collect::<Vec<_>>();
     let tracked_active_count = tracked_active.len();
-    let has_untracked_active = active_agents > tracked_active_count;
-    let has_active_write = has_untracked_active
-        || tracked_active
-            .iter()
-            .any(|reservation| reservation.write_capable);
-    let candidate_is_read_only = prepared.policy.access == RoleAccess::ReadOnly;
-    let limit = if candidate_is_read_only && !has_active_write {
-        READ_ONLY_CONCURRENCY_LIMIT
-    } else {
-        WRITE_OR_MIXED_CONCURRENCY_LIMIT
-    };
     let observed_active = active_agents.max(tracked_active_count);
-    if observed_active < limit {
+    if observed_active < CONCURRENCY_LIMIT {
         return None;
     }
-    let mode = if limit == READ_ONLY_CONCURRENCY_LIMIT {
-        "已确认的纯只读批次"
-    } else {
-        "包含写入型或身份未确认代理的批次"
-    };
     Some(format!(
-        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：{mode}当前已有 {observed_active} 个活动代理，达到并发上限 {limit}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
+        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：当前已有 {observed_active} 个活动代理，达到并发上限 {CONCURRENCY_LIMIT}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
     ))
 }
 
@@ -848,15 +841,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     if let Some(reason) = ledger_capacity_denial(&ledger) {
         return Ok(Some(reason));
     }
-    if let Some(conflict) = resource_conflict(&prepared, &ledger) {
-        return Ok(Some(conflict));
-    }
-    if let Some(conflict) =
-        resource_conflict_in_other_sessions(state_root, runtime_id, &store.ledger_path, &prepared)?
-    {
-        return Ok(Some(conflict));
-    }
-    if let Some(reason) = concurrency_denial(&ledger, &prepared, active_agents) {
+    if let Some(reason) = concurrency_denial(&ledger, active_agents) {
         return Ok(Some(reason));
     }
 
@@ -883,7 +868,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             runtime_generation,
             origin_runtime_id_hash,
             role: prepared.role,
-            write_capable: prepared.policy.access == RoleAccess::Write,
+            legacy_write_capable: None,
             workspace_root: prepared.workspace_root,
             state: ReservationState::Pending,
             outcome: ExecutionOutcome::Unknown,
@@ -1798,65 +1783,6 @@ pub(crate) fn active_reservation_projection(
     Ok(Some((active.len(), identities)))
 }
 
-/// Proves that every active attempt is a bound, local-read-only child and that
-/// the lifecycle marker identities exactly match the ledger projection. This
-/// deliberately accepts only `files.read`: read-only roles that can execute
-/// commands or use other capabilities keep the normal global root barrier.
-pub(crate) fn verified_local_read_only_active_count(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    active_marker_hashes: &BTreeSet<String>,
-    now_ms: u64,
-) -> Result<Option<usize>> {
-    if active_marker_hashes.is_empty() {
-        return Ok(None);
-    }
-    let loaded_rules = rules::load_logged(state_root);
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(None);
-    };
-    let active = ledger
-        .reservations
-        .values()
-        .filter(|reservation| reservation.state.is_active())
-        .collect::<Vec<_>>();
-    if active.is_empty() || active.len() != active_marker_hashes.len() {
-        return Ok(None);
-    }
-
-    let mut bound_agent_hashes = BTreeSet::new();
-    for reservation in &active {
-        let role_is_read_only = loaded_rules
-            .rules
-            .role_policy(&reservation.role)
-            .is_some_and(|policy| policy.access == RoleAccess::ReadOnly);
-        let files_read_only = matches!(
-            reservation.capabilities.as_slice(),
-            [capability] if capability == "files.read"
-        );
-        let Some(agent_id_hash) = reservation.agent_id_hash.as_ref() else {
-            return Ok(None);
-        };
-        if reservation.spawn_failed
-            || reservation.fenced_at_ms.is_some()
-            || reservation.started_at_ms.is_none()
-            || reservation.outcome != ExecutionOutcome::Unknown
-            || !role_is_read_only
-            || reservation.write_capable
-            || !files_read_only
-            || !bound_agent_hashes.insert(agent_id_hash.clone())
-        {
-            return Ok(None);
-        }
-    }
-    if &bound_agent_hashes != active_marker_hashes {
-        return Ok(None);
-    }
-    Ok(Some(active.len()))
-}
-
 /// Atomically fences every still-active reservation before the gate discards
 /// legacy marker files. This keeps the ledger as the authoritative source of
 /// truth and prevents a Stop recovery loop from resurrecting stale work.
@@ -2155,7 +2081,18 @@ pub(crate) struct ChildToolContext<'a> {
     pub(crate) tool_input: Option<&'a Value>,
 }
 
+#[cfg(test)]
 pub(crate) fn authorize_child_tool_with_context(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    context: ChildToolContext<'_>,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    authorize_child_tool(state_root, runtime_id, session_id, context, now_ms)
+}
+
+pub(crate) fn authorize_child_tool(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
@@ -2170,17 +2107,7 @@ pub(crate) fn authorize_child_tool_with_context(
         tool_input,
     } = context;
     let loaded_rules = rules::load_logged(state_root);
-    let mut tool_class = rules::classify_tool(tool_name);
-    if tool_class == ToolClass::Unknown
-        && crate::subagent_gate::cached_read_only_tool(
-            state_root,
-            tool_name,
-            tool_input,
-            loaded_rules.rules.revision,
-        )
-    {
-        tool_class = ToolClass::Read;
-    }
+    let tool_class = rules::classify_tool(tool_name);
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store.load(runtime_id, session_id, now_ms)?;
     let agent_hash = hash_component(agent_id);
@@ -2354,7 +2281,7 @@ pub(crate) fn authorize_child_tool_with_context(
             )),
             Some(_) => None,
         },
-        ToolClass::Write => match bound_reservation {
+        ToolClass::Write | ToolClass::Unknown => match bound_reservation {
             None => Some(format!(
                 "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 能力/资源门禁：当前 child 未绑定有效 attempt，禁止执行写入工具。不要重试写入或等待门禁自行恢复；请立即把该错误码返回主代理，由主代理使用全新的 task_name 重新派生或直接接管。"
             )),
@@ -2521,11 +2448,10 @@ fn reservation_declares_visual(reservation: &Reservation) -> bool {
 }
 
 fn reservation_declares_write(reservation: &Reservation) -> bool {
-    reservation.write_capable
-        && reservation
-            .capabilities
-            .iter()
-            .any(|capability| capability == "workspace.write")
+    reservation
+        .capabilities
+        .iter()
+        .any(|capability| capability == "workspace.write")
 }
 
 fn reservation_trace(reservation: &Reservation) -> TraceContext {
@@ -2537,109 +2463,6 @@ fn reservation_trace(reservation: &Reservation) -> TraceContext {
         },
         parent_id: reservation.parent_id.clone(),
     }
-}
-
-fn resource_conflict(prepared: &PreparedContract, ledger: &SessionLedger) -> Option<String> {
-    for existing in ledger
-        .reservations
-        .values()
-        .filter(|reservation| !reservation.spawn_failed && reservation.state.is_active())
-    {
-        if let Some(conflict) = reservation_resource_conflict(prepared, existing) {
-            return Some(conflict);
-        }
-    }
-    None
-}
-
-fn resource_conflict_in_other_sessions(
-    state_root: &Path,
-    runtime_id: &str,
-    current_ledger_path: &Path,
-    prepared: &PreparedContract,
-) -> Result<Option<String>> {
-    let runtime_id_hash = hash_component(runtime_id);
-    for entry in fs::read_dir(state_root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let ledger_path = entry.path().join(LEDGER_FILE);
-        if ledger_path == current_ledger_path {
-            continue;
-        }
-        let bytes = match crate::fs_util::read_bounded(&ledger_path, MAX_LEDGER_BYTES) {
-            Ok(bytes) => bytes,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("读取跨会话子代理账本失败：{}", ledger_path.display())
-                });
-            }
-        };
-        // A ledger left behind by a crashed or older Codey must not block every
-        // other session: skip it, keep looking, and leave the diagnostics on stderr.
-        let ledger: SessionLedger = match serde_json::from_slice(&bytes) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                eprintln!(
-                    "Codey 跳过无法解析的跨会话子代理账本 {}：{error}",
-                    ledger_path.display()
-                );
-                continue;
-            }
-        };
-        if ledger.runtime_id_hash != runtime_id_hash {
-            continue;
-        }
-        for existing in ledger
-            .reservations
-            .values()
-            .filter(|reservation| !reservation.spawn_failed && reservation.state.is_active())
-        {
-            if let Some(conflict) = reservation_resource_conflict(prepared, existing) {
-                return Ok(Some(conflict));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn reservation_resource_conflict(
-    prepared: &PreparedContract,
-    existing: &Reservation,
-) -> Option<String> {
-    if prepared.policy.access != RoleAccess::Write && !existing.write_capable {
-        return None;
-    }
-    let overlaps = match (&prepared.workspace_root, &existing.workspace_root) {
-        (Some(left), Some(right)) => paths_overlap(left, right),
-        _ => true,
-    };
-    overlaps.then(|| {
-        format!(
-            "Codey 能力/资源冲突门禁：任务 `{}` 与活动任务 `{}` 共享工作区且至少一方可写；请串行执行。",
-            prepared.capsule.id, existing.task_id
-        )
-    })
-}
-
-fn paths_overlap(left: &str, right: &str) -> bool {
-    path_is_within(left, right) || path_is_within(right, left)
-}
-
-fn path_is_within(path: &str, parent: &str) -> bool {
-    path == parent
-        || parent.ends_with('/') && path.starts_with(parent)
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 pub(crate) fn safe_child_reporting_tool(tool_name: &str, tool_input: Option<&Value>) -> bool {
@@ -2707,55 +2530,28 @@ mod tests {
     }
 
     #[test]
-    fn native_capsule_assigns_role_capabilities() {
+    fn native_capsule_assigns_the_same_capabilities_to_every_role() {
         let temp = tempdir().unwrap();
         let rules = rules::load(temp.path()).rules;
-        let readonly = prepare_task_capsule(
-            Some(&spawn_input("read_task", "codey_quick_scan")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(readonly.capabilities, ["files.read"]);
-
-        let visual = prepare_task_capsule(
-            Some(&spawn_input("visual_task", "codey_visual_analysis")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(visual.capabilities, ["files.read", "visual.inspect"]);
-
-        let writer = prepare_task_capsule(
-            Some(&spawn_input("write_task", "codey_worker")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(
-            writer.capabilities,
-            ["command.execute", "files.read", "workspace.write"]
-        );
-
-        let visual_writer = prepare_task_capsule(
-            Some(&spawn_input("visual_write_task", "codey_visual_worker")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(
-            visual_writer.capabilities,
-            [
-                "command.execute",
-                "files.read",
-                "workspace.write",
-                "visual.inspect"
-            ]
-        );
+        for role in crate::config::SUBAGENT_ROLE_IDS {
+            let task =
+                prepare_task_capsule(Some(&spawn_input("task", role)), Some("/repo"), &rules)
+                    .unwrap();
+            assert_eq!(
+                task.capabilities,
+                [
+                    "command.execute",
+                    "files.read",
+                    "workspace.write",
+                    "visual.inspect"
+                ],
+                "{role}"
+            );
+        }
     }
 
     #[test]
-    fn visual_tools_require_a_bound_visual_role() {
+    fn analysis_roles_can_use_tools_and_still_require_an_active_attempt() {
         let temp = tempdir().unwrap();
         let root = temp.path();
         admit_and_bind(
@@ -2799,26 +2595,57 @@ mod tests {
             "plain_reader",
             "codey_quick_scan",
             "scan-agent",
-            "/repo",
+            "/scan-repo",
             0,
             30,
         );
-        let denied = authorize_child_tool_with_context(
-            root,
-            "runtime-a",
-            "scan-session",
-            ChildToolContext {
+        for tool_name in [
+            "mcp__cua_repl__js",
+            "apply_patch",
+            "exec_command",
+            "mcp__custom__tool",
+        ] {
+            let context = || ChildToolContext {
                 agent_id: "scan-agent",
                 agent_type: Some("codey_quick_scan"),
                 transcript_path: None,
-                tool_name: "mcp__cua_repl__js",
+                tool_name,
                 tool_input: None,
-            },
-            40,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denied.contains("visual.inspect"));
+            };
+            assert_eq!(
+                authorize_child_tool_with_context(root, "runtime-a", "scan-session", context(), 40)
+                    .unwrap(),
+                None,
+                "{tool_name}"
+            );
+        }
+        subagent_stopped(root, "runtime-a", "scan-session", "scan-agent", 41).unwrap();
+        for tool_name in [
+            "mcp__cua_repl__js",
+            "apply_patch",
+            "exec_command",
+            "mcp__custom__tool",
+        ] {
+            assert!(
+                authorize_child_tool_with_context(
+                    root,
+                    "runtime-a",
+                    "scan-session",
+                    ChildToolContext {
+                        agent_id: "scan-agent",
+                        agent_type: Some("codey_quick_scan"),
+                        transcript_path: None,
+                        tool_name,
+                        tool_input: None,
+                    },
+                    42,
+                )
+                .unwrap()
+                .unwrap()
+                .contains(UNBOUND_ATTEMPT_ERROR_CODE),
+                "{tool_name}"
+            );
+        }
     }
 
     #[test]
@@ -2843,14 +2670,14 @@ mod tests {
     }
 
     #[test]
-    fn writer_uses_a_workspace_wide_conflict_lock() {
+    fn analysis_roles_do_not_reserve_writing_at_spawn() {
         let temp = tempdir().unwrap();
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
                 "runtime-a",
                 "session-b",
-                Some(&spawn_input("writer_a", "codey_worker")),
+                Some(&spawn_input("writer_a", "codey_quick_scan")),
                 Some("/repo"),
                 0,
                 10,
@@ -2858,18 +2685,17 @@ mod tests {
             .unwrap(),
             None
         );
-        let denial = pre_spawn_with_workspace(
+        let admission = pre_spawn_with_workspace(
             temp.path(),
             "runtime-a",
             "session-a",
-            Some(&spawn_input("writer_b", "codey_worker")),
+            Some(&spawn_input("writer_b", "codey_deep_research")),
             Some("/repo"),
             1,
             11,
         )
-        .unwrap()
         .unwrap();
-        assert!(denial.contains("资源冲突"));
+        assert_eq!(admission, None);
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
@@ -2927,16 +2753,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_read_agent_releases_a_concurrency_slot_immediately() {
+    fn terminal_analysis_agent_releases_a_concurrency_slot_immediately() {
         let temp = tempdir().unwrap();
         let session = "read-refill";
-        for (index, (task, agent)) in [
-            ("read_a", "agent-a"),
-            ("read_b", "agent-b"),
-            ("read_c", "agent-c"),
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, (task, agent)) in [("read_a", "agent-a"), ("read_b", "agent-b")]
+            .into_iter()
+            .enumerate()
         {
             admit_and_bind(
                 temp.path(),
@@ -2944,7 +2766,7 @@ mod tests {
                 task,
                 "codey_quick_scan",
                 agent,
-                "/repo",
+                &format!("/repo-{index}"),
                 index,
                 10 + index as u64 * 10,
             );
@@ -2956,13 +2778,13 @@ mod tests {
             "runtime-a",
             session,
             Some(&refill),
-            Some("/repo"),
-            3,
+            Some("/repo-new"),
+            2,
             40,
         )
         .unwrap()
         .unwrap();
-        assert!(denial.contains("并发上限 3"));
+        assert!(denial.contains("并发上限 2"));
 
         subagent_stopped(temp.path(), "runtime-a", session, "agent-a", 41).unwrap();
         assert_eq!(
@@ -2971,8 +2793,8 @@ mod tests {
                 "runtime-a",
                 session,
                 Some(&refill),
-                Some("/repo"),
-                2,
+                Some("/repo-new"),
+                1,
                 42,
             )
             .unwrap(),
@@ -3011,7 +2833,7 @@ mod tests {
             "runtime-a",
             session,
             Some(&read_refill),
-            Some("/read-repo"),
+            Some("/refill-repo"),
             2,
             30,
         )
@@ -3026,7 +2848,7 @@ mod tests {
                 "runtime-a",
                 session,
                 Some(&read_refill),
-                Some("/read-repo"),
+                Some("/refill-repo"),
                 1,
                 32,
             )
